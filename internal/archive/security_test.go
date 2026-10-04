@@ -46,9 +46,9 @@ func TestVerifyRefusesSymlinkOutOfTape(t *testing.T) {
 
 func TestVerifyRejectsTraversalInManifest(t *testing.T) {
 	_, tape := setup(t)
-	os.MkdirAll(filepath.Join(tape, manifest.Dir), 0o755)
+	os.MkdirAll(filepath.Join(tape, manifest.Dir, manifest.SegmentsDir), 0o755)
 	line := `{"path":"../../../../etc/passwd","size":1,"sha256":"` + strings.Repeat("0", 64) + `"}` + "\n"
-	os.WriteFile(filepath.Join(tape, manifest.Dir, manifest.FileName), []byte(line), 0o644)
+	os.WriteFile(filepath.Join(tape, manifest.Dir, manifest.SegmentsDir, "000001.manifest.jsonl"), []byte(line), 0o644)
 	if _, err := Verify(VerifyOptions{TapeRoot: tape, Log: io.Discard}); err == nil {
 		t.Fatal("traversal path accepted")
 	}

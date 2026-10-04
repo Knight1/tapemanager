@@ -46,23 +46,32 @@ func Verify(opts VerifyOptions) (VerifyResult, error) {
 	start := time.Now()
 	var res VerifyResult
 
-	entries, err := manifest.Load(opts.TapeRoot)
+	// Manifest paths come from the tape. Its root refuses any path or
+	// symlink that would lead outside it.
+	tape, err := manifest.Open(opts.TapeRoot)
 	if err != nil {
 		return res, err
 	}
-	chunks, err := manifest.LoadChunks(opts.TapeRoot)
+	defer tape.Close()
+	root := tape.Root()
+
+	entries, err := tape.Entries()
+	if err != nil {
+		return res, err
+	}
+	chunks, err := tape.Chunks()
 	if err != nil {
 		return res, err
 	}
 	prefix := strings.Trim(filepath.ToSlash(opts.Prefix), "/")
 
-	// Manifest paths come from the tape. root refuses any path or symlink
-	// that would lead outside it.
-	root, err := os.OpenRoot(opts.TapeRoot)
-	if err != nil {
-		return res, err
+	if opts.Catalog != nil {
+		if vol, err := tape.Volume(); err == nil && vol != nil {
+			if n, err := pendingCount(opts.Catalog.PendingPath(vol.ID)); err == nil && n > 0 {
+				fmt.Fprintf(opts.Log, "WARNING:   %d archived files are not yet in the tape manifest; rerun 'archive put' to record them\n", n)
+			}
+		}
 	}
-	defer root.Close()
 
 	for _, e := range entries {
 		if prefix != "" && e.Path != prefix && !strings.HasPrefix(e.Path, prefix+"/") {

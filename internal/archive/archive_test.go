@@ -43,6 +43,24 @@ func setup(t *testing.T) (src, tape string) {
 	return src, tape
 }
 
+func loadEntries(dir string) ([]manifest.Entry, error) {
+	tp, err := manifest.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer tp.Close()
+	return tp.Entries()
+}
+
+func loadChunks(dir string) (map[string]manifest.Chunks, error) {
+	tp, err := manifest.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer tp.Close()
+	return tp.Chunks()
+}
+
 func newCatalog(t *testing.T, tape string) *catalog.Catalog {
 	t.Helper()
 	c, err := catalog.Open(filepath.Join(filepath.Dir(tape), "catalog"))
@@ -86,7 +104,7 @@ func TestPutWritesFilesAndManifest(t *testing.T) {
 		t.Fatalf("tape content = %q, %v", got, err)
 	}
 
-	entries, err := manifest.Load(tape)
+	entries, err := loadEntries(tape)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +149,7 @@ func TestPutRerunSkipsArchived(t *testing.T) {
 	if sum.Files != 1 || sum.Skipped != 3 {
 		t.Fatalf("summary = %+v", sum)
 	}
-	entries, _ := manifest.Load(tape)
+	entries, _ := loadEntries(tape)
 	if len(entries) != 4 {
 		t.Fatalf("got %d entries", len(entries))
 	}

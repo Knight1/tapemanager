@@ -238,7 +238,12 @@ func cmdList(args []string, stdout, stderr io.Writer) int {
 	if err := cf.checkTape(); err != nil {
 		return fail(stderr, err)
 	}
-	entries, err := manifest.Load(cf.tape)
+	tape, err := manifest.Open(cf.tape)
+	if err != nil {
+		return fail(stderr, err)
+	}
+	defer tape.Close()
+	entries, err := tape.Entries()
 	if err != nil {
 		return fail(stderr, err)
 	}

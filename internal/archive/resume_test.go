@@ -177,7 +177,7 @@ func TestVerifyReportsDamagedRange(t *testing.T) {
 func TestChunksRecorded(t *testing.T) {
 	_, tape, _, o := bigSetup(t)
 	Put(o)
-	chunks, err := manifest.LoadChunks(tape)
+	chunks, err := loadChunks(tape)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestDedup(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(tape, "downloads", "copy.iso")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("duplicate content was written")
 	}
-	entries, _ := manifest.Load(tape)
+	entries, _ := loadEntries(tape)
 	var ref *manifest.Ref
 	for _, e := range entries {
 		if e.Path == "downloads/copy.iso" {

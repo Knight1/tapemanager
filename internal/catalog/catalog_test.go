@@ -13,19 +13,17 @@ import (
 func makeTape(t *testing.T, label string, entries ...manifest.Entry) string {
 	t.Helper()
 	dir := t.TempDir()
-	if _, err := manifest.InitVolume(dir, label, ""); err != nil {
-		t.Fatal(err)
-	}
-	w, err := manifest.OpenWriter(dir)
+	tp, err := manifest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range entries {
-		if err := w.Append(e, nil); err != nil {
-			t.Fatal(err)
-		}
+	defer tp.Close()
+	if _, err := tp.InitVolume(label, ""); err != nil {
+		t.Fatal(err)
 	}
-	w.Close()
+	if err := tp.WriteSegment(entries, nil, entries); err != nil {
+		t.Fatal(err)
+	}
 	return dir
 }
 

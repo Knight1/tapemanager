@@ -6,6 +6,7 @@
 //	<dir>/tapes/<id>.json      tape record and verification history
 //	<dir>/tapes/<id>.jsonl     copy of the tape's manifest.jsonl
 //	<dir>/journal/<id>/        resume journals for interrupted writes
+//	<dir>/pending/<id>.jsonl   records not yet written to the tape
 //
 // The manifest on the tape is authoritative. The catalog is updated after the
 // tape, so a failed catalog write never loses archived data.
@@ -71,24 +72,32 @@ func Open(dir string) (*Catalog, error) {
 func (c *Catalog) recordPath(id string) string   { return filepath.Join(c.Dir, "tapes", id+".json") }
 func (c *Catalog) manifestPath(id string) string { return filepath.Join(c.Dir, "tapes", id+".jsonl") }
 
+// PendingPath returns the pending manifest log of tape id.
+func (c *Catalog) PendingPath(id string) string { return filepath.Join(c.Dir, "pending", id+".jsonl") }
+
 // JournalDir returns the directory for resume journals of tape id.
 func (c *Catalog) JournalDir(id string) string { return filepath.Join(c.Dir, "journal", id) }
 
 // Import copies the manifest of the tape mounted at tapeRoot into the
 // catalog. Local verification history is kept.
 func (c *Catalog) Import(tapeRoot string) (*Tape, error) {
-	vol, err := manifest.LoadVolume(tapeRoot)
+	tape, err := manifest.Open(tapeRoot)
+	if err != nil {
+		return nil, err
+	}
+	defer tape.Close()
+	vol, err := tape.Volume()
 	if err != nil {
 		return nil, err
 	}
 	if vol == nil {
 		return nil, errors.New("tape has no tapemgr volume record; nothing archived yet")
 	}
-	data, err := os.ReadFile(filepath.Join(tapeRoot, manifest.Dir, manifest.FileName))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	entries, err := tape.Entries()
+	if err != nil {
 		return nil, err
 	}
-	entries, err := manifest.Load(tapeRoot)
+	data, err := manifest.MarshalJSONL(entries)
 	if err != nil {
 		return nil, err
 	}

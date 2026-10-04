@@ -34,6 +34,10 @@ const (
 	DefaultCheckpointEvery = 1 << 30
 	// DefaultDedupMinSize is the smallest file considered for deduplication.
 	DefaultDedupMinSize = 1 << 20
+	// DefaultFlushEvery is how much archived data accumulates before its
+	// manifest records are written to the tape as one segment. Larger
+	// values mean fewer, bigger metadata files on tape.
+	DefaultFlushEvery = 100 << 30
 )
 
 // testHook lets tests simulate interruptions at named stages.
@@ -60,6 +64,7 @@ type PutOptions struct {
 	ChunkSize       int64 // default DefaultChunkSize
 	CheckpointEvery int64 // default DefaultCheckpointEvery
 	DedupMinSize    int64 // default DefaultDedupMinSize
+	FlushEvery      int64 // default DefaultFlushEvery
 }
 
 // PutSummary reports what Put did.
@@ -81,8 +86,9 @@ type job struct {
 
 // Put archives opts.Source onto the tape. Files are written strictly one
 // after another in lexical order. Each file's SHA-256 is computed from the
-// same bytes that are written, and a manifest entry is appended only after
-// the file has been synced and renamed into place.
+// same bytes that are written. Its manifest record goes to the local
+// pending log once the file is synced and renamed into place, and pending
+// records are written to the tape in large segments (see package manifest).
 //
 // Rerunning an interrupted Put skips files already in the manifest and
 // continues a partially written file from its last checkpoint.
@@ -99,6 +105,9 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 	}
 	if opts.DedupMinSize <= 0 {
 		opts.DedupMinSize = DefaultDedupMinSize
+	}
+	if opts.FlushEvery <= 0 {
+		opts.FlushEvery = DefaultFlushEvery
 	}
 
 	src, err := filepath.Abs(opts.Source)
@@ -119,24 +128,70 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		return sum, err
 	}
 
-	vol, err := manifest.InitVolume(opts.TapeRoot, opts.Label, ltfs.VolumeUUID(opts.TapeRoot))
+	tape, err := manifest.Open(opts.TapeRoot)
+	if err != nil {
+		return sum, err
+	}
+	defer tape.Close()
+	vol, err := tape.InitVolume(opts.Label, ltfs.VolumeUUID(opts.TapeRoot))
 	if err != nil {
 		return sum, err
 	}
 	sum.Tape = vol
 
-	// All tape access goes through root, which refuses paths and symlinks
-	// that lead outside the tape.
-	root, err := os.OpenRoot(opts.TapeRoot)
+	existing, err := tape.Entries()
 	if err != nil {
 		return sum, err
 	}
-	defer root.Close()
+	pend, err := openPending(opts.Catalog.PendingPath(vol.ID))
+	if err != nil {
+		return sum, err
+	}
+	defer pend.close()
 
-	existing, err := manifest.Load(opts.TapeRoot)
-	if err != nil {
-		return sum, err
+	// flush writes the pending records to the tape as one new segment.
+	flush := func() error {
+		if len(pend.records) == 0 {
+			return nil
+		}
+		if err := hook("flush", int64(len(pend.records))); err != nil {
+			return err
+		}
+		onTape := make(map[string]string, len(existing))
+		for _, e := range existing {
+			onTape[e.Path] = e.SHA256
+		}
+		var entries []manifest.Entry
+		var chunks []manifest.Chunks
+		for _, r := range pend.records {
+			// A crash after the segment was written but before the
+			// pending log was cleared leaves records already on tape.
+			if sha, ok := onTape[r.Entry.Path]; ok {
+				if sha != r.Entry.SHA256 {
+					return fmt.Errorf("pending record for %s conflicts with the tape manifest", r.Entry.Path)
+				}
+				continue
+			}
+			entries = append(entries, r.Entry)
+			if r.Chunks != nil {
+				chunks = append(chunks, *r.Chunks)
+			}
+		}
+		all := append(existing[:len(existing):len(existing)], entries...)
+		if err := tape.WriteSegment(entries, chunks, all); err != nil {
+			return fmt.Errorf("writing manifest segment: %w", err)
+		}
+		existing = all
+		return pend.clear()
 	}
+
+	if n := len(pend.records); n > 0 {
+		fmt.Fprintf(opts.Log, "RECOVERING: writing %d records from an interrupted run to the tape manifest\n", n)
+		if err := flush(); err != nil {
+			return sum, err
+		}
+	}
+
 	archived := make(map[string]manifest.Entry, len(existing))
 	for _, e := range existing {
 		archived[e.Path] = e
@@ -154,18 +209,28 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		}
 	}
 
-	w, err := manifest.OpenWriter(opts.TapeRoot)
-	if err != nil {
-		return sum, err
-	}
 	defer func() {
-		err = errors.Join(err, w.Close())
-		// Keep the catalog in step with the tape even after a failure.
+		// Records of completed files are valid even after a failure.
+		if ferr := flush(); ferr != nil {
+			err = errors.Join(err, ferr)
+		}
+		// Keep the catalog in step with the tape.
 		if _, cerr := opts.Catalog.Import(opts.TapeRoot); cerr != nil {
 			err = errors.Join(err, fmt.Errorf("updating catalog (tape data is fine, run 'tapemgr catalog import'): %w", cerr))
 		}
 		sum.Duration = time.Since(start)
 	}()
+
+	record := func(r pendingRecord) error {
+		if err := pend.add(r); err != nil {
+			return fmt.Errorf("writing pending log: %w", err)
+		}
+		archived[r.Entry.Path] = r.Entry
+		if pend.bytes >= opts.FlushEvery {
+			return flush()
+		}
+		return nil
+	}
 
 	journalDir := opts.Catalog.JournalDir(vol.ID)
 	for _, j := range jobs {
@@ -184,8 +249,8 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 				return sum, fmt.Errorf("%s: %w", j.src, err)
 			}
 			if e != nil {
-				if err := w.Append(*e, nil); err != nil {
-					return sum, fmt.Errorf("writing manifest: %w", err)
+				if err := record(pendingRecord{Entry: *e}); err != nil {
+					return sum, err
 				}
 				fmt.Fprintf(opts.Log, "DUPLICATE: %s\n       same as %s on tape %s\n\n", j.src, e.Ref.Path, e.Ref.Tape)
 				sum.Deduped++
@@ -195,7 +260,7 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 
 		fmt.Fprintf(opts.Log, "ARCHIVING: %s\n       %s\n", j.src, FormatBytes(j.info.Size()))
 		jpath := journalPath(journalDir, j.rel)
-		e, chunks, resumed, err := archiveFile(opts, root, j, jpath)
+		e, chunks, resumed, err := archiveFile(opts, tape.Root(), j, jpath)
 		if err != nil {
 			return sum, fmt.Errorf("%s: %w", j.src, err)
 		}
@@ -205,8 +270,8 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		if err := hook("manifest", e.Size); err != nil {
 			return sum, err
 		}
-		if err := w.Append(e, chunks); err != nil {
-			return sum, fmt.Errorf("writing manifest: %w", err)
+		if err := record(pendingRecord{Entry: e, Chunks: chunks}); err != nil {
+			return sum, err
 		}
 		if err := os.Remove(jpath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return sum, err
