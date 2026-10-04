@@ -106,3 +106,78 @@ func TestRejectsBadIDs(t *testing.T) {
 		t.Errorf("tapes = %+v, %v", tapes, err)
 	}
 }
+
+func TestCopiesAndRetire(t *testing.T) {
+	c, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t1, err := c.Import(makeTape(t, "ONE", entry("a", 1, 'a'), entry("b", 1, 'b')))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := entry("a-ref", 1, 'a')
+	ref.Ref = &manifest.Ref{Tape: t1.ID, Path: "a"}
+	t2, err := c.Import(makeTape(t, "TWO", entry("a2", 1, 'a'), ref))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sumA, sumB := strings.Repeat("a", 64), strings.Repeat("b", 64)
+
+	cp, err := c.Copies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cp.Tapes(sumA, ""); len(got) != 2 {
+		t.Fatalf("a: %+v", got)
+	}
+	if got := cp.Tapes(sumA, t1.ID); len(got) != 1 || got[0].ID != t2.ID {
+		t.Fatalf("a without tape 1: %+v", got)
+	}
+	// The reference on tape 2 is not a copy of b or a second copy of a.
+	if got := cp.Tapes(sumB, ""); len(got) != 1 || got[0].ID != t1.ID {
+		t.Fatalf("b: %+v", got)
+	}
+
+	if _, err := c.SetRetired(t1.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	// Reimporting a retired tape keeps it retired.
+	tr, _ := c.Tape(t1.ID)
+	if tr.Retired == nil {
+		t.Fatal("not retired")
+	}
+	cp, _ = c.Copies()
+	if got := cp.Tapes(sumA, ""); len(got) != 1 || got[0].ID != t2.ID {
+		t.Fatalf("a after retiring: %+v", got)
+	}
+	if got := cp.Tapes(sumB, ""); len(got) != 0 {
+		t.Fatalf("b after retiring: %+v", got)
+	}
+	// Search still finds files on retired tapes.
+	if hits, _ := c.Search("b"); len(hits) == 0 {
+		t.Fatal("retired tape hidden from search")
+	}
+	if tp, err := c.SetRetired(t1.ID, false); err != nil || tp.Retired != nil {
+		t.Fatalf("%+v %v", tp, err)
+	}
+	if _, err := c.SetRetired("00000000-0000-4000-8000-000000000000", true); err == nil {
+		t.Fatal("unknown tape retired")
+	}
+	if _, err := c.SetRetired("../x", true); err == nil {
+		t.Fatal("bad ID accepted")
+	}
+}
+
+func TestRetiredSurvivesImport(t *testing.T) {
+	c, _ := Open(t.TempDir())
+	dir := makeTape(t, "ONE", entry("a", 1, 'a'))
+	tp, _ := c.Import(dir)
+	c.SetRetired(tp.ID, true)
+	if _, err := c.Import(dir); err != nil {
+		t.Fatal(err)
+	}
+	if tp, _ := c.Tape(tp.ID); tp.Retired == nil {
+		t.Fatal("import cleared the retired mark")
+	}
+}

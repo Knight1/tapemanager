@@ -9,21 +9,17 @@
 //	<dir>/parity/<id>/         parity staged until the next segment write
 //	<dir>/pending/<id>.jsonl   records not yet written to the tape
 //	<dir>/written/<id>.jsonl   records this machine wrote to the tape
-//	<dir>/continue/<key>.json  archive runs that filled a tape and continue on the next
 //
 // The manifest on the tape is authoritative. The catalog is updated after the
 // tape, so a failed catalog write never loses archived data.
 package catalog
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -38,6 +34,10 @@ type Tape struct {
 	Bytes         int64          `json:"bytes"`
 	ImportedAt    time.Time      `json:"imported_at"`
 	Verifications []Verification `json:"verifications,omitempty"`
+	// Retired is set when the tape was lost or is failing. Its files no
+	// longer count as copies, so put writes them again and purge does not
+	// rely on them.
+	Retired *time.Time `json:"retired,omitempty"`
 }
 
 // Verification records one run of archive verify.
@@ -70,6 +70,54 @@ func (t *Tape) LastVerified() *Verification {
 func (t *Tape) VerifiedSince(at time.Time) bool {
 	v := t.LastVerified()
 	return v != nil && v.Passed() && v.At.After(at)
+}
+
+// SetRetired marks tape id as retired, or active again.
+func (c *Catalog) SetRetired(id string, retired bool) (*Tape, error) {
+	t, err := c.Tape(id)
+	if err != nil {
+		return nil, err
+	}
+	if t == nil {
+		return nil, fmt.Errorf("tape %s is not in the catalog", id)
+	}
+	t.Retired = nil
+	if retired {
+		now := time.Now().UTC()
+		t.Retired = &now
+	}
+	return t, c.save(t)
+}
+
+// Copies maps a SHA-256 to the active tapes that hold that content as data.
+// References do not count: they only point at another tape.
+type Copies map[string]map[string]Tape
+
+// Tapes returns the tapes holding sum, excluding the tape with ID skip.
+func (cp Copies) Tapes(sum, skip string) []Tape {
+	var out []Tape
+	for id, t := range cp[sum] {
+		if id != skip {
+			out = append(out, t)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// Copies returns the content index of all tapes that are not retired.
+func (c *Catalog) Copies() (Copies, error) {
+	cp := Copies{}
+	err := c.each(func(t Tape, e manifest.Entry) {
+		if e.Ref != nil || t.Retired != nil {
+			return
+		}
+		if cp[e.SHA256] == nil {
+			cp[e.SHA256] = map[string]Tape{}
+		}
+		cp[e.SHA256][t.ID] = t
+	})
+	return cp, err
 }
 
 // Hit is one search result.
@@ -174,75 +222,6 @@ func (c *Catalog) Written() ([]Hit, error) {
 
 // ParityDir returns the directory for staged parity of tape id.
 func (c *Catalog) ParityDir(id string) string { return filepath.Join(c.Dir, "parity", id) }
-
-// Continuation records an archive run that filled one or more tapes, so
-// running the same command on the next tape skips what is already on them.
-type Continuation struct {
-	Source  string    `json:"source"`
-	Prefix  string    `json:"prefix"`
-	Tapes   []string  `json:"tapes"`
-	Updated time.Time `json:"updated"`
-}
-
-func (c *Catalog) continuationPath(source, prefix string) string {
-	h := sha256.Sum256([]byte(source + "\x00" + prefix))
-	return filepath.Join(c.Dir, "continue", hex.EncodeToString(h[:16])+".json")
-}
-
-// Continuation returns the open continuation for source and prefix, or nil.
-func (c *Catalog) Continuation(source, prefix string) (*Continuation, error) {
-	b, err := os.ReadFile(c.continuationPath(source, prefix))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var cont Continuation
-	if err := json.Unmarshal(b, &cont); err != nil || cont.Source != source || cont.Prefix != prefix {
-		return nil, nil
-	}
-	ids := cont.Tapes[:0]
-	for _, id := range cont.Tapes {
-		if manifest.ValidID(id) {
-			ids = append(ids, id)
-		}
-	}
-	cont.Tapes = ids
-	return &cont, nil
-}
-
-// AddContinuation notes that the run for source and prefix filled tape id.
-func (c *Catalog) AddContinuation(source, prefix, id string) error {
-	cont, err := c.Continuation(source, prefix)
-	if err != nil {
-		return err
-	}
-	if cont == nil {
-		cont = &Continuation{Source: source, Prefix: prefix}
-	}
-	if !slices.Contains(cont.Tapes, id) {
-		cont.Tapes = append(cont.Tapes, id)
-	}
-	cont.Updated = time.Now().UTC()
-	b, err := json.MarshalIndent(cont, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Join(c.Dir, "continue"), 0o755); err != nil {
-		return err
-	}
-	return manifest.WriteFileAtomic(c.continuationPath(source, prefix), append(b, '\n'))
-}
-
-// ClearContinuation ends the continuation for source and prefix.
-func (c *Catalog) ClearContinuation(source, prefix string) error {
-	err := os.Remove(c.continuationPath(source, prefix))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	return err
-}
 
 // FindTape identifies a cataloged tape whose volume record cannot be read:
 // by its LTFS volume UUID if known, otherwise by its manifest entries. It

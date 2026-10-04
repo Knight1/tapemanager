@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Knight1/tapemanager/internal/catalog"
 	"github.com/Knight1/tapemanager/internal/manifest"
 )
 
@@ -22,6 +23,9 @@ type RestoreOptions struct {
 	Dest     string // local directory to restore into
 	Log      io.Writer
 	Progress io.Writer
+	// Catalog, if set, is used to name other tapes holding a copy of a
+	// file that cannot be restored from this one.
+	Catalog *catalog.Catalog
 }
 
 // RestoreResult reports what Restore did.
@@ -64,6 +68,20 @@ func Restore(opts RestoreOptions) (res RestoreResult, err error) {
 	for _, p := range append(append(problems, p2...), p3...) {
 		fmt.Fprintf(opts.Log, "PROBLEM:   %s\n", p)
 	}
+	otherCopies := func(e manifest.Entry) {}
+	if opts.Catalog != nil {
+		var current string
+		if v, err := tape.Volume(); err == nil && v != nil {
+			current = v.ID
+		}
+		if cp, err := opts.Catalog.Copies(); err == nil {
+			otherCopies = func(e manifest.Entry) {
+				if tapes := cp.Tapes(e.SHA256, current); len(tapes) > 0 {
+					fmt.Fprintf(opts.Log, "       another copy is on %s\n", tapeList(tapes))
+				}
+			}
+		}
+	}
 
 	if err := os.MkdirAll(opts.Dest, 0o755); err != nil {
 		return res, err
@@ -88,6 +106,7 @@ func Restore(opts RestoreOptions) (res RestoreResult, err error) {
 		matched++
 		if e.Ref != nil {
 			fmt.Fprintf(opts.Log, "SKIPPED:   %s\n       stored as %s on tape %s; mount that tape to restore it\n", e.Path, e.Ref.Path, e.Ref.Tape)
+			otherCopies(e)
 			res.Skipped++
 			continue
 		}
@@ -95,6 +114,7 @@ func Restore(opts RestoreOptions) (res RestoreResult, err error) {
 		repaired, err := restoreFile(tape, dest, noClobber, e, chunks, par, opts.Progress)
 		if err != nil {
 			fmt.Fprintf(opts.Log, "       FAILED: %v\n", err)
+			otherCopies(e)
 			res.Failed++
 			continue
 		}

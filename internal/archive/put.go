@@ -36,6 +36,8 @@ const (
 	// DefaultCheckpointEvery is how much data is written between resume
 	// checkpoints. Each checkpoint syncs the file to tape.
 	DefaultCheckpointEvery = 1 << 30
+	// MaxCopies bounds PutOptions.Copies and PurgeOptions.Copies.
+	MaxCopies = 9
 	// DefaultDedupMinSize is the smallest file considered for deduplication.
 	DefaultDedupMinSize = 1 << 20
 	// DefaultFlushEvery is how much archived data accumulates before its
@@ -86,9 +88,12 @@ type PutOptions struct {
 	Catalog  *catalog.Catalog // local catalog, required
 	Dedup    bool             // store a reference instead of content already on tape
 	Parity   int              // parity overhead in percent, 0 for none
-	// Again ignores an open continuation: after a full tape, running the
-	// same put again on the next tape normally skips the files that went to
-	// the earlier tapes. With Again everything is archived.
+	// Copies is how many different tapes each file should be on, 1 by
+	// default. Files that already have that many copies on other tapes are
+	// skipped, so running the same put on the next tape after a full one
+	// continues where it stopped, and Copies 2 makes a second copy.
+	Copies int
+	// Again archives files even if they already have enough copies.
 	Again    bool
 	Log      io.Writer // per-file output
 	Progress io.Writer // progress bar output, nil to disable
@@ -104,7 +109,7 @@ type PutSummary struct {
 	Tape      *manifest.Volume
 	Files     int
 	Skipped   int // already on this tape
-	Elsewhere int // already on an earlier tape of this run (continuation)
+	Elsewhere int // already on enough other tapes
 	Deduped   int
 	Bytes     int64
 	Resumed   int64 // bytes not rewritten thanks to a resume checkpoint
@@ -141,6 +146,12 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 	}
 	if opts.FlushEvery <= 0 {
 		opts.FlushEvery = DefaultFlushEvery
+	}
+	if opts.Copies <= 0 {
+		opts.Copies = 1
+	}
+	if opts.Copies > MaxCopies {
+		return sum, fmt.Errorf("at most %d copies are supported", MaxCopies)
 	}
 	m, err := parity.Shards(opts.Parity)
 	if err != nil {
@@ -327,47 +338,41 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		done[e.Path] = e
 	}
 
-	// When an earlier run of this same source and destination filled a
-	// tape, files that went to those tapes are skipped here. Only that
-	// chain counts, so an intentional second copy on another tape is
-	// archived in full.
-	elsewhere := map[string][]catalog.Hit{}
-	cont, err := opts.Catalog.Continuation(src, prefix)
+	// Copies on other tapes come from the catalog. The catalog's view of
+	// this tape may be stale, so copies here are tracked separately.
+	others, err := opts.Catalog.Copies()
 	if err != nil {
 		return sum, err
 	}
-	if cont != nil && !opts.Again {
-		chain := map[string]bool{}
-		for _, id := range cont.Tapes {
-			if id != vol.ID {
-				chain[id] = true
-			}
+	here := map[string]bool{}
+	for _, e := range existing {
+		if e.Ref == nil {
+			here[e.SHA256] = true
 		}
+	}
+	copiesOf := func(sha string) (n int, tapes []catalog.Tape) {
+		tapes = others.Tapes(sha, vol.ID)
+		n = len(tapes)
+		if here[sha] {
+			n++
+		}
+		return n, tapes
+	}
+	// Where a source file went before is taken from the records this
+	// machine wrote, matched by path, size and mtime, which gives its
+	// SHA-256 without reading it again.
+	writtenBefore := map[string][]catalog.Hit{}
+	if !opts.Again {
 		written, err := opts.Catalog.Written()
 		if err != nil {
 			return sum, err
 		}
 		for _, h := range written {
-			if chain[h.Tape.ID] {
-				elsewhere[h.Entry.Source] = append(elsewhere[h.Entry.Source], h)
+			if h.Tape.ID != vol.ID {
+				writtenBefore[h.Entry.Source] = append(writtenBefore[h.Entry.Source], h)
 			}
-		}
-		if len(chain) > 0 {
-			fmt.Fprintf(opts.Log, "CONTINUING: %s was started on %d earlier tape(s); files already there are skipped\n", src, len(chain))
 		}
 	}
-	defer func() {
-		switch {
-		case errors.Is(err, ErrTapeFull):
-			if cerr := opts.Catalog.AddContinuation(src, prefix, vol.ID); cerr != nil {
-				err = errors.Join(err, cerr)
-			}
-		case err == nil:
-			if cerr := opts.Catalog.ClearContinuation(src, prefix); cerr != nil {
-				err = cerr
-			}
-		}
-	}()
 
 	var dedup map[int64][]catalog.Hit
 	if opts.Dedup {
@@ -413,14 +418,26 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 			}
 			return sum, fmt.Errorf("%s: a different version is already archived as %s", j.src, j.rel)
 		}
-		if h := archivedElsewhere(j, elsewhere[j.src]); h != nil {
-			fmt.Fprintf(opts.Log, "SKIPPING:  %s (already on tape %s)\n", j.src, tapeLabel(h.Tape))
-			sum.Elsewhere++
-			continue
+		if h := archivedElsewhere(j, writtenBefore[j.src]); h != nil {
+			if n, tapes := copiesOf(h.Entry.SHA256); n >= opts.Copies {
+				fmt.Fprintf(opts.Log, "SKIPPING:  %s (already on %s)\n", j.src, tapeList(tapes))
+				sum.Elsewhere++
+				continue
+			}
 		}
 
 		if opts.Dedup && j.info.Size() >= opts.DedupMinSize && len(dedup[j.info.Size()]) > 0 {
-			e, err := findDuplicate(j, dedup[j.info.Size()])
+			// A reference to another tape is no extra copy: it is only
+			// used when that content already has enough copies.
+			var candidates []catalog.Hit
+			for _, c := range dedup[j.info.Size()] {
+				if c.Tape.ID == vol.ID {
+					candidates = append(candidates, c)
+				} else if n, _ := copiesOf(c.Entry.SHA256); n >= opts.Copies && c.Tape.Retired == nil {
+					candidates = append(candidates, c)
+				}
+			}
+			e, err := findDuplicate(j, candidates)
 			if err != nil {
 				return sum, fmt.Errorf("%s: %w", j.src, err)
 			}
@@ -473,6 +490,7 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		if opts.Dedup {
 			dedup[e.Size] = append(dedup[e.Size], catalog.Hit{Tape: catalog.Tape{Volume: *vol}, Entry: e})
 		}
+		here[e.SHA256] = true
 		sum.Files++
 		sum.Bytes += e.Size
 		sum.Resumed += resumed
@@ -556,6 +574,21 @@ func archivedElsewhere(j job, hits []catalog.Hit) *catalog.Hit {
 		}
 	}
 	return nil
+}
+
+// tapeList names tapes for the log.
+func tapeList(tapes []catalog.Tape) string {
+	if len(tapes) == 0 {
+		return "this tape"
+	}
+	names := make([]string, len(tapes))
+	for i, t := range tapes {
+		names[i] = tapeLabel(t)
+	}
+	if len(names) == 1 {
+		return "tape " + names[0]
+	}
+	return "tapes " + strings.Join(names, ", ")
 }
 
 // checkSpace makes sure the next file fits. On tape it needs room for its

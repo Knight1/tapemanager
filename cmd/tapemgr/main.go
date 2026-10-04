@@ -32,6 +32,7 @@ Usage:
   tapemgr catalog import [flags]           copy the mounted tape's manifest into the catalog
   tapemgr catalog tapes [flags]            list known tapes
   tapemgr catalog search [flags] <query>   find files by path or SHA-256 prefix
+  tapemgr catalog retire [--undo] <tape>   stop counting a lost or failing tape as a copy
   tapemgr drive list                       list attached tape drives
   tapemgr drive info [flags]               show drive, cartridge, error counters and TapeAlert flags
   tapemgr drive check [flags]              exit 1 if the drive needs cleaning or reports errors
@@ -74,6 +75,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		"catalog import":  cmdImport,
 		"catalog tapes":   cmdTapes,
 		"catalog search":  cmdSearch,
+		"catalog retire":  cmdRetire,
 		"drive list":      cmdDriveList,
 		"drive info":      cmdDriveInfo,
 		"drive check":     cmdDriveCheck,
@@ -162,12 +164,17 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 	label := fs.String("label", "", "tape label, set when the tape is first used")
 	noDedup := fs.Bool("no-dedup", false, "always write content, even if an identical file is already archived")
 	parityPct := fs.Int("parity", 10, "Reed-Solomon parity overhead in percent (0 to 25, 0 disables)")
-	again := fs.Bool("again", false, "archive files even if they are already on another tape")
+	copies := fs.Int("copies", 1, "number of different tapes each file should be on; 2 makes a second copy on this tape")
+	again := fs.Bool("again", false, "archive files even if they already have enough copies on other tapes")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
 		fmt.Fprintln(stderr, "usage: tapemgr archive put [flags] <source>")
+		return exitUsage
+	}
+	if *copies < 1 {
+		fmt.Fprintln(stderr, "tapemgr: --copies must be at least 1")
 		return exitUsage
 	}
 	if err := cf.checkTape(); err != nil {
@@ -186,6 +193,7 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 		Catalog:  cat,
 		Dedup:    !*noDedup,
 		Parity:   *parityPct,
+		Copies:   *copies,
 		Again:    *again,
 		Log:      stdout,
 		Progress: progressOut(stderr),
@@ -368,6 +376,9 @@ func cmdTapes(args []string, stdout, stderr io.Writer) int {
 			}
 			verified = fmt.Sprintf("verified %s %s", v.At.Format("2006-01-02"), status)
 		}
+		if t.Retired != nil {
+			verified = "RETIRED " + t.Retired.Format("2006-01-02") + ", " + verified
+		}
 		fmt.Fprintf(stdout, "%-16s  %s  %8d files  %10s  %s\n",
 			t.Label, t.ID, t.Files, archive.FormatBytes(t.Bytes), verified)
 	}
@@ -394,7 +405,11 @@ func cmdSearch(args []string, stdout, stderr io.Writer) int {
 	last := ""
 	for _, h := range hits {
 		if h.Tape.ID != last {
-			fmt.Fprintf(stdout, "%s\n", tapeName(&h.Tape.Volume))
+			name := tapeName(&h.Tape.Volume)
+			if h.Tape.Retired != nil {
+				name += " (retired)"
+			}
+			fmt.Fprintf(stdout, "%s\n", name)
 			last = h.Tape.ID
 		}
 		fmt.Fprint(stdout, "  ")
@@ -411,11 +426,16 @@ func cmdPurge(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs, cf := newFlagSet("archive purge-source", stderr)
 	yes := fs.Bool("yes", false, "delete without asking for confirmation")
 	rehash := fs.Bool("rehash", false, "reread every source file and compare its SHA-256 before deleting")
+	copies := fs.Int("copies", 1, "verified copies on different tapes required before deleting")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
 		fmt.Fprintln(stderr, "usage: tapemgr archive purge-source [flags] <source>")
+		return exitUsage
+	}
+	if *copies < 1 {
+		fmt.Fprintln(stderr, "tapemgr: --copies must be at least 1")
 		return exitUsage
 	}
 	cat, err := catalog.Open(cf.catalog)
@@ -427,6 +447,7 @@ func cmdPurge(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		TapeRoot: cf.tape,
 		Catalog:  cat,
 		Rehash:   *rehash,
+		Copies:   *copies,
 	})
 	if err != nil {
 		return fail(stderr, err)
@@ -449,7 +470,11 @@ func cmdPurge(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	fmt.Fprintf(stdout, "This will delete %d files (%s) from:\n\n    %s\n\n", len(plan.Delete), archive.FormatBytes(plan.Bytes), plan.Root)
-	fmt.Fprintf(stdout, "The files have been verified on tape %s.\n", strings.Join(plan.Tapes, ", "))
+	if *copies > 1 {
+		fmt.Fprintf(stdout, "Every file has %d verified copies on different tapes (%s).\n", *copies, strings.Join(plan.Tapes, ", "))
+	} else {
+		fmt.Fprintf(stdout, "The files have been verified on tape %s.\n", strings.Join(plan.Tapes, ", "))
+	}
 	if len(plan.Keep) > 0 {
 		fmt.Fprintf(stdout, "%d files will be kept.\n", len(plan.Keep))
 	}
@@ -523,13 +548,21 @@ func cmdRestore(args []string, stdout, stderr io.Writer) int {
 	if err := cf.checkTape(); err != nil {
 		return fail(stderr, err)
 	}
-	res, err := archive.Restore(archive.RestoreOptions{
+	opts := archive.RestoreOptions{
 		TapeRoot: cf.tape,
 		Path:     fs.Arg(0),
 		Dest:     *to,
 		Log:      stdout,
 		Progress: progressOut(stderr),
-	})
+	}
+	// The catalog only adds hints about other copies; restore works
+	// without one, and a missing catalog is not created.
+	if _, err := os.Stat(cf.catalog); err == nil {
+		if cat, err := catalog.Open(cf.catalog); err == nil {
+			opts.Catalog = cat
+		}
+	}
+	res, err := archive.Restore(opts)
 	if err != nil {
 		return fail(stderr, err)
 	}
@@ -538,5 +571,48 @@ func cmdRestore(args []string, stdout, stderr io.Writer) int {
 	if res.Failed > 0 || res.Skipped > 0 {
 		return exitFailure
 	}
+	return exitOK
+}
+
+func cmdRetire(args []string, stdout, stderr io.Writer) int {
+	fs, cf := newFlagSet("catalog retire", stderr)
+	undo := fs.Bool("undo", false, "count the tape as a copy again")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(stderr, "usage: tapemgr catalog retire [--undo] <tape label or ID>")
+		return exitUsage
+	}
+	cat, err := catalog.Open(cf.catalog)
+	if err != nil {
+		return fail(stderr, err)
+	}
+	tapes, err := cat.Tapes()
+	if err != nil {
+		return fail(stderr, err)
+	}
+	var match []catalog.Tape
+	for _, t := range tapes {
+		if t.ID == fs.Arg(0) || t.Label == fs.Arg(0) {
+			match = append(match, t)
+		}
+	}
+	switch len(match) {
+	case 0:
+		return fail(stderr, fmt.Errorf("no tape %q in the catalog", fs.Arg(0)))
+	case 1:
+	default:
+		return fail(stderr, fmt.Errorf("several tapes are labeled %q; use the tape ID", fs.Arg(0)))
+	}
+	t, err := cat.SetRetired(match[0].ID, !*undo)
+	if err != nil {
+		return fail(stderr, err)
+	}
+	if *undo {
+		fmt.Fprintf(stdout, "Tape %s counts as a copy again.\n", tapeName(&t.Volume))
+		return exitOK
+	}
+	fmt.Fprintf(stdout, "Tape %s is retired. Its files no longer count as copies: 'archive put' writes them to another tape again, and 'purge-source' does not rely on it.\n", tapeName(&t.Volume))
 	return exitOK
 }

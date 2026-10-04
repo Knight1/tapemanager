@@ -22,13 +22,14 @@ type PurgeOptions struct {
 	TapeRoot string // refuse to purge anything on or containing the tape
 	Catalog  *catalog.Catalog
 	Rehash   bool // reread each source file and compare its SHA-256
+	Copies   int  // verified copies on different tapes required, 1 by default
 }
 
 // PurgeFile is a source file selected for deletion.
 type PurgeFile struct {
 	Path string // absolute
 	Size int64
-	Tape string // tape holding the verified copy
+	Tape string // tapes holding the verified copies
 	rel  string // relative to the plan root
 	info fs.FileInfo
 }
@@ -52,9 +53,17 @@ type PurgePlan struct {
 // PlanPurge decides which source files may be deleted. A file qualifies
 // only if this machine archived it, it still has the same size and mtime,
 // the tape manifest lists the same SHA-256, and the tape holding the content
-// passed its most recent verification after the file was archived.
-// Deduplicated files qualify through the tape holding the content.
+// passed its most recent verification after the file was archived. With
+// Copies above 1, that must hold on that many different tapes. Retired
+// tapes never count. Deduplicated files qualify through the tape holding
+// the content.
 func PlanPurge(opts PurgeOptions) (*PurgePlan, error) {
+	if opts.Copies <= 0 {
+		opts.Copies = 1
+	}
+	if opts.Copies > MaxCopies {
+		return nil, fmt.Errorf("at most %d copies are supported", MaxCopies)
+	}
 	src, err := filepath.Abs(opts.Source)
 	if err != nil {
 		return nil, err
@@ -127,7 +136,7 @@ func PlanPurge(opts PurgeOptions) (*PurgePlan, error) {
 
 	tapes := map[string]bool{}
 	for _, f := range files {
-		tape, sum, reason := purgeCheck(f, bySource[f.src], byLocation)
+		found, sum, reason := purgeCheck(f, bySource[f.src], byLocation, opts.Copies)
 		if reason == "" && opts.Rehash {
 			reason = rehash(f, sum)
 		}
@@ -135,9 +144,11 @@ func PlanPurge(opts PurgeOptions) (*PurgePlan, error) {
 			plan.Keep = append(plan.Keep, PurgeKept{Path: f.src, Reason: reason})
 			continue
 		}
-		plan.Delete = append(plan.Delete, PurgeFile{Path: f.src, Size: f.info.Size(), Tape: tape, rel: f.rel, info: f.info})
+		plan.Delete = append(plan.Delete, PurgeFile{Path: f.src, Size: f.info.Size(), Tape: strings.Join(found, ", "), rel: f.rel, info: f.info})
 		plan.Bytes += f.info.Size()
-		tapes[tape] = true
+		for _, t := range found {
+			tapes[t] = true
+		}
 	}
 	for t := range tapes {
 		plan.Tapes = append(plan.Tapes, t)
@@ -146,13 +157,14 @@ func PlanPurge(opts PurgeOptions) (*PurgePlan, error) {
 	return plan, nil
 }
 
-// purgeCheck returns the tape name and SHA-256 of a verified copy of f, or
-// the reason there is none. hits are this machine's records for f.
-func purgeCheck(f job, hits []catalog.Hit, byLocation map[string]catalog.Hit) (tape, sum, reason string) {
+// purgeCheck returns the tapes and SHA-256 of enough verified copies of f,
+// or the reason there are not enough. hits are this machine's records for f.
+func purgeCheck(f job, hits []catalog.Hit, byLocation map[string]catalog.Hit, copies int) (tapes []string, sum, reason string) {
 	if len(hits) == 0 {
-		return "", "", "not archived"
+		return nil, "", "not archived"
 	}
 	reason = "archived copy differs (size or mtime changed since archiving)"
+	seen := map[string]bool{}
 	for _, h := range hits {
 		if h.Entry.Size != f.info.Size() || !h.Entry.MTime.Equal(f.info.ModTime()) {
 			continue
@@ -173,13 +185,34 @@ func purgeCheck(f job, hits []catalog.Hit, byLocation map[string]catalog.Hit) (t
 			}
 			content = target
 		}
+		// All copies must be of the same content.
+		if sum != "" && content.Entry.SHA256 != sum {
+			continue
+		}
+		if seen[content.Tape.ID] {
+			continue
+		}
+		if content.Tape.Retired != nil {
+			reason = fmt.Sprintf("tape %s is retired", tapeLabel(content.Tape))
+			continue
+		}
 		if !content.Tape.VerifiedSince(content.Entry.ArchivedAt) {
 			reason = fmt.Sprintf("tape %s has not passed verification since archiving", tapeLabel(content.Tape))
 			continue
 		}
-		return tapeLabel(content.Tape), content.Entry.SHA256, ""
+		seen[content.Tape.ID] = true
+		sum = content.Entry.SHA256
+		tapes = append(tapes, tapeLabel(content.Tape))
+		if len(tapes) >= copies {
+			sort.Strings(tapes)
+			return tapes, sum, ""
+		}
 	}
-	return "", "", reason
+	sort.Strings(tapes)
+	if len(tapes) > 0 {
+		return nil, "", fmt.Sprintf("only %d of %d required verified copies (%s)", len(tapes), copies, strings.Join(tapes, ", "))
+	}
+	return nil, "", reason
 }
 
 func rehash(f job, want string) string {

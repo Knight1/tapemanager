@@ -366,22 +366,7 @@ func TestCrashDuringParityWriteKeepsParity(t *testing.T) {
 	checkRestored(t, dest, big, small)
 }
 
-// Only a run that filled a tape continues on the next one; an intentional
-// second copy is archived in full.
-func TestSecondCopyIsArchived(t *testing.T) {
-	src, tape := setup(t)
-	o := opts(t, src, tape)
-	put(t, src, tape)
-	tape2 := filepath.Join(filepath.Dir(tape), "tape2")
-	os.MkdirAll(tape2, 0o755)
-	o.TapeRoot = tape2
-	sum, err := Put(o)
-	if err != nil || sum.Files != 3 || sum.Elsewhere != 0 {
-		t.Fatalf("second copy: %+v, %v", sum, err)
-	}
-}
-
-func TestContinuationEndsAfterCompleteRun(t *testing.T) {
+func TestNextTapeContinuesAfterFullTape(t *testing.T) {
 	src, tape := setup(t)
 	writeFile(t, filepath.Join(src, "z-last.bin"), strings.Repeat("z", 1000))
 	o := opts(t, src, tape)
@@ -401,16 +386,16 @@ func TestContinuationEndsAfterCompleteRun(t *testing.T) {
 	o.TapeRoot = tape2
 	var log strings.Builder
 	o.Log = &log
-	if sum, err := Put(o); err != nil || sum.Elsewhere != 3 || !strings.Contains(log.String(), "CONTINUING") {
-		t.Fatalf("continuation: %+v, %v", sum, err)
+	if sum, err := Put(o); err != nil || sum.Elsewhere != 3 || sum.Files != 1 || !strings.Contains(log.String(), "already on tape") {
+		t.Fatalf("next tape: %+v, %v\n%s", sum, err, log.String())
 	}
-	// The run is complete; a third tape is a fresh copy.
+	// Everything has one copy now; a third tape gets nothing new.
 	tape3 := filepath.Join(filepath.Dir(tape), "tape3")
 	os.MkdirAll(tape3, 0o755)
 	o.TapeRoot = tape3
 	o.Log = io.Discard
-	if sum, err := Put(o); err != nil || sum.Files != 4 {
-		t.Fatalf("after completion: %+v, %v", sum, err)
+	if sum, err := Put(o); err != nil || sum.Files != 0 || sum.Elsewhere != 4 {
+		t.Fatalf("third tape: %+v, %v", sum, err)
 	}
 }
 
@@ -445,7 +430,6 @@ func TestDamagedWrittenLogDoesNotBlockPut(t *testing.T) {
 	w := filepath.Join(o.Catalog.Dir, "written", sum.Tape.ID+".jsonl")
 	b, _ := os.ReadFile(w)
 	os.WriteFile(w, append([]byte("garbage\n"), b...), 0o644)
-	o.Catalog.AddContinuation(o.SourceAbs(t), "downloads", sum.Tape.ID)
 	tape2 := filepath.Join(filepath.Dir(tape), "tape2")
 	os.MkdirAll(tape2, 0o755)
 	o.TapeRoot = tape2
