@@ -1,11 +1,15 @@
 package archive
 
 import (
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+var ltfsReadOnly = readOnly
 
 // newTape adds another empty tape next to the first one.
 func newTape(t *testing.T, tape, name string) string {
@@ -232,5 +236,41 @@ func TestRestoreNamesOtherCopy(t *testing.T) {
 	log.Reset()
 	if res, _ := Restore(RestoreOptions{TapeRoot: tape, Dest: t.TempDir(), Log: &log}); res.Failed != 1 || strings.Contains(log.String(), "another copy") {
 		t.Fatalf("%+v\n%s", res, log.String())
+	}
+}
+
+func TestReadOnlyTapeRefused(t *testing.T) {
+	src, tape := setup(t)
+	o := opts(t, src, tape)
+	readOnly = func(p string) (bool, error) { return p == tape, nil }
+	defer func() { readOnly = ltfsReadOnly }()
+	var log strings.Builder
+	o.Log = &log
+	if _, err := Put(o); !errors.Is(err, ErrReadOnly) || !strings.Contains(err.Error(), "nothing was written") {
+		t.Fatalf("put: %v", err)
+	}
+	if _, err := Recover(RecoverOptions{TapeRoot: tape, Catalog: o.Catalog, Log: io.Discard}); !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("recover: %v", err)
+	}
+	// Nothing touched the tape or the catalog's per-tape state, and the
+	// source was not scanned.
+	if ents, _ := os.ReadDir(tape); len(ents) != 0 {
+		t.Fatalf("tape written: %v", ents)
+	}
+	for _, d := range []string{"pending", "written", "journal", "parity"} {
+		if exists(filepath.Join(o.Catalog.Dir, d)) {
+			t.Fatalf("catalog %s created", d)
+		}
+	}
+	if log.Len() != 0 {
+		t.Fatalf("log: %s", log.String())
+	}
+	readOnly = func(string) (bool, error) { return false, errors.New("statfs failed") }
+	if _, err := Put(o); err == nil || !strings.Contains(err.Error(), "statfs failed") {
+		t.Fatalf("statfs error: %v", err)
+	}
+	readOnly = ltfsReadOnly
+	if _, err := Put(o); err != nil {
+		t.Fatalf("writable tape: %v", err)
 	}
 }

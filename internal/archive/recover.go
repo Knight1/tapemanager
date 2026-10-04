@@ -55,6 +55,9 @@ func Recover(opts RecoverOptions) (res RecoverResult, err error) {
 	if opts.FlushEvery <= 0 {
 		opts.FlushEvery = DefaultFlushEvery
 	}
+	if err := checkWritable(opts.TapeRoot); err != nil {
+		return res, err
+	}
 
 	tape, err := manifest.Open(opts.TapeRoot)
 	if err != nil {

@@ -49,6 +49,19 @@ func StartBlock(path string) (block int64, ok bool) {
 	return block, err == nil && block >= 0
 }
 
+// stRdonly is the statfs flag of a read-only mount.
+const stRdonly = 0x1
+
+// ReadOnly reports whether path is on a read-only mount. LTFS mounts a
+// write-protected cartridge read-only.
+func ReadOnly(path string) (bool, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return false, err
+	}
+	return st.Flags&stRdonly != 0, nil
+}
+
 // FreeSpace returns the bytes available on the filesystem holding path.
 // LTFS reports the remaining capacity of the mounted tape.
 func FreeSpace(path string) (int64, error) {

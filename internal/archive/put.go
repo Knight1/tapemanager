@@ -62,6 +62,9 @@ var (
 	realSyncIndex = ltfs.SyncIndex
 )
 
+// readOnly reports a read-only mount. Tests replace it.
+var readOnly = ltfs.ReadOnly
+
 // metadataReserve estimates the tape space the next segment write needs
 // beyond staged parity: manifest and chunk lists, and a rewritten
 // SHA256SUMS, plus a fixed margin.
@@ -177,6 +180,9 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		return sum, fmt.Errorf("invalid destination prefix %q", prefix)
 	}
 
+	if err := checkWritable(opts.TapeRoot); err != nil {
+		return sum, err
+	}
 	jobs, err := plan(src, prefix, opts.Log)
 	if err != nil {
 		return sum, err
@@ -572,6 +578,22 @@ func archivedElsewhere(j job, hits []catalog.Hit) *catalog.Hit {
 		if h.Entry.Size == j.info.Size() && h.Entry.MTime.Equal(j.info.ModTime()) {
 			return &hits[i]
 		}
+	}
+	return nil
+}
+
+// ErrReadOnly means the tape cannot be written.
+var ErrReadOnly = errors.New("tape is read-only")
+
+// checkWritable refuses a read-only tape before anything is scanned or
+// written. LTFS mounts a write-protected cartridge read-only.
+func checkWritable(root string) error {
+	ro, err := readOnly(root)
+	if err != nil {
+		return err
+	}
+	if ro {
+		return fmt.Errorf("%w: %s is mounted read-only (write-protected cartridge, or LTFS mounted it read-only); nothing was written", ErrReadOnly, root)
 	}
 	return nil
 }

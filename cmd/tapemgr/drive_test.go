@@ -16,6 +16,7 @@ import (
 func TestMain(m *testing.M) {
 	// Tests never talk to a real drive.
 	driveWarnings = func(string) []string { return nil }
+	checkWriteProtect = func(string) error { return nil }
 	openDevice = func(string) (drive.Device, error) { return nil, errors.New("no drive in tests") }
 	os.Exit(m.Run())
 }
@@ -221,5 +222,56 @@ func TestCLIPrintsDriveWarnings(t *testing.T) {
 	}
 	if len(asked) != 2 || asked[0] != tape {
 		t.Fatalf("%v", asked)
+	}
+}
+
+func TestDriveWriteProtect(t *testing.T) {
+	f := drivetest.New()
+	useFake(t, f, fakeFound, nil)
+	oldFor := forMount
+	t.Cleanup(func() { forMount = oldFor })
+	forMount = func(string) (drive.Found, error) { return fakeFound, nil }
+
+	if err := driveWriteProtect("/mnt/ltfs"); err != nil {
+		t.Fatalf("writable: %v", err)
+	}
+	f.WriteProtect = true
+	if err := driveWriteProtect("/mnt/ltfs"); err == nil || !strings.Contains(err.Error(), "write protected") {
+		t.Fatalf("protected: %v", err)
+	}
+	if !f.Closed {
+		t.Fatal("device not closed")
+	}
+	// Without a drive to ask, the mount check alone decides.
+	forMount = func(string) (drive.Found, error) { return drive.Found{}, errors.New("not a mount point") }
+	if err := driveWriteProtect("/mnt/ltfs"); err != nil {
+		t.Fatalf("no drive: %v", err)
+	}
+	forMount = func(string) (drive.Found, error) { return drive.Found{SG: "/dev/other"}, nil }
+	if err := driveWriteProtect("/mnt/ltfs"); err != nil {
+		t.Fatalf("open error: %v", err)
+	}
+}
+
+func TestCLIRefusesWriteProtectedTape(t *testing.T) {
+	old := checkWriteProtect
+	t.Cleanup(func() { checkWriteProtect = old })
+	checkWriteProtect = func(string) error { return errors.New("the cartridge in /dev/sg9 is write protected") }
+	base := t.TempDir()
+	src, tape := filepath.Join(base, "src"), filepath.Join(base, "tape")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(tape, 0o755)
+	os.WriteFile(filepath.Join(src, "f"), []byte("x"), 0o644)
+	common := []string{"--tape", tape, "--catalog", filepath.Join(base, "cat"), "--no-mount-check"}
+	for _, args := range [][]string{
+		append(append([]string{"archive", "put"}, common...), src),
+		append([]string{"archive", "recover"}, common...),
+	} {
+		if code, _, errOut := runCmd(t, args...); code != exitFailure || !strings.Contains(errOut, "write protected") {
+			t.Fatalf("%v: %d %s", args[:2], code, errOut)
+		}
+	}
+	if ents, _ := os.ReadDir(tape); len(ents) != 0 {
+		t.Fatalf("tape written: %v", ents)
 	}
 }

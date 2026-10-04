@@ -156,6 +156,7 @@ const (
 const (
 	opTestUnitReady = 0x00
 	opInquiry       = 0x12
+	opModeSense6    = 0x1A
 	opLoadUnload    = 0x1B
 	opLogSense      = 0x4D
 	opReadAttribute = 0x8C
@@ -263,6 +264,34 @@ func ReadAttributes(d Device, partition byte) (Attributes, error) {
 		return nil, err
 	}
 	return parseAttributes(buf[:n])
+}
+
+// WriteProtected reports whether the loaded cartridge is write protected,
+// from the WP bit of the MODE SENSE header, or the VHF data if the drive
+// does not answer MODE SENSE. WORM cartridges that cannot be appended to
+// report it the same way.
+func WriteProtected(d Device) (bool, error) {
+	buf := make([]byte, 255)
+	// All pages without block descriptors; only the header is used.
+	n, err := d.Do([]byte{opModeSense6, 0x08, 0x3F, 0, byte(len(buf)), 0}, DirIn, buf, shortTimeout)
+	if err == nil {
+		if n < 4 {
+			return false, errShort
+		}
+		return buf[2]&0x80 != 0, nil
+	}
+	if errors.Is(err, ErrNoMedium) {
+		return false, err
+	}
+	lp, lerr := ReadLogPage(d, PageDeviceStatus)
+	if lerr != nil {
+		return false, err
+	}
+	v, lerr := parseVHF(lp)
+	if lerr != nil {
+		return false, err
+	}
+	return v.WriteProtect, nil
 }
 
 // Load loads the cartridge in the drive.

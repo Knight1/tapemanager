@@ -180,6 +180,9 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 	if err := cf.checkTape(); err != nil {
 		return fail(stderr, err)
 	}
+	if err := checkWriteProtect(cf.tape); err != nil {
+		return fail(stderr, err)
+	}
 	cat, err := catalog.Open(cf.catalog)
 	if err != nil {
 		return fail(stderr, err)
@@ -511,6 +514,9 @@ func cmdRecover(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	if err := cf.checkTape(); err != nil {
+		return fail(stderr, err)
+	}
+	if err := checkWriteProtect(cf.tape); err != nil {
 		return fail(stderr, err)
 	}
 	cat, err := catalog.Open(cf.catalog)

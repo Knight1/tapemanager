@@ -16,3 +16,6 @@ func FreeSpace(path string) (int64, error) { return 1 << 62, nil }
 
 // SyncIndex is a no-op on this platform.
 func SyncIndex(root string) error { return nil }
+
+// ReadOnly is not detected on this platform; writes fail if it is.
+func ReadOnly(path string) (bool, error) { return false, nil }

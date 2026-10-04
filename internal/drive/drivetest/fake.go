@@ -20,6 +20,7 @@ type Fake struct {
 	ReadUncorr     uint64
 	VolumeReadErrs uint64 // unrecovered read errors over the cartridge's life
 	PreventRemoval bool   // unload fails like a drive locked by LTFS
+	WriteProtect   bool   // cartridge write protected
 	DeviceType     byte   // INQUIRY device type, 1 (tape) unless set
 	LTFSUUID       string
 	// Fail makes commands with this operation code fail with the given
@@ -77,6 +78,14 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 			return 0, check(op, drive.SenseNotReady, 0x3A, 0)
 		}
 		resp = f.attributes(cdb[7])
+	case 0x1A: // MODE SENSE(6), header only
+		if f.NoMedium {
+			return 0, check(op, drive.SenseNotReady, 0x3A, 0)
+		}
+		resp = []byte{3, 0x68, 0x10, 0}
+		if f.WriteProtect {
+			resp[2] |= 0x80
+		}
 	case 0x1B: // LOAD UNLOAD
 		if cdb[4]&1 == 1 {
 			f.Loaded++
@@ -133,6 +142,9 @@ func (f *Fake) logPage(code byte) []byte {
 		}
 		if f.CleanRequired {
 			vhf[0] |= 0x02
+		}
+		if f.WriteProtect {
+			vhf[0] |= 0x08
 		}
 		return page(code, param(0, vhf))
 	case drive.PageTapeAlert:

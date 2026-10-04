@@ -20,11 +20,12 @@ var (
 	resolveDrive = drive.Resolve
 	listDrives   = drive.List
 	mountPoints  = drive.MountPoints
+	forMount     = drive.ForMount
 	ltfsMounts   = drive.LTFSMounts
 	// driveWarnings returns warnings about the drive holding the tape
 	// mounted at tapeRoot, or nothing if that drive cannot be found.
 	driveWarnings = func(tapeRoot string) []string {
-		f, err := drive.ForMount(tapeRoot)
+		f, err := forMount(tapeRoot)
 		if err != nil {
 			return nil
 		}
@@ -40,6 +41,29 @@ var (
 		return info.Warnings()
 	}
 )
+
+// checkWriteProtect refuses to write when the drive holding the tape
+// mounted at tapeRoot reports the cartridge write protected. If the drive
+// cannot be found or asked, it returns nil: the read-only mount check in
+// put and recover still applies.
+var checkWriteProtect = driveWriteProtect
+
+func driveWriteProtect(tapeRoot string) error {
+	f, err := forMount(tapeRoot)
+	if err != nil {
+		return nil
+	}
+	d, err := openDevice(f.SG)
+	if err != nil {
+		return nil
+	}
+	defer d.Close()
+	wp, err := drive.WriteProtected(d)
+	if err != nil || !wp {
+		return nil
+	}
+	return fmt.Errorf("the cartridge in %s is write protected; slide its write-protect tab back or insert another tape (a full WORM cartridge reports the same). Nothing was written", f.SG)
+}
 
 type driveFlags struct {
 	*commonFlags

@@ -175,3 +175,42 @@ func TestLoadUnload(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+// shortModeSense answers MODE SENSE with fewer bytes than a header.
+type shortModeSense struct{ *drivetest.Fake }
+
+func (s shortModeSense) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Duration) (int, error) {
+	if cdb[0] == 0x1A {
+		return copy(buf, []byte{1, 0}), nil
+	}
+	return s.Fake.Do(cdb, dir, buf, timeout)
+}
+
+func TestWriteProtected(t *testing.T) {
+	f := drivetest.New()
+	if wp, err := drive.WriteProtected(f); err != nil || wp {
+		t.Fatalf("%v %v", wp, err)
+	}
+	f.WriteProtect = true
+	if wp, err := drive.WriteProtected(f); err != nil || !wp {
+		t.Fatalf("%v %v", wp, err)
+	}
+	// Without MODE SENSE the VHF data answers.
+	f.Fail = map[byte]*drive.CommandError{0x1A: {Op: 0x1A, Status: 2, Key: drive.SenseIllegalRequest, ASC: 0x20}}
+	if wp, err := drive.WriteProtected(f); err != nil || !wp {
+		t.Fatalf("VHF fallback: %v %v", wp, err)
+	}
+	// Neither available: an error, not a guess.
+	f.Fail[0x4D] = &drive.CommandError{Op: 0x4D, Status: 2, Key: drive.SenseIllegalRequest, ASC: 0x20}
+	if _, err := drive.WriteProtected(f); err == nil {
+		t.Fatal("no source reported as not protected")
+	}
+	f = drivetest.New()
+	f.NoMedium = true
+	if _, err := drive.WriteProtected(f); !errors.Is(err, drive.ErrNoMedium) {
+		t.Fatalf("%v", err)
+	}
+	if _, err := drive.WriteProtected(shortModeSense{drivetest.New()}); err == nil {
+		t.Fatal("short header accepted")
+	}
+}

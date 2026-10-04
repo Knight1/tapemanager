@@ -75,4 +75,14 @@ func TestRealDrive(t *testing.T) {
 	if info.Inquiry.Vendor == "" || len(info.Problems) != 0 {
 		t.Fatalf("%+v", info)
 	}
+	if info.Cartridge != nil {
+		wp, err := WriteProtected(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.VHF != nil && info.VHF.WriteProtect != wp {
+			t.Fatalf("MODE SENSE says write protected %v, VHF says %v", wp, info.VHF.WriteProtect)
+		}
+		t.Logf("write protected: %v", wp)
+	}
 }
