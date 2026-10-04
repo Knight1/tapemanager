@@ -4,9 +4,11 @@ package archive
 
 import (
 	"crypto/sha256"
+	"encoding"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -15,30 +17,59 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Knight1/tapemanager/internal/catalog"
+	"github.com/Knight1/tapemanager/internal/ltfs"
 	"github.com/Knight1/tapemanager/internal/manifest"
 )
 
 // PartialSuffix marks a file on tape whose transfer has not completed.
 const PartialSuffix = ".tapemgr-partial"
 
-// copyBufferSize is the read/write chunk size. Large sequential writes keep
-// the drive streaming instead of shoe-shining.
-const copyBufferSize = 4 << 20
+const (
+	// DefaultChunkSize is the read/write and chunk hash unit. Large
+	// sequential writes keep the drive streaming instead of shoe-shining.
+	DefaultChunkSize = 4 << 20
+	// DefaultCheckpointEvery is how much data is written between resume
+	// checkpoints. Each checkpoint syncs the file to tape.
+	DefaultCheckpointEvery = 1 << 30
+	// DefaultDedupMinSize is the smallest file considered for deduplication.
+	DefaultDedupMinSize = 1 << 20
+)
+
+// testHook lets tests simulate interruptions at named stages.
+var testHook func(stage string, offset int64) error
+
+func hook(stage string, offset int64) error {
+	if testHook == nil {
+		return nil
+	}
+	return testHook(stage, offset)
+}
 
 // PutOptions configures Put.
 type PutOptions struct {
-	TapeRoot string    // LTFS mount point
-	Source   string    // file or directory to archive
-	Prefix   string    // destination directory on tape; defaults to the source base name
-	Log      io.Writer // per-file output
-	Progress io.Writer // progress bar output, nil to disable
+	TapeRoot string           // LTFS mount point
+	Source   string           // file or directory to archive
+	Prefix   string           // destination directory on tape; defaults to the source base name
+	Label    string           // tape label, used only when the tape is first initialized
+	Catalog  *catalog.Catalog // local catalog, required
+	Dedup    bool             // store a reference instead of content already on tape
+	Log      io.Writer        // per-file output
+	Progress io.Writer        // progress bar output, nil to disable
+
+	ChunkSize       int64 // default DefaultChunkSize
+	CheckpointEvery int64 // default DefaultCheckpointEvery
+	DedupMinSize    int64 // default DefaultDedupMinSize
 }
 
 // PutSummary reports what Put did.
 type PutSummary struct {
+	Tape     *manifest.Volume
 	Files    int
 	Skipped  int
+	Deduped  int
 	Bytes    int64
+	Resumed  int64 // bytes not rewritten thanks to a resume checkpoint
 	Duration time.Duration
 }
 
@@ -53,11 +84,22 @@ type job struct {
 // same bytes that are written, and a manifest entry is appended only after
 // the file has been synced and renamed into place.
 //
-// Files already present in the manifest with the same size and mtime are
-// skipped, so rerunning an interrupted Put continues where it stopped.
-func Put(opts PutOptions) (PutSummary, error) {
+// Rerunning an interrupted Put skips files already in the manifest and
+// continues a partially written file from its last checkpoint.
+func Put(opts PutOptions) (sum PutSummary, err error) {
 	start := time.Now()
-	var sum PutSummary
+	if opts.Catalog == nil {
+		return sum, errors.New("catalog is required")
+	}
+	if opts.ChunkSize <= 0 {
+		opts.ChunkSize = DefaultChunkSize
+	}
+	if opts.CheckpointEvery <= 0 {
+		opts.CheckpointEvery = DefaultCheckpointEvery
+	}
+	if opts.DedupMinSize <= 0 {
+		opts.DedupMinSize = DefaultDedupMinSize
+	}
 
 	src, err := filepath.Abs(opts.Source)
 	if err != nil {
@@ -68,7 +110,7 @@ func Put(opts PutOptions) (PutSummary, error) {
 		prefix = filepath.Base(src)
 	}
 	prefix = path.Clean(filepath.ToSlash(prefix))
-	if prefix == "." || prefix == ".." || strings.HasPrefix(prefix, "../") || path.IsAbs(prefix) {
+	if !manifest.ValidPath(prefix) {
 		return sum, fmt.Errorf("invalid destination prefix %q", prefix)
 	}
 
@@ -76,6 +118,20 @@ func Put(opts PutOptions) (PutSummary, error) {
 	if err != nil {
 		return sum, err
 	}
+
+	vol, err := manifest.InitVolume(opts.TapeRoot, opts.Label, ltfs.VolumeUUID(opts.TapeRoot))
+	if err != nil {
+		return sum, err
+	}
+	sum.Tape = vol
+
+	// All tape access goes through root, which refuses paths and symlinks
+	// that lead outside the tape.
+	root, err := os.OpenRoot(opts.TapeRoot)
+	if err != nil {
+		return sum, err
+	}
+	defer root.Close()
 
 	existing, err := manifest.Load(opts.TapeRoot)
 	if err != nil {
@@ -86,12 +142,32 @@ func Put(opts PutOptions) (PutSummary, error) {
 		archived[e.Path] = e
 	}
 
+	var dedup map[int64][]catalog.Hit
+	if opts.Dedup {
+		if dedup, err = opts.Catalog.BySize(); err != nil {
+			return sum, err
+		}
+		for _, e := range existing {
+			if e.Ref == nil {
+				dedup[e.Size] = append(dedup[e.Size], catalog.Hit{Tape: catalog.Tape{Volume: *vol}, Entry: e})
+			}
+		}
+	}
+
 	w, err := manifest.OpenWriter(opts.TapeRoot)
 	if err != nil {
 		return sum, err
 	}
-	defer w.Close()
+	defer func() {
+		err = errors.Join(err, w.Close())
+		// Keep the catalog in step with the tape even after a failure.
+		if _, cerr := opts.Catalog.Import(opts.TapeRoot); cerr != nil {
+			err = errors.Join(err, fmt.Errorf("updating catalog (tape data is fine, run 'tapemgr catalog import'): %w", cerr))
+		}
+		sum.Duration = time.Since(start)
+	}()
 
+	journalDir := opts.Catalog.JournalDir(vol.ID)
 	for _, j := range jobs {
 		if e, ok := archived[j.rel]; ok {
 			if e.Size == j.info.Size() && e.MTime.Equal(j.info.ModTime()) {
@@ -102,21 +178,97 @@ func Put(opts PutOptions) (PutSummary, error) {
 			return sum, fmt.Errorf("%s: a different version is already archived as %s", j.src, j.rel)
 		}
 
+		if opts.Dedup && j.info.Size() >= opts.DedupMinSize && len(dedup[j.info.Size()]) > 0 {
+			e, err := findDuplicate(j, dedup[j.info.Size()])
+			if err != nil {
+				return sum, fmt.Errorf("%s: %w", j.src, err)
+			}
+			if e != nil {
+				if err := w.Append(*e, nil); err != nil {
+					return sum, fmt.Errorf("writing manifest: %w", err)
+				}
+				fmt.Fprintf(opts.Log, "DUPLICATE: %s\n       same as %s on tape %s\n\n", j.src, e.Ref.Path, e.Ref.Tape)
+				sum.Deduped++
+				continue
+			}
+		}
+
 		fmt.Fprintf(opts.Log, "ARCHIVING: %s\n       %s\n", j.src, FormatBytes(j.info.Size()))
-		e, err := archiveFile(opts.TapeRoot, j, opts.Progress)
+		jpath := journalPath(journalDir, j.rel)
+		e, chunks, resumed, err := archiveFile(opts, root, j, jpath)
 		if err != nil {
 			return sum, fmt.Errorf("%s: %w", j.src, err)
 		}
-		if err := w.Append(e); err != nil {
+		if resumed > 0 {
+			fmt.Fprintf(opts.Log, "       resumed at %s\n", FormatBytes(resumed))
+		}
+		if err := hook("manifest", e.Size); err != nil {
+			return sum, err
+		}
+		if err := w.Append(e, chunks); err != nil {
 			return sum, fmt.Errorf("writing manifest: %w", err)
 		}
+		if err := os.Remove(jpath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return sum, err
+		}
 		fmt.Fprintf(opts.Log, "       SHA256: %s\n\n", e.SHA256)
+		if opts.Dedup {
+			dedup[e.Size] = append(dedup[e.Size], catalog.Hit{Tape: catalog.Tape{Volume: *vol}, Entry: e})
+		}
 		sum.Files++
 		sum.Bytes += e.Size
+		sum.Resumed += resumed
 	}
+	return sum, nil
+}
 
-	sum.Duration = time.Since(start)
-	return sum, w.Close()
+// findDuplicate hashes the source and returns a reference entry if a file
+// with the same content is already archived.
+func findDuplicate(j job, candidates []catalog.Hit) (*manifest.Entry, error) {
+	f, err := openSource(j)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.CopyBuffer(h, struct{ io.Reader }{f}, make([]byte, DefaultChunkSize)); err != nil {
+		return nil, err
+	}
+	sum := hex.EncodeToString(h.Sum(nil))
+	for _, c := range candidates {
+		if c.Entry.SHA256 == sum {
+			return &manifest.Entry{
+				Path:       j.rel,
+				Size:       j.info.Size(),
+				SHA256:     sum,
+				MTime:      j.info.ModTime(),
+				Source:     j.src,
+				ArchivedAt: time.Now().UTC(),
+				Ref:        &manifest.Ref{Tape: c.Tape.ID, Path: c.Entry.Path},
+			}, nil
+		}
+	}
+	return nil, nil
+}
+
+// openSource opens the source file and makes sure it is still the regular
+// file found while planning, not something swapped in since (for example a
+// symlink to a file the user should not be able to archive).
+func openSource(j job) (*os.File, error) {
+	f, err := os.Open(j.src)
+	if err != nil {
+		return nil, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if !st.Mode().IsRegular() || !os.SameFile(st, j.info) {
+		f.Close()
+		return nil, errors.New("source file was replaced after it was scanned")
+	}
+	return f, nil
 }
 
 // plan walks src and returns the regular files to archive in lexical order.
@@ -165,81 +317,250 @@ func plan(src, prefix string, log io.Writer) ([]job, error) {
 	return jobs, err
 }
 
-// archiveFile streams one file to the tape and returns its manifest entry.
+// archiveFile streams one file to the tape and returns its manifest entry,
+// chunk hashes, and how many bytes were skipped by resuming.
+//
 // Data goes to a partial file first and is renamed only once complete, so a
-// crash never leaves a truncated file under its final name.
-func archiveFile(tapeRoot string, j job, progressOut io.Writer) (manifest.Entry, error) {
-	dst := filepath.Join(tapeRoot, filepath.FromSlash(j.rel))
-	if _, err := os.Lstat(dst); err == nil {
-		return manifest.Entry{}, fmt.Errorf("%s exists on tape but is not in the manifest", dst)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return manifest.Entry{}, err
-	}
-
+// crash never leaves a truncated file under its final name. Progress is
+// checkpointed to the journal at jpath.
+func archiveFile(opts PutOptions, root *os.Root, j job, jpath string) (manifest.Entry, *manifest.Chunks, int64, error) {
+	var none manifest.Entry
+	dst := filepath.FromSlash(j.rel)
 	partial := dst + PartialSuffix
-	if err := os.Remove(partial); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return manifest.Entry{}, err
+	hdr := journalHeader{Source: j.src, Path: j.rel, Size: j.info.Size(), MTime: j.info.ModTime(), ChunkSize: opts.ChunkSize}
+
+	oldHdr, points, err := loadJournal(jpath)
+	if err != nil {
+		return none, nil, 0, err
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return manifest.Entry{}, err
+	journalValid := oldHdr != nil && sameHeader(*oldHdr, hdr)
+
+	if _, err := root.Lstat(dst); err == nil {
+		// A previous run may have renamed the file and stopped before
+		// writing the manifest entry.
+		if journalValid && len(points) > 0 {
+			if p := points[len(points)-1]; p.sha256 != "" && p.offset == j.info.Size() {
+				if st, err := root.Lstat(dst); err == nil && st.Mode().IsRegular() && st.Size() == p.offset {
+					return entryFor(j, p.sha256), chunksFor(j, opts.ChunkSize, p.chunks), p.offset, nil
+				}
+			}
+		}
+		return none, nil, 0, fmt.Errorf("%s exists on tape but is not in the manifest", j.rel)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return none, nil, 0, err
 	}
 
-	in, err := os.Open(j.src)
+	var start *resumePoint
+	if journalValid {
+		if start, err = pickResumePoint(root, partial, points, j.info.Size(), opts.ChunkSize); err != nil {
+			return none, nil, 0, err
+		}
+	}
+
+	in, err := openSource(j)
 	if err != nil {
-		return manifest.Entry{}, err
+		return none, nil, 0, err
 	}
 	defer in.Close()
 
-	out, err := os.OpenFile(partial, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		return manifest.Entry{}, err
+	h := sha256.New()
+	var out *os.File
+	var chunks []string
+	var offset int64
+	if start != nil {
+		if err := h.(encoding.BinaryUnmarshaler).UnmarshalBinary(start.state); err != nil {
+			return none, nil, 0, fmt.Errorf("restoring checkpoint: %w", err)
+		}
+		if out, err = root.OpenFile(partial, os.O_WRONLY, 0); err != nil {
+			return none, nil, 0, err
+		}
+		offset, chunks = start.offset, start.chunks
+		if err := out.Truncate(offset); err == nil {
+			_, err = out.Seek(offset, io.SeekStart)
+		}
+		if err == nil {
+			_, err = in.Seek(offset, io.SeekStart)
+		}
+		if err != nil {
+			out.Close()
+			return none, nil, 0, err
+		}
+	} else {
+		if err := root.Remove(partial); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return none, nil, 0, err
+		}
+		if err := root.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return none, nil, 0, err
+		}
+		if out, err = root.OpenFile(partial, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644); err != nil {
+			return none, nil, 0, err
+		}
 	}
+	resumed := offset
+
 	ok := false
 	defer func() {
 		if !ok {
 			out.Close()
-			os.Remove(partial)
 		}
 	}()
 
-	h := sha256.New()
-	prog := startProgress(progressOut, j.info.Size())
-	// Wrap the reader so io.CopyBuffer uses our buffer instead of a
-	// WriterTo fast path with small chunks.
-	n, err := io.CopyBuffer(io.MultiWriter(out, h, prog), struct{ io.Reader }{in}, make([]byte, copyBufferSize))
+	jr, err := writeJournal(jpath, hdr, start)
+	if err != nil {
+		return none, nil, 0, err
+	}
+	defer jr.close()
+
+	prog := startProgress(opts.Progress, j.info.Size())
+	prog.done.Store(offset)
+	err = copyChunks(in, out, h, prog, &offset, &chunks, opts, jr)
 	prog.finish()
 	if err != nil {
-		return manifest.Entry{}, err
+		return none, nil, 0, err
 	}
 
 	after, err := in.Stat()
 	if err != nil {
-		return manifest.Entry{}, err
+		return none, nil, 0, err
 	}
-	if n != j.info.Size() || after.Size() != j.info.Size() || !after.ModTime().Equal(j.info.ModTime()) {
-		return manifest.Entry{}, errors.New("source changed while it was being archived")
+	if offset != j.info.Size() || after.Size() != j.info.Size() || !after.ModTime().Equal(j.info.ModTime()) {
+		return none, nil, 0, errors.New("source changed while it was being archived")
 	}
 
 	if err := out.Sync(); err != nil {
-		return manifest.Entry{}, err
-	}
-	if err := out.Close(); err != nil {
-		return manifest.Entry{}, err
-	}
-	if err := os.Chtimes(partial, j.info.ModTime(), j.info.ModTime()); err != nil {
-		return manifest.Entry{}, err
-	}
-	if err := os.Rename(partial, dst); err != nil {
-		return manifest.Entry{}, err
+		return none, nil, 0, err
 	}
 	ok = true
+	if err := out.Close(); err != nil {
+		return none, nil, 0, err
+	}
+	state, err := h.(encoding.BinaryMarshaler).MarshalBinary()
+	if err != nil {
+		return none, nil, 0, err
+	}
+	sum := hex.EncodeToString(h.Sum(nil))
+	if err := jr.append(journalRecord{Offset: offset, State: state, Chunks: pendingChunks(chunks, jr), SHA256: sum}); err != nil {
+		return none, nil, 0, err
+	}
+	if err := root.Chtimes(partial, j.info.ModTime(), j.info.ModTime()); err != nil {
+		return none, nil, 0, err
+	}
+	if err := root.Rename(partial, dst); err != nil {
+		return none, nil, 0, err
+	}
+	return entryFor(j, sum), chunksFor(j, opts.ChunkSize, chunks), resumed, nil
+}
 
+// copyChunks copies in to out one chunk at a time, hashing each chunk and the
+// whole stream, and writes a journal checkpoint every opts.CheckpointEvery
+// bytes once the data up to that point is synced.
+func copyChunks(in io.Reader, out *os.File, h hash.Hash, prog io.Writer, offset *int64, chunks *[]string, opts PutOptions, jr *journal) error {
+	buf := make([]byte, opts.ChunkSize)
+	lastCheckpoint := *offset
+	for {
+		n, rerr := io.ReadFull(in, buf)
+		if n > 0 {
+			if _, err := out.Write(buf[:n]); err != nil {
+				return err
+			}
+			h.Write(buf[:n])
+			prog.Write(buf[:n])
+			c := sha256.Sum256(buf[:n])
+			*chunks = append(*chunks, hex.EncodeToString(c[:]))
+			*offset += int64(n)
+		}
+		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+			return nil
+		}
+		if rerr != nil {
+			return rerr
+		}
+		if *offset-lastCheckpoint >= opts.CheckpointEvery {
+			if err := out.Sync(); err != nil {
+				return err
+			}
+			state, err := h.(encoding.BinaryMarshaler).MarshalBinary()
+			if err != nil {
+				return err
+			}
+			if err := jr.append(journalRecord{Offset: *offset, State: state, Chunks: pendingChunks(*chunks, jr)}); err != nil {
+				return err
+			}
+			lastCheckpoint = *offset
+			if err := hook("checkpoint", *offset); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// pendingChunks returns the chunk hashes not yet recorded in the journal.
+func pendingChunks(chunks []string, jr *journal) []string {
+	p := chunks[jr.recorded:]
+	jr.recorded = len(chunks)
+	return p
+}
+
+// pickResumePoint returns the latest checkpoint whose data is fully present
+// in the partial file, after checking that its last chunk reads back
+// correctly. LTFS may lose data written after its last index update, so the
+// partial file can be shorter than the newest checkpoint.
+func pickResumePoint(root *os.Root, partial string, points []resumePoint, size, chunkSize int64) (*resumePoint, error) {
+	st, err := root.Lstat(partial)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, nil
+	}
+	f, err := root.Open(partial)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	for i := len(points) - 1; i >= 0; i-- {
+		p := points[i]
+		// The journal is a local file but may be damaged; never trust its
+		// offsets for allocations or seeks without checking them.
+		if p.offset <= 0 || p.offset > st.Size() || p.offset > size ||
+			int64(len(p.chunks)) != (p.offset+chunkSize-1)/chunkSize {
+			continue
+		}
+		last := int64(len(p.chunks)-1) * chunkSize
+		buf := make([]byte, p.offset-last)
+		if _, err := f.ReadAt(buf, last); err != nil {
+			continue
+		}
+		c := sha256.Sum256(buf)
+		if hex.EncodeToString(c[:]) == p.chunks[len(p.chunks)-1] {
+			return &p, nil
+		}
+	}
+	return nil, nil
+}
+
+func sameHeader(a, b journalHeader) bool {
+	return a.Source == b.Source && a.Path == b.Path && a.Size == b.Size && a.MTime.Equal(b.MTime) && a.ChunkSize == b.ChunkSize
+}
+
+func entryFor(j job, sum string) manifest.Entry {
 	return manifest.Entry{
 		Path:       j.rel,
-		Size:       n,
-		SHA256:     hex.EncodeToString(h.Sum(nil)),
+		Size:       j.info.Size(),
+		SHA256:     sum,
 		MTime:      j.info.ModTime(),
 		Source:     j.src,
 		ArchivedAt: time.Now().UTC(),
-	}, nil
+	}
+}
+
+func chunksFor(j job, size int64, chunks []string) *manifest.Chunks {
+	if chunks == nil {
+		chunks = []string{}
+	}
+	return &manifest.Chunks{Path: j.rel, ChunkSize: size, SHA256: chunks}
 }

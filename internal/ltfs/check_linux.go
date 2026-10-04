@@ -22,3 +22,14 @@ func CheckMounted(path string) error {
 	}
 	return nil
 }
+
+// VolumeUUID returns the LTFS volume UUID of the tape mounted at path, or ""
+// if path is not an LTFS mount.
+func VolumeUUID(path string) string {
+	buf := make([]byte, 128)
+	n, err := syscall.Getxattr(path, "user.ltfs.volumeUUID", buf)
+	if err != nil {
+		return ""
+	}
+	return string(buf[:n])
+}

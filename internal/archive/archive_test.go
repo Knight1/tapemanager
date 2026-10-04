@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Knight1/tapemanager/internal/catalog"
 	"github.com/Knight1/tapemanager/internal/manifest"
 )
 
@@ -42,9 +43,22 @@ func setup(t *testing.T) (src, tape string) {
 	return src, tape
 }
 
+func newCatalog(t *testing.T, tape string) *catalog.Catalog {
+	t.Helper()
+	c, err := catalog.Open(filepath.Join(filepath.Dir(tape), "catalog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func opts(t *testing.T, src, tape string) PutOptions {
+	return PutOptions{TapeRoot: tape, Source: src, Catalog: newCatalog(t, tape), Log: io.Discard}
+}
+
 func put(t *testing.T, src, tape string) PutSummary {
 	t.Helper()
-	sum, err := Put(PutOptions{TapeRoot: tape, Source: src, Log: io.Discard})
+	sum, err := Put(opts(t, src, tape))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +142,7 @@ func TestPutRefusesChangedSource(t *testing.T) {
 	put(t, src, tape)
 	writeFile(t, filepath.Join(src, "a.iso"), "alpha v2")
 
-	_, err := Put(PutOptions{TapeRoot: tape, Source: src, Log: io.Discard})
+	_, err := Put(opts(t, src, tape))
 	if err == nil || !strings.Contains(err.Error(), "different version") {
 		t.Fatalf("err = %v", err)
 	}
@@ -147,7 +161,7 @@ func TestPutReplacesStalePartial(t *testing.T) {
 func TestPutRefusesUnknownFileOnTape(t *testing.T) {
 	src, tape := setup(t)
 	writeFile(t, filepath.Join(tape, "downloads", "a.iso"), "something else")
-	_, err := Put(PutOptions{TapeRoot: tape, Source: src, Log: io.Discard})
+	_, err := Put(opts(t, src, tape))
 	if err == nil || !strings.Contains(err.Error(), "not in the manifest") {
 		t.Fatalf("err = %v", err)
 	}
@@ -155,7 +169,9 @@ func TestPutRefusesUnknownFileOnTape(t *testing.T) {
 
 func TestPutSingleFileWithDest(t *testing.T) {
 	src, tape := setup(t)
-	_, err := Put(PutOptions{TapeRoot: tape, Source: filepath.Join(src, "a.iso"), Prefix: "isos/a.iso", Log: io.Discard})
+	o := opts(t, filepath.Join(src, "a.iso"), tape)
+	o.Prefix = "isos/a.iso"
+	_, err := Put(o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,8 +182,10 @@ func TestPutSingleFileWithDest(t *testing.T) {
 
 func TestPutRejectsEscapingDest(t *testing.T) {
 	src, tape := setup(t)
-	for _, p := range []string{"../x", "/abs", ".."} {
-		if _, err := Put(PutOptions{TapeRoot: tape, Source: src, Prefix: p, Log: io.Discard}); err == nil {
+	for _, p := range []string{"../x", "/abs", "..", ".tapemgr", ".tapemgr/x"} {
+		o := opts(t, src, tape)
+		o.Prefix = p
+		if _, err := Put(o); err == nil {
 			t.Errorf("prefix %q accepted", p)
 		}
 	}
