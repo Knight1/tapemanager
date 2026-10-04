@@ -32,12 +32,19 @@ Usage:
   tapemgr catalog import [flags]           copy the mounted tape's manifest into the catalog
   tapemgr catalog tapes [flags]            list known tapes
   tapemgr catalog search [flags] <query>   find files by path or SHA-256 prefix
+  tapemgr drive list                       list attached tape drives
+  tapemgr drive info [flags]               show drive, cartridge, error counters and TapeAlert flags
+  tapemgr drive check [flags]              exit 1 if the drive needs cleaning or reports errors
+  tapemgr drive load [flags]               load the inserted cartridge
+  tapemgr drive eject [flags]              rewind and eject the cartridge (refused while mounted)
   tapemgr version
 
 Common flags:
   --tape DIR          LTFS mount point (default $TAPEMGR_TAPE or /mnt/ltfs)
   --catalog DIR       local catalog (default $TAPEMGR_CATALOG or /var/lib/tapemgr)
   --no-mount-check    allow a tape root that is not an LTFS mount
+  --device PATH       drive commands: sg device (default $TAPEMGR_DEVICE, the
+                      drive of the mounted tape, or the only drive)
 
 Run 'tapemgr <group> <command> -h' for command flags.
 `
@@ -67,6 +74,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		"catalog import":  cmdImport,
 		"catalog tapes":   cmdTapes,
 		"catalog search":  cmdSearch,
+		"drive list":      cmdDriveList,
+		"drive info":      cmdDriveInfo,
+		"drive check":     cmdDriveCheck,
+		"drive load":      cmdDriveLoad,
+		"drive eject":     cmdDriveEject,
 	}
 	if len(args) >= 2 {
 		if args[0] == "archive" && args[1] == "purge-source" {
@@ -178,6 +190,7 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 		Log:      stdout,
 		Progress: progressOut(stderr),
 	})
+	printDriveWarnings(cf.tape, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "tapemgr:", err)
 		if errors.Is(err, archive.ErrTapeFull) {
@@ -228,6 +241,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 		Log:      stdout,
 		Progress: progressOut(stderr),
 	})
+	printDriveWarnings(cf.tape, stderr)
 	if err != nil && res.Files == 0 {
 		return fail(stderr, err)
 	}
