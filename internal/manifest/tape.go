@@ -376,6 +376,58 @@ func (t *Tape) WriteSegment(seg Segment, all []Entry) error {
 	return nil
 }
 
+// WriteParity adds parity to existing segment n that has none, for example
+// after a crash interrupted the parity write following its manifest. It
+// refuses if the segment already has a parity list.
+func (t *Tape) WriteParity(n int, pars []Parity, data io.Reader) error {
+	if len(pars) == 0 {
+		return nil
+	}
+	list := segmentName(n, parityListSuffix)
+	if _, err := t.root.Lstat(list); err == nil {
+		return fmt.Errorf("segment %d already has parity", n)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err := t.root.Lstat(segmentName(n, manifestSuffix)); err != nil {
+		return fmt.Errorf("segment %d: %w", n, err)
+	}
+	for _, name := range []string{segmentName(n, paritySuffix), segmentName(n, paritySuffix) + ".tmp", list + ".tmp"} {
+		if err := t.root.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if err := t.writeStream(segmentName(n, paritySuffix), data); err != nil {
+		t.root.Remove(segmentName(n, paritySuffix) + ".tmp")
+		return err
+	}
+	p, err := MarshalJSONL(pars)
+	if err != nil {
+		return err
+	}
+	return t.writeAtomic(list, p)
+}
+
+// EnsureSums rewrites SHA256SUMS if it does not match all, for example after
+// a crash between a segment's manifest and its SHA256SUMS update.
+func (t *Tape) EnsureSums(all []Entry) error {
+	want := sumsContent(all)
+	f, err := t.root.Open(SumsName)
+	if err == nil {
+		got, rerr := io.ReadAll(io.LimitReader(f, int64(len(want))+1))
+		f.Close()
+		if rerr == nil && string(got) == want {
+			return nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if len(all) == 0 {
+		return nil
+	}
+	return t.writeAtomic(SumsName, []byte(want))
+}
+
 func (t *Tape) writeStream(name string, r io.Reader) error {
 	tmp := name + ".tmp"
 	f, err := t.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
@@ -390,13 +442,17 @@ func (t *Tape) writeStream(name string, r io.Reader) error {
 }
 
 func (t *Tape) writeSums(all []Entry) error {
+	return t.writeAtomic(SumsName, []byte(sumsContent(all)))
+}
+
+func sumsContent(all []Entry) string {
 	var b strings.Builder
 	for _, e := range all {
 		if e.Ref == nil {
 			fmt.Fprintf(&b, "%s  %s\n", e.SHA256, e.Path)
 		}
 	}
-	return t.writeAtomic(SumsName, []byte(b.String()))
+	return b.String()
 }
 
 func (t *Tape) writeAtomic(name string, data []byte) error {

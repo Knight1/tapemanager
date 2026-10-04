@@ -9,17 +9,21 @@
 //	<dir>/parity/<id>/         parity staged until the next segment write
 //	<dir>/pending/<id>.jsonl   records not yet written to the tape
 //	<dir>/written/<id>.jsonl   records this machine wrote to the tape
+//	<dir>/continue/<key>.json  archive runs that filled a tape and continue on the next
 //
 // The manifest on the tape is authoritative. The catalog is updated after the
 // tape, so a failed catalog write never loses archived data.
 package catalog
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -150,7 +154,9 @@ func (c *Catalog) Written() ([]Hit, error) {
 		if err != nil {
 			return nil, err
 		}
-		entries, err := manifest.Read(f)
+		// Damaged lines are skipped: that only makes purge keep more files
+		// and put skip fewer.
+		entries, _, err := manifest.ReadJSONLLenient[manifest.Entry](f)
 		f.Close()
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", n, err)
@@ -164,6 +170,119 @@ func (c *Catalog) Written() ([]Hit, error) {
 
 // ParityDir returns the directory for staged parity of tape id.
 func (c *Catalog) ParityDir(id string) string { return filepath.Join(c.Dir, "parity", id) }
+
+// Continuation records an archive run that filled one or more tapes, so
+// running the same command on the next tape skips what is already on them.
+type Continuation struct {
+	Source  string    `json:"source"`
+	Prefix  string    `json:"prefix"`
+	Tapes   []string  `json:"tapes"`
+	Updated time.Time `json:"updated"`
+}
+
+func (c *Catalog) continuationPath(source, prefix string) string {
+	h := sha256.Sum256([]byte(source + "\x00" + prefix))
+	return filepath.Join(c.Dir, "continue", hex.EncodeToString(h[:16])+".json")
+}
+
+// Continuation returns the open continuation for source and prefix, or nil.
+func (c *Catalog) Continuation(source, prefix string) (*Continuation, error) {
+	b, err := os.ReadFile(c.continuationPath(source, prefix))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var cont Continuation
+	if err := json.Unmarshal(b, &cont); err != nil || cont.Source != source || cont.Prefix != prefix {
+		return nil, nil
+	}
+	ids := cont.Tapes[:0]
+	for _, id := range cont.Tapes {
+		if manifest.ValidID(id) {
+			ids = append(ids, id)
+		}
+	}
+	cont.Tapes = ids
+	return &cont, nil
+}
+
+// AddContinuation notes that the run for source and prefix filled tape id.
+func (c *Catalog) AddContinuation(source, prefix, id string) error {
+	cont, err := c.Continuation(source, prefix)
+	if err != nil {
+		return err
+	}
+	if cont == nil {
+		cont = &Continuation{Source: source, Prefix: prefix}
+	}
+	if !slices.Contains(cont.Tapes, id) {
+		cont.Tapes = append(cont.Tapes, id)
+	}
+	cont.Updated = time.Now().UTC()
+	b, err := json.MarshalIndent(cont, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Join(c.Dir, "continue"), 0o755); err != nil {
+		return err
+	}
+	return manifest.WriteFileAtomic(c.continuationPath(source, prefix), append(b, '\n'))
+}
+
+// ClearContinuation ends the continuation for source and prefix.
+func (c *Catalog) ClearContinuation(source, prefix string) error {
+	err := os.Remove(c.continuationPath(source, prefix))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+// FindTape identifies a cataloged tape whose volume record cannot be read:
+// by its LTFS volume UUID if known, otherwise by its manifest entries. It
+// returns "" unless exactly one tape matches.
+func (c *Catalog) FindTape(ltfsUUID string, entries []manifest.Entry) string {
+	tapes, err := c.Tapes()
+	if err != nil {
+		return ""
+	}
+	var match []string
+	for _, t := range tapes {
+		if ltfsUUID != "" {
+			if t.LTFSUUID == ltfsUUID {
+				match = append(match, t.ID)
+			}
+			continue
+		}
+		if len(entries) == 0 {
+			continue
+		}
+		known, err := c.Entries(t.ID)
+		if err != nil {
+			continue
+		}
+		sums := make(map[string]string, len(known))
+		for _, e := range known {
+			sums[e.Path] = e.SHA256
+		}
+		all := true
+		for _, e := range entries[:min(len(entries), 50)] {
+			if sums[e.Path] != e.SHA256 {
+				all = false
+				break
+			}
+		}
+		if all {
+			match = append(match, t.ID)
+		}
+	}
+	if len(match) == 1 {
+		return match[0]
+	}
+	return ""
+}
 
 // JournalDir returns the directory for resume journals of tape id.
 func (c *Catalog) JournalDir(id string) string { return filepath.Join(c.Dir, "journal", id) }

@@ -263,14 +263,22 @@ func TestRestoreWithoutHardLinks(t *testing.T) {
 	}
 }
 
-func TestRestoreReplacesStalePartial(t *testing.T) {
+// Restore never touches files it did not create, whatever their names.
+func TestRestoreLeavesForeignFilesAlone(t *testing.T) {
 	src, tape := setup(t)
 	put(t, src, tape)
 	dest := filepath.Join(filepath.Dir(tape), "out")
-	writeFile(t, filepath.Join(dest, "downloads", "a.iso"+PartialSuffix), "stale")
+	foreign := filepath.Join(dest, "downloads", "a.iso"+PartialSuffix)
+	writeFile(t, foreign, "mine")
 	res, err := Restore(RestoreOptions{TapeRoot: tape, Dest: dest, Log: io.Discard})
 	if err != nil || res.Files != 3 || res.Failed != 0 {
 		t.Fatalf("res = %+v, %v", res, err)
+	}
+	if b, _ := os.ReadFile(foreign); string(b) != "mine" {
+		t.Fatal("foreign file touched")
+	}
+	if left, _ := filepath.Glob(filepath.Join(dest, "downloads", "*.tapemgr-restore-*")); len(left) != 0 {
+		t.Fatalf("temp files left: %v", left)
 	}
 }
 
@@ -291,4 +299,169 @@ func TestRenamedFileFinishedWithOtherSettings(t *testing.T) {
 	}
 	_, dest := restoreAll(t, tape)
 	checkRestored(t, dest, big, small)
+}
+
+// A damaged volume record must not leave an older pass in place.
+func TestDamagedVolumeStillRecordsVerify(t *testing.T) {
+	src, tape := setup(t)
+	o := opts(t, src, tape)
+	put(t, src, tape)
+	verifyWith(t, tape, o.Catalog)
+	os.WriteFile(filepath.Join(tape, manifest.Dir, manifest.VolumeName), []byte("{garbage"), 0o644)
+	damage(t, filepath.Join(tape, "downloads", "a.iso"), 0, 1)
+
+	res, _ := Verify(VerifyOptions{TapeRoot: tape, Catalog: o.Catalog, Log: io.Discard})
+	if res.Failed != 1 || res.Problems < 1 {
+		t.Fatalf("res = %+v", res)
+	}
+	if p := planPurge(t, src, tape, o.Catalog, false); len(p.Delete) != 0 {
+		t.Fatal("purge allowed after a failed verify of a tape with a damaged volume record")
+	}
+}
+
+func TestUnidentifiedTapeReportsUnrecorded(t *testing.T) {
+	src, tape := setup(t)
+	o := opts(t, src, tape)
+	put(t, src, tape)
+	os.WriteFile(filepath.Join(tape, manifest.Dir, manifest.VolumeName), []byte("{garbage"), 0o644)
+	empty := newCatalog(t, filepath.Join(t.TempDir(), "x"))
+	_, err := Verify(VerifyOptions{TapeRoot: tape, Catalog: empty, Log: io.Discard})
+	if err == nil || !strings.Contains(err.Error(), "NOT recorded") {
+		t.Fatalf("err = %v", err)
+	}
+	_ = o
+}
+
+// A process dying during the parity write must not lose that parity.
+func TestCrashDuringParityWriteKeepsParity(t *testing.T) {
+	_, tape, big, small, o := paritySetup(t)
+	testHook = func(stage string, _ int64) error {
+		if stage == "parity-data" {
+			panic(errCrash)
+		}
+		return nil
+	}
+	func() {
+		defer func() { recover() }()
+		Put(o)
+	}()
+	testHook = nil
+	if entries, _ := loadEntries(tape); len(entries) != 2 {
+		t.Fatalf("precondition: manifest has %d entries", len(entries))
+	}
+	var log strings.Builder
+	o.Log = &log
+	if _, err := Put(o); err != nil {
+		t.Fatalf("%v\n%s", err, log.String())
+	}
+	tp, _ := manifest.Open(tape)
+	par, _, _ := tp.Parity()
+	tp.Close()
+	if len(par) != 2 {
+		t.Fatalf("parity records after recovery = %d\n%s", len(par), log.String())
+	}
+	damage(t, filepath.Join(tape, "src", "big.bin"), 0, pChunk)
+	damage(t, filepath.Join(tape, "src", "small.bin"), 0, 3)
+	_, dest := restoreAll(t, tape)
+	checkRestored(t, dest, big, small)
+}
+
+// Only a run that filled a tape continues on the next one; an intentional
+// second copy is archived in full.
+func TestSecondCopyIsArchived(t *testing.T) {
+	src, tape := setup(t)
+	o := opts(t, src, tape)
+	put(t, src, tape)
+	tape2 := filepath.Join(filepath.Dir(tape), "tape2")
+	os.MkdirAll(tape2, 0o755)
+	o.TapeRoot = tape2
+	sum, err := Put(o)
+	if err != nil || sum.Files != 3 || sum.Elsewhere != 0 {
+		t.Fatalf("second copy: %+v, %v", sum, err)
+	}
+}
+
+func TestContinuationEndsAfterCompleteRun(t *testing.T) {
+	src, tape := setup(t)
+	writeFile(t, filepath.Join(src, "z-last.bin"), strings.Repeat("z", 1000))
+	o := opts(t, src, tape)
+	reserve := metadataReserve(4, 1010, o.ChunkSizeOrDefault())
+	freeSpace = func(p string) (int64, error) {
+		if p == tape {
+			return reserve + 100, nil
+		}
+		return 1 << 40, nil
+	}
+	defer func() { freeSpace = realFreeSpace }()
+	if _, err := Put(o); !errors.Is(err, ErrTapeFull) {
+		t.Fatalf("err = %v", err)
+	}
+	tape2 := filepath.Join(filepath.Dir(tape), "tape2")
+	os.MkdirAll(tape2, 0o755)
+	o.TapeRoot = tape2
+	var log strings.Builder
+	o.Log = &log
+	if sum, err := Put(o); err != nil || sum.Elsewhere != 3 || !strings.Contains(log.String(), "CONTINUING") {
+		t.Fatalf("continuation: %+v, %v", sum, err)
+	}
+	// The run is complete; a third tape is a fresh copy.
+	tape3 := filepath.Join(filepath.Dir(tape), "tape3")
+	os.MkdirAll(tape3, 0o755)
+	o.TapeRoot = tape3
+	o.Log = io.Discard
+	if sum, err := Put(o); err != nil || sum.Files != 4 {
+		t.Fatalf("after completion: %+v, %v", sum, err)
+	}
+}
+
+// A file already renamed into place on a nearly full tape is finished, not
+// refused as not fitting.
+func TestRenamedFileOnFullTapeIsRecorded(t *testing.T) {
+	src, tape := setup(t)
+	writeFile(t, filepath.Join(src, "big.bin"), strings.Repeat("b", 5000))
+	o := opts(t, src, tape)
+	crashAt(t, "manifest", 4000)
+	Put(o)
+	testHook = nil
+	freeSpace = func(p string) (int64, error) {
+		if p == tape {
+			return metadataReserve(10, 6000, o.ChunkSizeOrDefault()) + 100, nil
+		}
+		return 1 << 40, nil
+	}
+	defer func() { freeSpace = realFreeSpace }()
+	// a.iso was recorded before the crash; big.bin is finished from its
+	// journal without needing space again.
+	sum, err := Put(o)
+	if err != nil || sum.Files != 3 || sum.Skipped != 1 || sum.Resumed != 5000 {
+		t.Fatalf("sum = %+v, err = %v", sum, err)
+	}
+}
+
+func TestDamagedWrittenLogDoesNotBlockPut(t *testing.T) {
+	src, tape := setup(t)
+	o := opts(t, src, tape)
+	sum := put(t, src, tape)
+	w := filepath.Join(o.Catalog.Dir, "written", sum.Tape.ID+".jsonl")
+	b, _ := os.ReadFile(w)
+	os.WriteFile(w, append([]byte("garbage\n"), b...), 0o644)
+	o.Catalog.AddContinuation(o.SourceAbs(t), "downloads", sum.Tape.ID)
+	tape2 := filepath.Join(filepath.Dir(tape), "tape2")
+	os.MkdirAll(tape2, 0o755)
+	o.TapeRoot = tape2
+	if _, err := Put(o); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStaleSumsRewritten(t *testing.T) {
+	src, tape := setup(t)
+	put(t, src, tape)
+	sums := filepath.Join(tape, manifest.SumsName)
+	os.WriteFile(sums, []byte("stale\n"), 0o644)
+	put(t, src, tape)
+	b, _ := os.ReadFile(sums)
+	if strings.Contains(string(b), "stale") || strings.Count(string(b), "\n") != 3 {
+		t.Fatalf("SHA256SUMS = %q", b)
+	}
 }

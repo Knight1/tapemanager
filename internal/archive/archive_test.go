@@ -250,3 +250,13 @@ func TestVerifyEmptyTape(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// SourceAbs returns the absolute source path as Put records it.
+func (o PutOptions) SourceAbs(t *testing.T) string {
+	t.Helper()
+	p, err := filepath.Abs(o.Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}

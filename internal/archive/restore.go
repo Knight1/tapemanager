@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -146,11 +147,11 @@ func restoreFile(tape *manifest.Tape, dest *os.Root, noClobber bool, e manifest.
 	if err := dest.MkdirAll(filepath.Dir(rel), 0o755); err != nil {
 		return false, err
 	}
-	tmp := rel + PartialSuffix
-	// A partial file of our own from an interrupted restore is replaced.
-	if err := dest.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return false, err
-	}
+	// A name unique to this attempt, created exclusively, so nothing that
+	// already exists in the destination is ever touched.
+	var rnd [8]byte
+	rand.Read(rnd[:])
+	tmp := rel + ".tapemgr-restore-" + hex.EncodeToString(rnd[:])
 	out, err := dest.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return false, err

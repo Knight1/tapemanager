@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Knight1/tapemanager/internal/catalog"
+	"github.com/Knight1/tapemanager/internal/ltfs"
 	"github.com/Knight1/tapemanager/internal/manifest"
 )
 
@@ -63,19 +64,38 @@ func Verify(opts VerifyOptions) (res VerifyResult, err error) {
 	}
 	defer tape.Close()
 
-	vol, _ := tape.Volume()
-	if opts.Catalog != nil && full && vol != nil {
+	var entries []manifest.Entry
+	vol, volErr := tape.Volume()
+	if volErr != nil {
+		fmt.Fprintf(opts.Log, "PROBLEM:   %v\n", volErr)
+		res.Problems++
+	}
+	if opts.Catalog != nil && full && (vol != nil || volErr != nil) {
 		defer func() {
 			res.Duration = time.Since(start)
 			if err != nil && !errors.Is(err, ErrNoEntries) {
 				res.Failed++
 			}
-			if rerr := recordVerify(opts.Catalog, opts.TapeRoot, vol.ID, res); rerr != nil {
+			// A damaged volume record must not leave an older pass in
+			// place: find the tape another way and record the result.
+			id := ""
+			if vol != nil {
+				id = vol.ID
+			} else {
+				id = opts.Catalog.FindTape(ltfs.VolumeUUID(opts.TapeRoot), entries)
+			}
+			if id == "" {
+				err = errors.Join(err, fmt.Errorf("the tape's volume record is damaged and the tape could not be identified in the catalog; this result was NOT recorded"))
+				return
+			}
+			if rerr := recordVerify(opts.Catalog, opts.TapeRoot, id, res); rerr != nil {
 				err = errors.Join(err, fmt.Errorf("updating catalog: %w", rerr))
 			}
 		}()
-		if n, err := pendingCount(opts.Catalog.PendingPath(vol.ID)); err == nil && n > 0 {
-			fmt.Fprintf(opts.Log, "WARNING:   %d archived files are not yet in the tape manifest; rerun 'archive put' to record them\n", n)
+		if vol != nil {
+			if n, err := pendingCount(opts.Catalog.PendingPath(vol.ID)); err == nil && n > 0 {
+				fmt.Fprintf(opts.Log, "WARNING:   %d archived files are not yet in the tape manifest; rerun 'archive put' to record them\n", n)
+			}
 		}
 	}
 

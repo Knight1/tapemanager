@@ -79,9 +79,9 @@ type PutOptions struct {
 	Catalog  *catalog.Catalog // local catalog, required
 	Dedup    bool             // store a reference instead of content already on tape
 	Parity   int              // parity overhead in percent, 0 for none
-	// Again archives files even if this machine already archived them to
-	// another tape. Without it such files are skipped, so a source larger
-	// than one tape continues on the next tape by running put again.
+	// Again ignores an open continuation: after a full tape, running the
+	// same put again on the next tape normally skips the files that went to
+	// the earlier tapes. With Again everything is archived.
 	Again    bool
 	Log      io.Writer // per-file output
 	Progress io.Writer // progress bar output, nil to disable
@@ -97,7 +97,7 @@ type PutSummary struct {
 	Tape      *manifest.Volume
 	Files     int
 	Skipped   int // already on this tape
-	Elsewhere int // already archived by this machine to another tape
+	Elsewhere int // already on an earlier tape of this run (continuation)
 	Deduped   int
 	Bytes     int64
 	Resumed   int64 // bytes not rewritten thanks to a resume checkpoint
@@ -195,10 +195,17 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		if err := hook("flush", int64(len(pend.records))); err != nil {
 			return err
 		}
-		onTape := make(map[string]string, len(existing))
+		onTape := make(map[string]manifest.Entry, len(existing))
 		for _, e := range existing {
-			onTape[e.Path] = e.SHA256
+			onTape[e.Path] = e
 		}
+		// Parity of records already on tape whose segment lost its parity
+		// write to a crash; written as an addendum to that segment.
+		tapeParity, _, err := tape.Parity()
+		if err != nil {
+			return err
+		}
+		addendum := map[int][]pendingRecord{}
 		var entries, written []manifest.Entry
 		var chunks []manifest.Chunks
 		var pars []manifest.Parity
@@ -214,9 +221,12 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 			written = append(written, r.Entry)
 			// A crash after the segment was written but before the
 			// pending log was cleared leaves records already on tape.
-			if sha, ok := onTape[r.Entry.Path]; ok {
-				if sha != r.Entry.SHA256 {
+			if e, ok := onTape[r.Entry.Path]; ok {
+				if e.SHA256 != r.Entry.SHA256 {
 					return fmt.Errorf("pending record for %s conflicts with the tape manifest", r.Entry.Path)
+				}
+				if _, has := tapeParity[r.Entry.Path]; r.Parity != nil && !has {
+					addendum[e.Segment] = append(addendum[e.Segment], r)
 				}
 				continue
 			}
@@ -255,6 +265,14 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		existing = all
 		// Recorded after the tape write and before clearing, so a crash in
 		// between repeats it rather than losing it. Duplicates are harmless.
+		for n, recs := range addendum {
+			paths, err := writeParityAddendum(tape, n, recs, parityDir)
+			if err != nil {
+				fmt.Fprintf(opts.Log, "WARNING:   could not add parity to segment %d: %v\n", n, err)
+				continue
+			}
+			staged = append(staged, paths...)
+		}
 		if err := opts.Catalog.RecordWritten(vol.ID, written); err != nil {
 			return fmt.Errorf("recording written files: %w", err)
 		}
@@ -275,25 +293,56 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 	}
 
 	removeStaleParity(parityDir, journalDir)
+	if err := tape.EnsureSums(existing); err != nil {
+		return sum, err
+	}
 
 	done := make(map[string]manifest.Entry, len(existing))
 	for _, e := range existing {
 		done[e.Path] = e
 	}
 
-	// Files this machine already archived to other tapes, by source.
+	// When an earlier run of this same source and destination filled a
+	// tape, files that went to those tapes are skipped here. Only that
+	// chain counts, so an intentional second copy on another tape is
+	// archived in full.
 	elsewhere := map[string][]catalog.Hit{}
-	if !opts.Again {
+	cont, err := opts.Catalog.Continuation(src, prefix)
+	if err != nil {
+		return sum, err
+	}
+	if cont != nil && !opts.Again {
+		chain := map[string]bool{}
+		for _, id := range cont.Tapes {
+			if id != vol.ID {
+				chain[id] = true
+			}
+		}
 		written, err := opts.Catalog.Written()
 		if err != nil {
 			return sum, err
 		}
 		for _, h := range written {
-			if h.Tape.ID != vol.ID {
+			if chain[h.Tape.ID] {
 				elsewhere[h.Entry.Source] = append(elsewhere[h.Entry.Source], h)
 			}
 		}
+		if len(chain) > 0 {
+			fmt.Fprintf(opts.Log, "CONTINUING: %s was started on %d earlier tape(s); files already there are skipped\n", src, len(chain))
+		}
 	}
+	defer func() {
+		switch {
+		case errors.Is(err, ErrTapeFull):
+			if cerr := opts.Catalog.AddContinuation(src, prefix, vol.ID); cerr != nil {
+				err = errors.Join(err, cerr)
+			}
+		case err == nil:
+			if cerr := opts.Catalog.ClearContinuation(src, prefix); cerr != nil {
+				err = cerr
+			}
+		}
+	}()
 
 	var dedup map[int64][]catalog.Hit
 	if opts.Dedup {
@@ -361,8 +410,8 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		}
 
 		layout := parity.ForFile(j.info.Size(), opts.ChunkSize, m)
-		if err := checkSpace(opts, tape.Root(), j, layout, pend, len(existing)); err != nil {
-			return sum, err
+		check := func(reused int64) error {
+			return checkSpace(opts, j, layout, pend, len(existing), reused)
 		}
 
 		fmt.Fprintf(opts.Log, "ARCHIVING: %s\n       %s\n", j.src, FormatBytes(j.info.Size()))
@@ -374,6 +423,7 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 			jpath: jpath,
 			ppath: filepath.Join(parityDir, fileKey(j.rel)+".bin"),
 			m:     m,
+			check: check,
 		})
 		if err != nil {
 			return sum, fmt.Errorf("%s: %w", j.src, err)
@@ -403,6 +453,41 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		sum.Resumed += resumed
 	}
 	return sum, nil
+}
+
+// writeParityAddendum writes the staged parity of recs, which are already
+// recorded in segment n, as that segment's parity. It returns the staged
+// files that were written.
+func writeParityAddendum(tape *manifest.Tape, n int, recs []pendingRecord, parityDir string) ([]string, error) {
+	var pars []manifest.Parity
+	var readers []io.Reader
+	var paths []string
+	defer func() {
+		for _, r := range readers {
+			r.(*os.File).Close()
+		}
+	}()
+	var off int64
+	for _, r := range recs {
+		ppath := filepath.Join(parityDir, fileKey(r.Entry.Path)+".bin")
+		if !stagedParityOK(ppath, r.Parity) {
+			continue
+		}
+		f, err := os.Open(ppath)
+		if err != nil {
+			return nil, err
+		}
+		readers = append(readers, f)
+		p := *r.Parity
+		p.Offset = off
+		off += p.Layout.ParitySize()
+		pars = append(pars, p)
+		paths = append(paths, ppath)
+	}
+	if err := tape.WriteParity(n, pars, io.MultiReader(readers...)); err != nil {
+		return nil, err
+	}
+	return paths, nil
 }
 
 // hookReader lets tests make the parity data stream fail.
@@ -438,17 +523,17 @@ func archivedElsewhere(j job, hits []catalog.Hit) *catalog.Hit {
 // data, its parity, the parity already staged for the next segment, and the
 // segment's metadata, so the final segment write of a full tape still
 // succeeds. On the catalog disk it needs room for its staged parity.
-func checkSpace(opts PutOptions, root *os.Root, j job, l *parity.Layout, pend *pending, entries int) error {
+//
+// reused is the part of the file already on tape from an interrupted run
+// that is resumed. A partial file that is not resumed does not count: LTFS
+// never reclaims space, so rewriting it needs the full size again.
+func checkSpace(opts PutOptions, j job, l *parity.Layout, pend *pending, entries int, reused int64) error {
 	var paritySize int64
 	if l != nil {
 		paritySize = l.ParitySize()
 	}
-	need := j.info.Size() + paritySize + pend.parityBytes +
+	need := j.info.Size() - reused + paritySize + pend.parityBytes +
 		metadataReserve(entries+len(pend.records)+1, pend.bytes+j.info.Size(), opts.ChunkSize)
-	// A partial file from an interrupted run already takes its space.
-	if st, err := root.Lstat(filepath.FromSlash(j.rel) + PartialSuffix); err == nil {
-		need -= min(st.Size(), j.info.Size())
-	}
 	free, err := freeSpace(opts.TapeRoot)
 	if err != nil {
 		return err
@@ -584,6 +669,9 @@ type fileState struct {
 	jpath string // resume journal
 	ppath string // staged parity
 	m     int    // parity shards per stripe, 0 for none
+	// check is called once it is known how much of the file is already on
+	// tape and will be reused, to make sure the rest fits.
+	check func(reused int64) error
 }
 
 // archived is the result of archiveFile.
@@ -645,10 +733,23 @@ func archiveFile(fs fileState) (*archived, error) {
 	var start *resumePoint
 	if journalValid && (layout == nil || layout.Scheme == parity.SchemeWindow) {
 		var accept func(*resumePoint) bool
-		if layout != nil {
-			accept = func(p *resumePoint) bool { return parityResumable(fs.ppath, layout, p) }
+		if layout != nil && len(points) > 0 {
+			// Hash lists are cumulative, so the staged file is checked once
+			// against the newest list; older points only compare lengths.
+			valid := stagedValidPrefix(fs.ppath, layout.ShardSize, points[len(points)-1].parityHashes)
+			accept = func(p *resumePoint) bool { return parityResumable(layout, p, valid) }
 		}
 		if start, err = pickResumePoint(root, partial, points, j.info.Size(), opts.ChunkSize, accept); err != nil {
+			return nil, err
+		}
+	}
+
+	if fs.check != nil {
+		var reused int64
+		if start != nil {
+			reused = start.offset
+		}
+		if err := fs.check(reused); err != nil {
 			return nil, err
 		}
 	}
@@ -960,15 +1061,36 @@ func (t *transfer) checkpoint() error {
 
 // parityResumable reports whether a resume point lies on a window boundary
 // and the staged parity up to it is intact.
-func parityResumable(ppath string, l *parity.Layout, p *resumePoint) bool {
+// valid is the number of leading staged parity shards that match their
+// recorded hashes.
+func parityResumable(l *parity.Layout, p *resumePoint, valid int) bool {
 	chunks := p.offset / l.ShardSize
 	if p.offset%l.ShardSize != 0 || chunks%int64(l.K*l.D) != 0 {
 		return false
 	}
-	if int64(len(p.parityHashes)) != chunks/int64(l.K)*int64(l.M) {
-		return false
+	n := len(p.parityHashes)
+	return int64(n) == chunks/int64(l.K)*int64(l.M) && n <= valid
+}
+
+// stagedValidPrefix returns how many leading shards of the staged parity
+// file match hashes.
+func stagedValidPrefix(ppath string, shardSize int64, hashes []string) int {
+	f, err := os.Open(ppath)
+	if err != nil {
+		return 0
 	}
-	return stagedShardsOK(ppath, l.ShardSize, p.parityHashes)
+	defer f.Close()
+	buf := make([]byte, shardSize)
+	for i, want := range hashes {
+		if _, err := io.ReadFull(f, buf); err != nil {
+			return i
+		}
+		got := sha256.Sum256(buf)
+		if hex.EncodeToString(got[:]) != want {
+			return i
+		}
+	}
+	return len(hashes)
 }
 
 // stagedParityOK reports whether the staged parity file holds exactly the
