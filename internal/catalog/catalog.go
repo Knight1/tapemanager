@@ -120,6 +120,10 @@ func (c *Catalog) RecordWritten(id string, entries []manifest.Entry) error {
 	if err != nil {
 		return err
 	}
+	if err := manifest.SyncDir(filepath.Dir(c.writtenPath(id))); err != nil {
+		f.Close()
+		return err
+	}
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		return err

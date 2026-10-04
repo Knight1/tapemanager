@@ -296,3 +296,21 @@ func TestEntriesLenientSkipsDamage(t *testing.T) {
 		t.Fatalf("list = %+v, problems = %v, err = %v", list, problems, err)
 	}
 }
+
+// A temporary file left by a crash is overwritten, and the result is
+// complete with no temporary file left behind.
+func TestWriteFileAtomicAfterCrash(t *testing.T) {
+	dir := t.TempDir()
+	name := filepath.Join(dir, "f.json")
+	os.WriteFile(name, []byte("old"), 0o644)
+	os.WriteFile(name+".tmp", []byte("half-written garbage from a crash"), 0o644)
+	if err := WriteFileAtomic(name, []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(name); string(b) != "new" {
+		t.Fatalf("content = %q", b)
+	}
+	if _, err := os.Stat(name + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("temporary file left behind")
+	}
+}

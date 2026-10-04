@@ -20,11 +20,14 @@ package manifest
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Knight1/tapemanager/internal/parity"
@@ -288,14 +291,42 @@ func MarshalJSONL[T any](list []T) ([]byte, error) {
 }
 
 // WriteFileAtomic replaces the local file name with data so readers see
-// either the old or the new content, never a partial file.
+// either the old or the new content, never a partial file, even if the
+// process or the host dies at any point: the data goes to a temporary file
+// that is synced, renamed over the old file in one atomic step, and the
+// directory is synced so the rename itself survives a power loss. The old
+// file is never removed first, which would leave a moment with no file.
 func WriteFileAtomic(name string, data []byte) error {
 	tmp := name + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	return finishAtomic(f, data, func() error { return os.Rename(tmp, name) })
+	return finishAtomic(f, data, func() error {
+		if err := os.Rename(tmp, name); err != nil {
+			return err
+		}
+		return SyncDir(filepath.Dir(name))
+	})
+}
+
+// SyncDir makes creates, renames and removals in dir durable. Filesystems
+// that cannot sync directories (some FUSE and network filesystems) are
+// accepted as they are.
+func SyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return ignoreUnsupported(d.Sync())
+}
+
+func ignoreUnsupported(err error) error {
+	if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOSYS) {
+		return nil
+	}
+	return err
 }
 
 func finishAtomic(f *os.File, data []byte, rename func() error) error {

@@ -146,6 +146,9 @@ func Recover(opts RecoverOptions) (res RecoverResult, err error) {
 		if err := tape.WriteSegment(manifest.Segment{Entries: batch, Chunks: chunks}, all); err != nil {
 			return fmt.Errorf("writing manifest segment: %w", err)
 		}
+		if err := syncIndex(opts.TapeRoot); err != nil {
+			return err
+		}
 		existing = all
 		batch, chunks, batchBytes = nil, nil, 0
 		return nil

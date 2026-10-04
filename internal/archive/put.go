@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Knight1/tapemanager/internal/catalog"
@@ -51,6 +52,12 @@ var ErrTapeFull = errors.New("tape is full")
 var (
 	freeSpace     = ltfs.FreeSpace
 	realFreeSpace = ltfs.FreeSpace
+)
+
+// syncIndex forces the LTFS index to tape. Tests replace it.
+var (
+	syncIndex     = ltfs.SyncIndex
+	realSyncIndex = ltfs.SyncIndex
 )
 
 // metadataReserve estimates the tape space the next segment write needs
@@ -218,10 +225,10 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 			}
 		}()
 		for _, r := range pend.records {
-			written = append(written, r.Entry)
 			// A crash after the segment was written but before the
 			// pending log was cleared leaves records already on tape.
 			if e, ok := onTape[r.Entry.Path]; ok {
+				written = append(written, r.Entry)
 				if e.SHA256 != r.Entry.SHA256 {
 					return fmt.Errorf("pending record for %s conflicts with the tape manifest", r.Entry.Path)
 				}
@@ -230,6 +237,18 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 				}
 				continue
 			}
+			// After a host crash LTFS rolls back to its last index, which
+			// can undo a file that was complete when it was recorded here.
+			// Only files really on tape are recorded; the others are
+			// archived again on the next run.
+			if r.Entry.Ref == nil {
+				st, err := tape.Root().Lstat(filepath.FromSlash(r.Entry.Path))
+				if err != nil || !st.Mode().IsRegular() || st.Size() != r.Entry.Size {
+					fmt.Fprintf(opts.Log, "WARNING:   %s is no longer complete on tape (interrupted run); it will be archived again\n", r.Entry.Path)
+					continue
+				}
+			}
+			written = append(written, r.Entry)
 			entries = append(entries, r.Entry)
 			if r.Chunks != nil {
 				chunks = append(chunks, *r.Chunks)
@@ -263,8 +282,6 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 			fmt.Fprintf(opts.Log, "WARNING:   %v; %d files in this batch have no parity\n", err, len(pars))
 		}
 		existing = all
-		// Recorded after the tape write and before clearing, so a crash in
-		// between repeats it rather than losing it. Duplicates are harmless.
 		for n, recs := range addendum {
 			paths, err := writeParityAddendum(tape, n, recs, parityDir)
 			if err != nil {
@@ -273,6 +290,14 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 			}
 			staged = append(staged, paths...)
 		}
+		// The local pending log is the only other copy of these records.
+		// Make LTFS write its index first, so a host crash cannot roll the
+		// tape back to before this segment once the log is cleared.
+		if err := syncIndex(opts.TapeRoot); err != nil {
+			return err
+		}
+		// Recorded after the tape write and before clearing, so a crash in
+		// between repeats it rather than losing it. Duplicates are harmless.
 		if err := opts.Catalog.RecordWritten(vol.ID, written); err != nil {
 			return fmt.Errorf("recording written files: %w", err)
 		}
@@ -453,6 +478,20 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		sum.Resumed += resumed
 	}
 	return sum, nil
+}
+
+// syncTapeDir makes a rename in dir on tape durable as far as the
+// filesystem allows. LTFS makes it durable with its next index write.
+func syncTapeDir(root *os.Root, dir string) error {
+	d, err := root.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOTSUP) && !errors.Is(err, syscall.EOPNOTSUPP) {
+		return err
+	}
+	return nil
 }
 
 // writeParityAddendum writes the staged parity of recs, which are already
@@ -856,6 +895,9 @@ func archiveFile(fs fileState) (*archived, error) {
 	if err := root.Rename(partial, dst); err != nil {
 		return nil, err
 	}
+	if err := syncTapeDir(root, filepath.Dir(dst)); err != nil {
+		return nil, err
+	}
 	return &archived{entry: entryFor(j, sum), chunks: chunksFor(j, opts.ChunkSize, t.chunks), parity: par, resumed: resumed}, nil
 }
 
@@ -893,8 +935,13 @@ func (t *transfer) startParity(ppath string, l *parity.Layout, start *resumePoin
 		if _, err := t.staging.Seek(end, io.SeekStart); err != nil {
 			return err
 		}
-	} else if t.staging, err = os.OpenFile(ppath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644); err != nil {
-		return err
+	} else {
+		if t.staging, err = os.OpenFile(ppath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644); err != nil {
+			return err
+		}
+		if err := manifest.SyncDir(filepath.Dir(ppath)); err != nil {
+			return err
+		}
 	}
 	if l.Scheme == parity.SchemeSmall {
 		t.small = bytes.NewBuffer(make([]byte, 0, l.Size))

@@ -60,6 +60,10 @@ func openPending(name string) (*pending, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := manifest.SyncDir(filepath.Dir(name)); err != nil {
+		f.Close()
+		return nil, err
+	}
 	p := &pending{f: f}
 
 	sc := bufio.NewScanner(f)

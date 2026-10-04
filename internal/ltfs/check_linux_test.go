@@ -30,3 +30,9 @@ func TestFreeSpace(t *testing.T) {
 		t.Error("missing path accepted")
 	}
 }
+
+func TestSyncIndexIgnoresPlainDirectories(t *testing.T) {
+	if err := SyncIndex(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+}

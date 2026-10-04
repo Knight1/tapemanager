@@ -13,3 +13,6 @@ func StartBlock(path string) (int64, bool) { return 0, false }
 
 // FreeSpace is unknown on this platform and reported as unlimited.
 func FreeSpace(path string) (int64, error) { return 1 << 62, nil }
+
+// SyncIndex is a no-op on this platform.
+func SyncIndex(root string) error { return nil }

@@ -438,7 +438,7 @@ func (t *Tape) writeStream(name string, r io.Reader) error {
 		f.Close()
 		return err
 	}
-	return finishAtomic(f, nil, func() error { return t.root.Rename(tmp, name) })
+	return finishAtomic(f, nil, func() error { return t.renameSynced(tmp, name) })
 }
 
 func (t *Tape) writeSums(all []Entry) error {
@@ -455,11 +455,30 @@ func sumsContent(all []Entry) string {
 	return b.String()
 }
 
+// writeAtomic replaces name on tape with data through a synced temporary
+// file and an atomic rename, then syncs the directory. See WriteFileAtomic.
 func (t *Tape) writeAtomic(name string, data []byte) error {
 	tmp := name + ".tmp"
 	f, err := t.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	return finishAtomic(f, data, func() error { return t.root.Rename(tmp, name) })
+	return finishAtomic(f, data, func() error { return t.renameSynced(tmp, name) })
+}
+
+func (t *Tape) renameSynced(tmp, name string) error {
+	if err := t.root.Rename(tmp, name); err != nil {
+		return err
+	}
+	return t.SyncDir(path.Dir(name))
+}
+
+// SyncDir syncs directory dir on tape.
+func (t *Tape) SyncDir(dir string) error {
+	d, err := t.root.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return ignoreUnsupported(d.Sync())
 }

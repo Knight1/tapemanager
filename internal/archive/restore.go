@@ -223,7 +223,7 @@ func restoreFile(tape *manifest.Tape, dest *os.Root, noClobber bool, e manifest.
 			}
 			return false, err
 		}
-		return repaired, nil
+		return repaired, syncTapeDir(dest, filepath.Dir(rel))
 	}
 	if _, err := dest.Lstat(rel); err == nil {
 		return false, fmt.Errorf("%s already exists in the destination", e.Path)
@@ -233,5 +233,5 @@ func restoreFile(tape *manifest.Tape, dest *os.Root, noClobber bool, e manifest.
 	if err := dest.Rename(tmp, rel); err != nil {
 		return false, err
 	}
-	return repaired, nil
+	return repaired, syncTapeDir(dest, filepath.Dir(rel))
 }

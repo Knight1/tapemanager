@@ -1,6 +1,7 @@
 package ltfs
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"syscall"
@@ -56,4 +57,19 @@ func FreeSpace(path string) (int64, error) {
 		return 0, err
 	}
 	return int64(st.Bavail) * int64(st.Bsize), nil
+}
+
+// SyncIndex makes LTFS write its index to tape now, so everything written
+// so far survives a host crash. LTFS otherwise writes the index only every
+// few minutes or at unmount, and after a crash rolls back to the last one.
+// It returns nil for directories that are not LTFS mounts.
+func SyncIndex(root string) error {
+	err := syscall.Setxattr(root, "user.ltfs.sync", []byte("1"), 0)
+	if err == nil || errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENODATA) {
+		return nil
+	}
+	if CheckMounted(root) != nil {
+		return nil // not LTFS, for example a test directory
+	}
+	return fmt.Errorf("forcing the LTFS index to tape: %w", err)
 }
