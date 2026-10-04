@@ -7,6 +7,7 @@
 //	<dir>/tapes/<id>.jsonl     copy of the tape's manifest.jsonl
 //	<dir>/journal/<id>/        resume journals for interrupted writes
 //	<dir>/pending/<id>.jsonl   records not yet written to the tape
+//	<dir>/written/<id>.jsonl   records this machine wrote to the tape
 //
 // The manifest on the tape is authoritative. The catalog is updated after the
 // tape, so a failed catalog write never loses archived data.
@@ -50,6 +51,13 @@ func (t *Tape) LastVerified() *Verification {
 	return &t.Verifications[len(t.Verifications)-1]
 }
 
+// VerifiedSince reports whether the tape's most recent verification passed
+// and happened after t. A later failed verification revokes earlier passes.
+func (t *Tape) VerifiedSince(at time.Time) bool {
+	v := t.LastVerified()
+	return v != nil && v.Failed == 0 && v.At.After(at)
+}
+
 // Hit is one search result.
 type Hit struct {
 	Tape  Tape
@@ -74,6 +82,75 @@ func (c *Catalog) manifestPath(id string) string { return filepath.Join(c.Dir, "
 
 // PendingPath returns the pending manifest log of tape id.
 func (c *Catalog) PendingPath(id string) string { return filepath.Join(c.Dir, "pending", id+".jsonl") }
+
+func (c *Catalog) writtenPath(id string) string { return filepath.Join(c.Dir, "written", id+".jsonl") }
+
+// RecordWritten notes entries that this machine archived to tape id. Only
+// these are trusted as proof of where a source file went: a manifest read
+// from a tape can claim any source path.
+func (c *Catalog) RecordWritten(id string, entries []manifest.Entry) error {
+	if !manifest.ValidID(id) {
+		return fmt.Errorf("invalid tape ID %q", id)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	data, err := manifest.MarshalJSONL(entries)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Join(c.Dir, "written"), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(c.writtenPath(id), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// Written returns all entries this machine archived, with their tapes.
+func (c *Catalog) Written() ([]Hit, error) {
+	names, err := filepath.Glob(filepath.Join(c.Dir, "written", "*.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	var hits []Hit
+	for _, n := range names {
+		id := strings.TrimSuffix(filepath.Base(n), ".jsonl")
+		if !manifest.ValidID(id) {
+			continue
+		}
+		t, err := c.Tape(id)
+		if err != nil {
+			return nil, err
+		}
+		if t == nil {
+			t = &Tape{Volume: manifest.Volume{ID: id}}
+		}
+		f, err := os.Open(n)
+		if err != nil {
+			return nil, err
+		}
+		entries, err := manifest.Read(f)
+		f.Close()
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", n, err)
+		}
+		for _, e := range entries {
+			hits = append(hits, Hit{Tape: *t, Entry: e})
+		}
+	}
+	return hits, nil
+}
 
 // JournalDir returns the directory for resume journals of tape id.
 func (c *Catalog) JournalDir(id string) string { return filepath.Join(c.Dir, "journal", id) }
@@ -233,6 +310,15 @@ func (c *Catalog) BySize() (map[int64][]Hit, error) {
 		}
 	})
 	return m, err
+}
+
+// All returns every cataloged entry with its tape.
+func (c *Catalog) All() ([]Hit, error) {
+	var hits []Hit
+	err := c.each(func(t Tape, e manifest.Entry) {
+		hits = append(hits, Hit{Tape: t, Entry: e})
+	})
+	return hits, err
 }
 
 func (c *Catalog) each(fn func(Tape, manifest.Entry)) error {

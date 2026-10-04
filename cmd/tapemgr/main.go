@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
@@ -22,6 +23,9 @@ Usage:
   tapemgr archive put [flags] <source>     stream files onto the tape with SHA-256
   tapemgr archive verify [flags] [path]    read files back and check SHA-256
   tapemgr archive list [flags] [path]      list archived files from the tape manifest
+  tapemgr archive purge-source [flags] <source>
+                                           delete source files that are on a verified tape
+  tapemgr archive recover [flags]          record files on tape that have no manifest entry
   tapemgr catalog import [flags]           copy the mounted tape's manifest into the catalog
   tapemgr catalog tapes [flags]            list known tapes
   tapemgr catalog search [flags] <query>   find files by path or SHA-256 prefix
@@ -36,7 +40,7 @@ Run 'tapemgr <group> <command> -h' for command flags.
 `
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
 // Exit codes.
@@ -46,20 +50,24 @@ const (
 	exitUsage   = 2
 )
 
-func run(args []string, stdout, stderr io.Writer) int {
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprint(stderr, usage)
 		return exitUsage
 	}
 	cmds := map[string]func([]string, io.Writer, io.Writer) int{
-		"archive put":    cmdPut,
-		"archive verify": cmdVerify,
-		"archive list":   cmdList,
-		"catalog import": cmdImport,
-		"catalog tapes":  cmdTapes,
-		"catalog search": cmdSearch,
+		"archive put":     cmdPut,
+		"archive verify":  cmdVerify,
+		"archive list":    cmdList,
+		"archive recover": cmdRecover,
+		"catalog import":  cmdImport,
+		"catalog tapes":   cmdTapes,
+		"catalog search":  cmdSearch,
 	}
 	if len(args) >= 2 {
+		if args[0] == "archive" && args[1] == "purge-source" {
+			return cmdPurge(args[2:], stdin, stdout, stderr)
+		}
 		if fn, ok := cmds[args[0]+" "+args[1]]; ok {
 			return fn(args[2:], stdout, stderr)
 		}
@@ -267,6 +275,9 @@ func printEntry(w io.Writer, e manifest.Entry) {
 	if e.Ref != nil {
 		ref = fmt.Sprintf("  -> %s:%s", e.Ref.Tape, e.Ref.Path)
 	}
+	if e.Recovered {
+		ref = "  (recovered)"
+	}
 	fmt.Fprintf(w, "%s  %12d  %s%s\n", e.SHA256, e.Size, e.Path, ref)
 }
 
@@ -347,6 +358,109 @@ func cmdSearch(args []string, stdout, stderr io.Writer) int {
 	if len(hits) == 0 {
 		fmt.Fprintln(stdout, "No matches.")
 		return exitFailure
+	}
+	return exitOK
+}
+
+func cmdPurge(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs, cf := newFlagSet("archive purge-source", stderr)
+	yes := fs.Bool("yes", false, "delete without asking for confirmation")
+	rehash := fs.Bool("rehash", false, "reread every source file and compare its SHA-256 before deleting")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(stderr, "usage: tapemgr archive purge-source [flags] <source>")
+		return exitUsage
+	}
+	cat, err := catalog.Open(cf.catalog)
+	if err != nil {
+		return fail(stderr, err)
+	}
+	plan, err := archive.PlanPurge(archive.PurgeOptions{
+		Source:   fs.Arg(0),
+		TapeRoot: cf.tape,
+		Catalog:  cat,
+		Rehash:   *rehash,
+	})
+	if err != nil {
+		return fail(stderr, err)
+	}
+
+	const maxListed = 20
+	for i, k := range plan.Keep {
+		if i == maxListed {
+			fmt.Fprintf(stdout, "KEEP:      ... and %d more\n", len(plan.Keep)-maxListed)
+			break
+		}
+		fmt.Fprintf(stdout, "KEEP:      %s (%s)\n", k.Path, k.Reason)
+	}
+	if len(plan.Keep) > 0 {
+		fmt.Fprintln(stdout)
+	}
+	if len(plan.Delete) == 0 {
+		fmt.Fprintln(stdout, "Nothing to delete.")
+		return exitFailure
+	}
+
+	fmt.Fprintf(stdout, "This will delete %d files (%s) from:\n\n    %s\n\n", len(plan.Delete), archive.FormatBytes(plan.Bytes), plan.Root)
+	fmt.Fprintf(stdout, "The files have been verified on tape %s.\n", strings.Join(plan.Tapes, ", "))
+	if len(plan.Keep) > 0 {
+		fmt.Fprintf(stdout, "%d files will be kept.\n", len(plan.Keep))
+	}
+	if !*yes {
+		fmt.Fprint(stdout, "\nContinue? [y/N] ")
+		answer, _ := bufio.NewReader(stdin).ReadString('\n')
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		if answer != "y" && answer != "yes" {
+			fmt.Fprintln(stdout, "Aborted. Nothing was deleted.")
+			return exitFailure
+		}
+	}
+	fmt.Fprintln(stdout)
+
+	deleted, err := plan.Execute(stdout)
+	fmt.Fprintf(stdout, "\nDeleted %d of %d files.\n", deleted, len(plan.Delete))
+	if err != nil {
+		return fail(stderr, err)
+	}
+	if deleted != len(plan.Delete) || len(plan.Keep) > 0 {
+		return exitFailure
+	}
+	return exitOK
+}
+
+func cmdRecover(args []string, stdout, stderr io.Writer) int {
+	fs, cf := newFlagSet("archive recover", stderr)
+	label := fs.String("label", "", "tape label, if the tape has never been used with tapemgr")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "usage: tapemgr archive recover [flags]")
+		return exitUsage
+	}
+	if err := cf.checkTape(); err != nil {
+		return fail(stderr, err)
+	}
+	cat, err := catalog.Open(cf.catalog)
+	if err != nil {
+		return fail(stderr, err)
+	}
+	res, err := archive.Recover(archive.RecoverOptions{
+		TapeRoot: cf.tape,
+		Label:    *label,
+		Catalog:  cat,
+		Log:      stdout,
+		Progress: progressOut(stderr),
+	})
+	if err != nil {
+		return fail(stderr, err)
+	}
+	fmt.Fprintf(stdout, "Recovered %d files (%s) on tape %s in %s.\n",
+		res.Files, archive.FormatBytes(res.Bytes), tapeName(res.Tape), archive.FormatDuration(res.Duration))
+	if res.Files > 0 {
+		fmt.Fprintln(stdout, "Run 'tapemgr archive verify' before relying on them.")
 	}
 	return exitOK
 }

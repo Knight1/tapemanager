@@ -161,9 +161,10 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		for _, e := range existing {
 			onTape[e.Path] = e.SHA256
 		}
-		var entries []manifest.Entry
+		var entries, written []manifest.Entry
 		var chunks []manifest.Chunks
 		for _, r := range pend.records {
+			written = append(written, r.Entry)
 			// A crash after the segment was written but before the
 			// pending log was cleared leaves records already on tape.
 			if sha, ok := onTape[r.Entry.Path]; ok {
@@ -182,6 +183,11 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 			return fmt.Errorf("writing manifest segment: %w", err)
 		}
 		existing = all
+		// Recorded after the tape write and before clearing, so a crash in
+		// between repeats it rather than losing it. Duplicates are harmless.
+		if err := opts.Catalog.RecordWritten(vol.ID, written); err != nil {
+			return fmt.Errorf("recording written files: %w", err)
+		}
 		return pend.clear()
 	}
 

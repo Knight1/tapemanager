@@ -140,44 +140,54 @@ func verifyFile(root *os.Root, e manifest.Entry, c *manifest.Chunks, progressOut
 		chunkSize = c.ChunkSize
 	}
 
-	h := sha256.New()
 	prog := startProgress(progressOut, e.Size)
-	defer prog.finish()
-
-	buf := make([]byte, chunkSize)
-	var n int64
+	got, chunks, n, err := hashStream(f, chunkSize, prog)
+	prog.finish()
+	if err != nil {
+		return err
+	}
 	var bad []int
-	for i := 0; ; i++ {
-		m, rerr := io.ReadFull(f, buf)
-		if m > 0 {
-			h.Write(buf[:m])
-			prog.Write(buf[:m])
-			n += int64(m)
-			if c != nil {
-				sum := sha256.Sum256(buf[:m])
-				if i >= len(c.SHA256) || hex.EncodeToString(sum[:]) != c.SHA256[i] {
-					bad = append(bad, i)
-				}
+	if c != nil {
+		for i, sum := range chunks {
+			if i >= len(c.SHA256) || sum != c.SHA256[i] {
+				bad = append(bad, i)
 			}
-		}
-		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
-			break
-		}
-		if rerr != nil {
-			return fmt.Errorf("read error at byte %d: %w", n, rerr)
 		}
 	}
 
 	if n != e.Size {
 		return fmt.Errorf("size mismatch: manifest %d, tape %d", e.Size, n)
 	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != e.SHA256 {
+	if got != e.SHA256 {
 		if len(bad) > 0 {
 			return fmt.Errorf("SHA-256 mismatch, damaged bytes: %s", badRanges(bad, chunkSize, e.Size))
 		}
 		return fmt.Errorf("SHA-256 mismatch: manifest %s, tape %s", e.SHA256, got)
 	}
 	return nil
+}
+
+// hashStream reads r to the end in chunkSize pieces and returns the SHA-256
+// of everything, the SHA-256 of each piece, and the byte count.
+func hashStream(r io.Reader, chunkSize int64, prog io.Writer) (sum string, chunks []string, n int64, err error) {
+	h := sha256.New()
+	buf := make([]byte, chunkSize)
+	for {
+		m, rerr := io.ReadFull(r, buf)
+		if m > 0 {
+			h.Write(buf[:m])
+			prog.Write(buf[:m])
+			c := sha256.Sum256(buf[:m])
+			chunks = append(chunks, hex.EncodeToString(c[:]))
+			n += int64(m)
+		}
+		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+			return hex.EncodeToString(h.Sum(nil)), chunks, n, nil
+		}
+		if rerr != nil {
+			return "", nil, n, fmt.Errorf("read error at byte %d: %w", n, rerr)
+		}
+	}
 }
 
 // badRanges merges consecutive bad chunk indexes into byte ranges.

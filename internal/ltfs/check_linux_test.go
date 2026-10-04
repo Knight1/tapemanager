@@ -14,3 +14,9 @@ func TestPlainDirectoryIsNotLTFS(t *testing.T) {
 		t.Error("missing path accepted")
 	}
 }
+
+func TestStartBlockUnavailable(t *testing.T) {
+	if _, ok := StartBlock(t.TempDir()); ok {
+		t.Error("start block reported for a plain directory")
+	}
+}

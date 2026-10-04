@@ -58,6 +58,10 @@ type Entry struct {
 	// Ref is set when the content was not written because an identical
 	// file already exists on tape. The entry then only records the source.
 	Ref *Ref `json:"ref,omitempty"`
+	// Recovered is set for files found on tape without a manifest record
+	// and recorded by 'archive recover'. Their hash was computed from the
+	// tape, not from the source, and their source is unknown.
+	Recovered bool `json:"recovered,omitempty"`
 }
 
 // Ref points at the copy of a deduplicated file.

@@ -2,6 +2,7 @@ package ltfs
 
 import (
 	"fmt"
+	"strconv"
 	"syscall"
 )
 
@@ -32,4 +33,17 @@ func VolumeUUID(path string) string {
 		return ""
 	}
 	return string(buf[:n])
+}
+
+// StartBlock returns the tape block where the file at path begins, as
+// reported by LTFS, so files can be read in tape order. ok is false if
+// the information is not available.
+func StartBlock(path string) (block int64, ok bool) {
+	buf := make([]byte, 32)
+	n, err := syscall.Getxattr(path, "user.ltfs.startblock", buf)
+	if err != nil {
+		return 0, false
+	}
+	block, err = strconv.ParseInt(string(buf[:n]), 10, 64)
+	return block, err == nil && block >= 0
 }
