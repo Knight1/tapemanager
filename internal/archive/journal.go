@@ -25,6 +25,7 @@ type journalHeader struct {
 	Size      int64     `json:"size"`
 	MTime     time.Time `json:"mtime"`
 	ChunkSize int64     `json:"chunk_size"`
+	ParityM   int       `json:"parity_m,omitempty"`
 }
 
 type journalRecord struct {
@@ -32,6 +33,10 @@ type journalRecord struct {
 	State  []byte   `json:"state"`            // marshaled SHA-256 state at Offset
 	Chunks []string `json:"chunks"`           // chunk hashes added since the previous record
 	SHA256 string   `json:"sha256,omitempty"` // set on the final record only
+	// Parity shard hashes added since the previous record.
+	ParityHashes []string `json:"parity_hashes,omitempty"`
+	// Parity is the complete parity record, on the final record only.
+	Parity *manifest.Parity `json:"parity,omitempty"`
 }
 
 // resumePoint is a position a transfer can continue from.
@@ -40,16 +45,25 @@ type resumePoint struct {
 	state  []byte
 	chunks []string // all chunk hashes up to offset
 	sha256 string   // final file hash if the transfer completed
+	// parityHashes holds all parity shard hashes up to offset.
+	parityHashes []string
+	parity       *manifest.Parity // final record only
+}
+
+// fileKey names the per-file state (journal, staged parity) of rel.
+func fileKey(rel string) string {
+	h := sha256.Sum256([]byte(rel))
+	return hex.EncodeToString(h[:16])
 }
 
 func journalPath(dir, rel string) string {
-	h := sha256.Sum256([]byte(rel))
-	return filepath.Join(dir, hex.EncodeToString(h[:16])+".jsonl")
+	return filepath.Join(dir, fileKey(rel)+".jsonl")
 }
 
 type journal struct {
-	f        *os.File
-	recorded int // number of chunk hashes already in the journal
+	f              *os.File
+	recorded       int // number of chunk hashes already in the journal
+	parityRecorded int // number of parity hashes already in the journal
 }
 
 // writeJournal creates or replaces the journal at name, starting with hdr
@@ -64,7 +78,7 @@ func writeJournal(name string, hdr journalHeader, start *resumePoint) (*journal,
 	}
 	data := append(b, '\n')
 	if start != nil {
-		b, err := json.Marshal(journalRecord{Offset: start.offset, State: start.state, Chunks: start.chunks, SHA256: start.sha256})
+		b, err := json.Marshal(journalRecord{Offset: start.offset, State: start.state, Chunks: start.chunks, SHA256: start.sha256, ParityHashes: start.parityHashes, Parity: start.parity})
 		if err != nil {
 			return nil, err
 		}
@@ -80,6 +94,7 @@ func writeJournal(name string, hdr journalHeader, start *resumePoint) (*journal,
 	j := &journal{f: f}
 	if start != nil {
 		j.recorded = len(start.chunks)
+		j.parityRecorded = len(start.parityHashes)
 	}
 	return j, nil
 }
@@ -119,14 +134,25 @@ func loadJournal(name string) (*journalHeader, []resumePoint, error) {
 		return nil, nil, nil
 	}
 	var points []resumePoint
-	var chunks []string
+	var chunks, parityHashes []string
 	for sc.Scan() {
 		var r journalRecord
 		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
 			break
 		}
+		if r.Parity != nil && r.Parity.Validate() != nil {
+			break
+		}
 		chunks = append(chunks, r.Chunks...)
-		points = append(points, resumePoint{offset: r.Offset, state: r.State, chunks: chunks[:len(chunks):len(chunks)], sha256: r.SHA256})
+		parityHashes = append(parityHashes, r.ParityHashes...)
+		points = append(points, resumePoint{
+			offset:       r.Offset,
+			state:        r.State,
+			chunks:       chunks[:len(chunks):len(chunks)],
+			sha256:       r.SHA256,
+			parityHashes: parityHashes[:len(parityHashes):len(parityHashes)],
+			parity:       r.Parity,
+		})
 	}
 	return &hdr, points, sc.Err()
 }

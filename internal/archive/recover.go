@@ -143,7 +143,7 @@ func Recover(opts RecoverOptions) (res RecoverResult, err error) {
 			return nil
 		}
 		all := append(existing[:len(existing):len(existing)], batch...)
-		if err := tape.WriteSegment(batch, chunks, all); err != nil {
+		if err := tape.WriteSegment(manifest.Segment{Entries: batch, Chunks: chunks}, all); err != nil {
 			return fmt.Errorf("writing manifest segment: %w", err)
 		}
 		existing = all

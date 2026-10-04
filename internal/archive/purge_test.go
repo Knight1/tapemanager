@@ -248,7 +248,7 @@ func TestPurgeIgnoresForeignTapeClaims(t *testing.T) {
 	forged.Recovered = false
 	os.RemoveAll(filepath.Join(foreign, ".tapemgr", "segments"))
 	tape, _ := manifest.Open(foreign)
-	tape.WriteSegment([]manifest.Entry{forged}, nil, []manifest.Entry{forged})
+	tape.WriteSegment(manifest.Segment{Entries: []manifest.Entry{forged}}, []manifest.Entry{forged})
 	tape.Close()
 	c.Import(foreign)
 	verifyWith(t, foreign, c)

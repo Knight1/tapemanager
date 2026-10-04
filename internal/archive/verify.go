@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -26,12 +25,13 @@ type VerifyOptions struct {
 
 // VerifyResult reports what Verify found.
 type VerifyResult struct {
-	Files    int
-	Verified int
-	Failed   int
-	Refs     int // deduplicated entries, whose content lives elsewhere
-	Bytes    int64
-	Duration time.Duration
+	Files      int
+	Verified   int
+	Repairable int // damaged, but parity can rebuild them
+	Failed     int // damaged beyond repair, or unreadable
+	Refs       int // deduplicated entries, whose content lives elsewhere
+	Bytes      int64
+	Duration   time.Duration
 }
 
 // ErrNoEntries is returned when the manifest has nothing to verify.
@@ -40,8 +40,9 @@ var ErrNoEntries = errors.New("no manifest entries to verify")
 // Verify reads every file listed in the tape manifest back from the tape,
 // recomputes its SHA-256 and compares it with the recorded value. Files are
 // read in manifest order, which matches the order they were written, to
-// avoid unnecessary tape repositioning. When chunk hashes are available,
-// damage is reported as byte ranges.
+// avoid unnecessary tape repositioning. Read errors do not stop the check:
+// damage is reported as byte ranges, and files with parity are checked for
+// whether they can be rebuilt.
 func Verify(opts VerifyOptions) (VerifyResult, error) {
 	start := time.Now()
 	var res VerifyResult
@@ -53,13 +54,16 @@ func Verify(opts VerifyOptions) (VerifyResult, error) {
 		return res, err
 	}
 	defer tape.Close()
-	root := tape.Root()
 
 	entries, err := tape.Entries()
 	if err != nil {
 		return res, err
 	}
 	chunks, err := tape.Chunks()
+	if err != nil {
+		return res, err
+	}
+	par, err := tape.Parity()
 	if err != nil {
 		return res, err
 	}
@@ -84,18 +88,18 @@ func Verify(opts VerifyOptions) (VerifyResult, error) {
 			continue
 		}
 		fmt.Fprintf(opts.Log, "VERIFYING: %s\n", e.Path)
-		var c *manifest.Chunks
-		if v, ok := chunks[e.Path]; ok {
-			c = &v
-		}
-		if err := verifyFile(root, e, c, opts.Progress); err != nil {
-			fmt.Fprintf(opts.Log, "       FAILED: %v\n", err)
+		switch status, detail := verifyFile(tape, e, chunks, par, opts.Progress); status {
+		case statusOK:
+			fmt.Fprintf(opts.Log, "       OK\n")
+			res.Verified++
+			res.Bytes += e.Size
+		case statusRepairable:
+			fmt.Fprintf(opts.Log, "       DAMAGED: %s\n       repairable with parity: restore it with 'tapemgr archive restore'\n", detail)
+			res.Repairable++
+		default:
+			fmt.Fprintf(opts.Log, "       FAILED: %s\n", detail)
 			res.Failed++
-			continue
 		}
-		fmt.Fprintf(opts.Log, "       OK\n")
-		res.Verified++
-		res.Bytes += e.Size
 	}
 
 	res.Duration = time.Since(start)
@@ -116,55 +120,49 @@ func recordVerify(c *catalog.Catalog, tapeRoot string, res VerifyResult) error {
 		return err
 	}
 	return c.RecordVerify(t.ID, catalog.Verification{
-		At:       time.Now().UTC(),
-		Files:    res.Files,
-		Verified: res.Verified,
-		Failed:   res.Failed,
+		At:         time.Now().UTC(),
+		Files:      res.Files,
+		Verified:   res.Verified,
+		Repairable: res.Repairable,
+		Failed:     res.Failed,
 	})
 }
 
-func verifyFile(root *os.Root, e manifest.Entry, c *manifest.Chunks, progressOut io.Writer) error {
-	f, err := root.Open(filepath.FromSlash(e.Path))
+type fileStatus int
+
+const (
+	statusOK fileStatus = iota
+	statusRepairable
+	statusFailed
+)
+
+func verifyFile(tape *manifest.Tape, e manifest.Entry, chunks map[string]manifest.Chunks, par map[string]manifest.Parity, prog io.Writer) (fileStatus, string) {
+	tf, err := openTapeFile(tape, e, chunks, par)
 	if err != nil {
-		return err
+		return statusFailed, err.Error()
 	}
-	defer f.Close()
-	if st, err := f.Stat(); err != nil {
-		return err
-	} else if !st.Mode().IsRegular() {
-		return errors.New("not a regular file")
+	defer tf.Close()
+	if st, err := tf.f.Stat(); err == nil && st.Size() > e.Size {
+		return statusFailed, fmt.Sprintf("file is larger than recorded (%d > %d bytes)", st.Size(), e.Size)
 	}
 
-	chunkSize := int64(DefaultChunkSize)
-	if c != nil && c.ChunkSize > 0 {
-		chunkSize = c.ChunkSize
-	}
-
-	prog := startProgress(progressOut, e.Size)
-	got, chunks, n, err := hashStream(f, chunkSize, prog)
-	prog.finish()
+	p := startProgress(prog, e.Size)
+	s, err := tf.scan(nil, p)
+	p.finish()
 	if err != nil {
-		return err
+		return statusFailed, err.Error()
 	}
-	var bad []int
-	if c != nil {
-		for i, sum := range chunks {
-			if i >= len(c.SHA256) || sum != c.SHA256[i] {
-				bad = append(bad, i)
-			}
-		}
+	if s.intact(e) {
+		return statusOK, ""
 	}
-
-	if n != e.Size {
-		return fmt.Errorf("size mismatch: manifest %d, tape %d", e.Size, n)
+	detail := describeDamage(s, e, tf.chunkSize())
+	if tf.parity == nil {
+		return statusFailed, detail
 	}
-	if got != e.SHA256 {
-		if len(bad) > 0 {
-			return fmt.Errorf("SHA-256 mismatch, damaged bytes: %s", badRanges(bad, chunkSize, e.Size))
-		}
-		return fmt.Errorf("SHA-256 mismatch: manifest %s, tape %s", e.SHA256, got)
+	if _, err := tf.repair(s); err != nil {
+		return statusFailed, fmt.Sprintf("%s; parity cannot repair it: %v", detail, err)
 	}
-	return nil
+	return statusRepairable, detail
 }
 
 // hashStream reads r to the end in chunkSize pieces and returns the SHA-256

@@ -6,6 +6,7 @@
 //	<dir>/tapes/<id>.json      tape record and verification history
 //	<dir>/tapes/<id>.jsonl     copy of the tape's manifest.jsonl
 //	<dir>/journal/<id>/        resume journals for interrupted writes
+//	<dir>/parity/<id>/         parity staged until the next segment write
 //	<dir>/pending/<id>.jsonl   records not yet written to the tape
 //	<dir>/written/<id>.jsonl   records this machine wrote to the tape
 //
@@ -37,10 +38,11 @@ type Tape struct {
 
 // Verification records one run of archive verify.
 type Verification struct {
-	At       time.Time `json:"at"`
-	Files    int       `json:"files"`
-	Verified int       `json:"verified"`
-	Failed   int       `json:"failed"`
+	At         time.Time `json:"at"`
+	Files      int       `json:"files"`
+	Verified   int       `json:"verified"`
+	Repairable int       `json:"repairable,omitempty"`
+	Failed     int       `json:"failed"`
 }
 
 // LastVerified returns the most recent verification, or nil.
@@ -53,9 +55,11 @@ func (t *Tape) LastVerified() *Verification {
 
 // VerifiedSince reports whether the tape's most recent verification passed
 // and happened after t. A later failed verification revokes earlier passes.
+// Damage that parity could still repair also counts as failed: the tape is
+// degrading and should not be the only copy.
 func (t *Tape) VerifiedSince(at time.Time) bool {
 	v := t.LastVerified()
-	return v != nil && v.Failed == 0 && v.At.After(at)
+	return v != nil && v.Failed == 0 && v.Repairable == 0 && v.At.After(at)
 }
 
 // Hit is one search result.
@@ -151,6 +155,9 @@ func (c *Catalog) Written() ([]Hit, error) {
 	}
 	return hits, nil
 }
+
+// ParityDir returns the directory for staged parity of tape id.
+func (c *Catalog) ParityDir(id string) string { return filepath.Join(c.Dir, "parity", id) }
 
 // JournalDir returns the directory for resume journals of tape id.
 func (c *Catalog) JournalDir(id string) string { return filepath.Join(c.Dir, "journal", id) }

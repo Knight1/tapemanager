@@ -192,3 +192,20 @@ func TestPendingCountMissing(t *testing.T) {
 		t.Fatalf("%d, %v", n, err)
 	}
 }
+
+func TestPendingRejectsMismatchedParity(t *testing.T) {
+	name := filepath.Join(t.TempDir(), "p.jsonl")
+	sha := strings.Repeat("a", 64)
+	l := `{"scheme":"rs-small","k":20,"m":1,"shard_size":5,"size":100}`
+	hashes := `"hashes":["` + sha + `"],"data_hashes":[` + strings.TrimSuffix(strings.Repeat(`"`+sha+`",`, 20), ",") + `]`
+	good := `{"entry":{"path":"z","size":1,"sha256":"` + sha + `"}}`
+	for _, line := range []string{
+		`{"entry":{"path":"a","size":100,"sha256":"` + sha + `"},"parity":{"path":"b","layout":` + l + `,` + hashes + `}}`,
+		`{"entry":{"path":"a","size":99,"sha256":"` + sha + `"},"parity":{"path":"a","layout":` + l + `,` + hashes + `}}`,
+	} {
+		os.WriteFile(name, []byte(line+"\n"+good+"\n"), 0o644)
+		if _, err := openPending(name); err == nil {
+			t.Errorf("accepted %s", line)
+		}
+	}
+}

@@ -21,7 +21,7 @@ func makeTape(t *testing.T, label string, entries ...manifest.Entry) string {
 	if _, err := tp.InitVolume(label, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := tp.WriteSegment(entries, nil, entries); err != nil {
+	if err := tp.WriteSegment(manifest.Segment{Entries: entries}, entries); err != nil {
 		t.Fatal(err)
 	}
 	return dir

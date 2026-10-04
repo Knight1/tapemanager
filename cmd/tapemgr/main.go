@@ -26,6 +26,8 @@ Usage:
   tapemgr archive purge-source [flags] <source>
                                            delete source files that are on a verified tape
   tapemgr archive recover [flags]          record files on tape that have no manifest entry
+  tapemgr archive restore [flags] --to DIR [path]
+                                           copy files from tape, repairing damage with parity
   tapemgr catalog import [flags]           copy the mounted tape's manifest into the catalog
   tapemgr catalog tapes [flags]            list known tapes
   tapemgr catalog search [flags] <query>   find files by path or SHA-256 prefix
@@ -60,6 +62,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		"archive verify":  cmdVerify,
 		"archive list":    cmdList,
 		"archive recover": cmdRecover,
+		"archive restore": cmdRestore,
 		"catalog import":  cmdImport,
 		"catalog tapes":   cmdTapes,
 		"catalog search":  cmdSearch,
@@ -145,6 +148,7 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 	prefix := fs.String("dest", "", "destination directory on tape (default: source base name)")
 	label := fs.String("label", "", "tape label, set when the tape is first used")
 	noDedup := fs.Bool("no-dedup", false, "always write content, even if an identical file is already archived")
+	parityPct := fs.Int("parity", 10, "Reed-Solomon parity overhead in percent (0 to 25, 0 disables)")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -167,6 +171,7 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 		Label:    *label,
 		Catalog:  cat,
 		Dedup:    !*noDedup,
+		Parity:   *parityPct,
 		Log:      stdout,
 		Progress: progressOut(stderr),
 	})
@@ -218,13 +223,17 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	if err != nil && res.Files == 0 {
 		return fail(stderr, err)
 	}
-	fmt.Fprintf(stdout, "\nFiles:       %d\nVerified:    %d\nFailed:      %d\nReferences:  %d\nBytes:       %s\nDuration:    %s\n\n",
-		res.Files, res.Verified, res.Failed, res.Refs, archive.FormatBytes(res.Bytes), archive.FormatDuration(res.Duration))
+	fmt.Fprintf(stdout, "\nFiles:       %d\nVerified:    %d\nRepairable:  %d\nFailed:      %d\nReferences:  %d\nBytes:       %s\nDuration:    %s\n\n",
+		res.Files, res.Verified, res.Repairable, res.Failed, res.Refs, archive.FormatBytes(res.Bytes), archive.FormatDuration(res.Duration))
 	if err != nil {
 		fmt.Fprintln(stderr, "tapemgr:", err)
 	}
 	if res.Failed > 0 {
 		fmt.Fprintln(stdout, "SHA-256 verification FAILED.")
+		return exitFailure
+	}
+	if res.Repairable > 0 {
+		fmt.Fprintln(stdout, "The tape is damaged, but parity can rebuild every affected file. Restore them and copy them to another tape.")
 		return exitFailure
 	}
 	fmt.Fprintln(stdout, "SHA-256 verification successful.")
@@ -461,6 +470,37 @@ func cmdRecover(args []string, stdout, stderr io.Writer) int {
 		res.Files, archive.FormatBytes(res.Bytes), tapeName(res.Tape), archive.FormatDuration(res.Duration))
 	if res.Files > 0 {
 		fmt.Fprintln(stdout, "Run 'tapemgr archive verify' before relying on them.")
+	}
+	return exitOK
+}
+
+func cmdRestore(args []string, stdout, stderr io.Writer) int {
+	fs, cf := newFlagSet("archive restore", stderr)
+	to := fs.String("to", "", "local directory to restore into (required)")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if fs.NArg() > 1 || *to == "" {
+		fmt.Fprintln(stderr, "usage: tapemgr archive restore [flags] --to DIR [path]")
+		return exitUsage
+	}
+	if err := cf.checkTape(); err != nil {
+		return fail(stderr, err)
+	}
+	res, err := archive.Restore(archive.RestoreOptions{
+		TapeRoot: cf.tape,
+		Path:     fs.Arg(0),
+		Dest:     *to,
+		Log:      stdout,
+		Progress: progressOut(stderr),
+	})
+	if err != nil {
+		return fail(stderr, err)
+	}
+	fmt.Fprintf(stdout, "\nRestored:    %d (%d repaired with parity)\nFailed:      %d\nSkipped:     %d\nBytes:       %s\nDuration:    %s\n",
+		res.Files, res.Repaired, res.Failed, res.Skipped, archive.FormatBytes(res.Bytes), archive.FormatDuration(res.Duration))
+	if res.Failed > 0 || res.Skipped > 0 {
+		return exitFailure
 	}
 	return exitOK
 }

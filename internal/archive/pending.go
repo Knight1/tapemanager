@@ -18,6 +18,7 @@ import (
 type pendingRecord struct {
 	Entry  manifest.Entry   `json:"entry"`
 	Chunks *manifest.Chunks `json:"chunks,omitempty"`
+	Parity *manifest.Parity `json:"parity,omitempty"`
 }
 
 func (r pendingRecord) Validate() error {
@@ -28,7 +29,15 @@ func (r pendingRecord) Validate() error {
 		if r.Chunks.Path != r.Entry.Path {
 			return fmt.Errorf("%s: chunk record for %s", r.Entry.Path, r.Chunks.Path)
 		}
-		return r.Chunks.Validate()
+		if err := r.Chunks.Validate(); err != nil {
+			return err
+		}
+	}
+	if r.Parity != nil {
+		if r.Parity.Path != r.Entry.Path || r.Parity.Layout.Size != r.Entry.Size {
+			return fmt.Errorf("%s: parity record does not match", r.Entry.Path)
+		}
+		return r.Parity.Validate()
 	}
 	return nil
 }

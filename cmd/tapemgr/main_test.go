@@ -138,3 +138,36 @@ func TestCLIPurgeYesAndRecover(t *testing.T) {
 		t.Fatalf("purge --yes: %d %s", code, out)
 	}
 }
+
+func TestCLIRestoreRepairs(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "dl")
+	tape := filepath.Join(base, "tape")
+	cat := filepath.Join(base, "cat")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(tape, 0o755)
+	data := strings.Repeat("0123456789", 50)
+	os.WriteFile(filepath.Join(src, "f.txt"), []byte(data), 0o644)
+	common := []string{"--tape", tape, "--catalog", cat, "--no-mount-check"}
+	runCmd(t, append([]string{"archive", "put", "--parity", "10"}, append(common, src)...)...)
+
+	// Damage the first bytes on tape; small-file parity rebuilds them.
+	f, _ := os.OpenFile(filepath.Join(tape, "dl", "f.txt"), os.O_WRONLY, 0)
+	f.WriteAt([]byte("XXXX"), 0)
+	f.Close()
+
+	if code, out, _ := runCmd(t, append([]string{"archive", "verify"}, common...)...); code != exitFailure || !strings.Contains(out, "Repairable:  1") {
+		t.Fatalf("verify: %d %s", code, out)
+	}
+	out := filepath.Join(base, "out")
+	code, stdout, errOut := runCmd(t, append([]string{"archive", "restore", "--to", out}, common...)...)
+	if code != exitOK || !strings.Contains(stdout, "1 repaired") {
+		t.Fatalf("restore: %d %s %s", code, stdout, errOut)
+	}
+	if got, _ := os.ReadFile(filepath.Join(out, "dl", "f.txt")); string(got) != data {
+		t.Fatal("restored content differs")
+	}
+	if code, _, _ := runCmd(t, append([]string{"archive", "restore"}, common...)...); code != exitUsage {
+		t.Fatal("restore without --to accepted")
+	}
+}

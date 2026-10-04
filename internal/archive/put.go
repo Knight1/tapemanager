@@ -3,6 +3,7 @@
 package archive
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding"
 	"encoding/hex"
@@ -15,11 +16,13 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Knight1/tapemanager/internal/catalog"
 	"github.com/Knight1/tapemanager/internal/ltfs"
 	"github.com/Knight1/tapemanager/internal/manifest"
+	"github.com/Knight1/tapemanager/internal/parity"
 )
 
 // PartialSuffix marks a file on tape whose transfer has not completed.
@@ -58,6 +61,7 @@ type PutOptions struct {
 	Label    string           // tape label, used only when the tape is first initialized
 	Catalog  *catalog.Catalog // local catalog, required
 	Dedup    bool             // store a reference instead of content already on tape
+	Parity   int              // parity overhead in percent, 0 for none
 	Log      io.Writer        // per-file output
 	Progress io.Writer        // progress bar output, nil to disable
 
@@ -109,6 +113,13 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 	if opts.FlushEvery <= 0 {
 		opts.FlushEvery = DefaultFlushEvery
 	}
+	m, err := parity.Shards(opts.Parity)
+	if err != nil {
+		return sum, err
+	}
+	if m > 0 && opts.ChunkSize > parity.MaxShardSize {
+		return sum, fmt.Errorf("parity needs a chunk size of at most %d bytes", parity.MaxShardSize)
+	}
 
 	src, err := filepath.Abs(opts.Source)
 	if err != nil {
@@ -143,6 +154,8 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 	if err != nil {
 		return sum, err
 	}
+	parityDir := opts.Catalog.ParityDir(vol.ID)
+	journalDir := opts.Catalog.JournalDir(vol.ID)
 	pend, err := openPending(opts.Catalog.PendingPath(vol.ID))
 	if err != nil {
 		return sum, err
@@ -163,6 +176,15 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		}
 		var entries, written []manifest.Entry
 		var chunks []manifest.Chunks
+		var pars []manifest.Parity
+		var staged []string
+		var parityData []io.Reader
+		var parityOffset int64
+		defer func() {
+			for _, r := range parityData {
+				r.(*os.File).Close()
+			}
+		}()
 		for _, r := range pend.records {
 			written = append(written, r.Entry)
 			// A crash after the segment was written but before the
@@ -177,9 +199,27 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 			if r.Chunks != nil {
 				chunks = append(chunks, *r.Chunks)
 			}
+			if r.Parity != nil {
+				ppath := filepath.Join(parityDir, fileKey(r.Entry.Path)+".bin")
+				if !stagedParityOK(ppath, r.Parity) {
+					fmt.Fprintf(opts.Log, "WARNING:   staged parity for %s is missing or damaged; it is archived without parity\n", r.Entry.Path)
+					continue
+				}
+				f, err := os.Open(ppath)
+				if err != nil {
+					return err
+				}
+				parityData = append(parityData, f)
+				p := *r.Parity
+				p.Offset = parityOffset
+				parityOffset += p.Layout.ParitySize()
+				pars = append(pars, p)
+				staged = append(staged, ppath)
+			}
 		}
 		all := append(existing[:len(existing):len(existing)], entries...)
-		if err := tape.WriteSegment(entries, chunks, all); err != nil {
+		seg := manifest.Segment{Entries: entries, Chunks: chunks, Parity: pars, ParityData: io.MultiReader(parityData...)}
+		if err := tape.WriteSegment(seg, all); err != nil {
 			return fmt.Errorf("writing manifest segment: %w", err)
 		}
 		existing = all
@@ -188,7 +228,13 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		if err := opts.Catalog.RecordWritten(vol.ID, written); err != nil {
 			return fmt.Errorf("recording written files: %w", err)
 		}
-		return pend.clear()
+		if err := pend.clear(); err != nil {
+			return err
+		}
+		for _, p := range staged {
+			os.Remove(p)
+		}
+		return nil
 	}
 
 	if n := len(pend.records); n > 0 {
@@ -198,9 +244,11 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		}
 	}
 
-	archived := make(map[string]manifest.Entry, len(existing))
+	removeStaleParity(parityDir, journalDir)
+
+	done := make(map[string]manifest.Entry, len(existing))
 	for _, e := range existing {
-		archived[e.Path] = e
+		done[e.Path] = e
 	}
 
 	var dedup map[int64][]catalog.Hit
@@ -231,16 +279,15 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		if err := pend.add(r); err != nil {
 			return fmt.Errorf("writing pending log: %w", err)
 		}
-		archived[r.Entry.Path] = r.Entry
+		done[r.Entry.Path] = r.Entry
 		if pend.bytes >= opts.FlushEvery {
 			return flush()
 		}
 		return nil
 	}
 
-	journalDir := opts.Catalog.JournalDir(vol.ID)
 	for _, j := range jobs {
-		if e, ok := archived[j.rel]; ok {
+		if e, ok := done[j.rel]; ok {
 			if e.Size == j.info.Size() && e.MTime.Equal(j.info.ModTime()) {
 				fmt.Fprintf(opts.Log, "SKIPPING:  %s (already archived)\n", j.src)
 				sum.Skipped++
@@ -266,17 +313,28 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 
 		fmt.Fprintf(opts.Log, "ARCHIVING: %s\n       %s\n", j.src, FormatBytes(j.info.Size()))
 		jpath := journalPath(journalDir, j.rel)
-		e, chunks, resumed, err := archiveFile(opts, tape.Root(), j, jpath)
+		res, err := archiveFile(fileState{
+			opts:  opts,
+			root:  tape.Root(),
+			j:     j,
+			jpath: jpath,
+			ppath: filepath.Join(parityDir, fileKey(j.rel)+".bin"),
+			m:     m,
+		})
 		if err != nil {
 			return sum, fmt.Errorf("%s: %w", j.src, err)
 		}
+		e, resumed := res.entry, res.resumed
 		if resumed > 0 {
 			fmt.Fprintf(opts.Log, "       resumed at %s\n", FormatBytes(resumed))
+		}
+		if res.note != "" {
+			fmt.Fprintf(opts.Log, "       NOTE: %s\n", res.note)
 		}
 		if err := hook("manifest", e.Size); err != nil {
 			return sum, err
 		}
-		if err := record(pendingRecord{Entry: e, Chunks: chunks}); err != nil {
+		if err := record(pendingRecord{Entry: e, Chunks: res.chunks, Parity: res.parity}); err != nil {
 			return sum, err
 		}
 		if err := os.Remove(jpath); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -291,6 +349,19 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		sum.Resumed += resumed
 	}
 	return sum, nil
+}
+
+// removeStaleParity deletes staged parity of files that are neither pending
+// nor in progress. It runs after pending records were flushed, so only
+// files with a resume journal still need their staged parity.
+func removeStaleParity(parityDir, journalDir string) {
+	names, _ := filepath.Glob(filepath.Join(parityDir, "*.bin"))
+	for _, n := range names {
+		key := strings.TrimSuffix(filepath.Base(n), ".bin")
+		if _, err := os.Stat(filepath.Join(journalDir, key+".jsonl")); errors.Is(err, os.ErrNotExist) {
+			os.Remove(n)
+		}
+	}
 }
 
 // findDuplicate hashes the source and returns a reference entry if a file
@@ -388,181 +459,422 @@ func plan(src, prefix string, log io.Writer) ([]job, error) {
 	return jobs, err
 }
 
-// archiveFile streams one file to the tape and returns its manifest entry,
-// chunk hashes, and how many bytes were skipped by resuming.
+// fileState bundles what archiveFile needs for one file.
+type fileState struct {
+	opts  PutOptions
+	root  *os.Root
+	j     job
+	jpath string // resume journal
+	ppath string // staged parity
+	m     int    // parity shards per stripe, 0 for none
+}
+
+// archived is the result of archiveFile.
+type archived struct {
+	entry   manifest.Entry
+	chunks  *manifest.Chunks
+	parity  *manifest.Parity
+	resumed int64
+	note    string // something the user should know, such as lost parity
+}
+
+// archiveFile streams one file to the tape.
 //
 // Data goes to a partial file first and is renamed only once complete, so a
 // crash never leaves a truncated file under its final name. Progress is
-// checkpointed to the journal at jpath.
-func archiveFile(opts PutOptions, root *os.Root, j job, jpath string) (manifest.Entry, *manifest.Chunks, int64, error) {
-	var none manifest.Entry
+// checkpointed to the journal. Parity is computed while streaming and
+// staged locally; it reaches the tape with the next manifest segment.
+func archiveFile(fs fileState) (*archived, error) {
+	opts, root, j := fs.opts, fs.root, fs.j
 	dst := filepath.FromSlash(j.rel)
 	partial := dst + PartialSuffix
-	hdr := journalHeader{Source: j.src, Path: j.rel, Size: j.info.Size(), MTime: j.info.ModTime(), ChunkSize: opts.ChunkSize}
+	layout := parity.ForFile(j.info.Size(), opts.ChunkSize, fs.m)
+	hdr := journalHeader{Source: j.src, Path: j.rel, Size: j.info.Size(), MTime: j.info.ModTime(), ChunkSize: opts.ChunkSize, ParityM: fs.m}
 
-	oldHdr, points, err := loadJournal(jpath)
+	oldHdr, points, err := loadJournal(fs.jpath)
 	if err != nil {
-		return none, nil, 0, err
+		return nil, err
 	}
 	journalValid := oldHdr != nil && sameHeader(*oldHdr, hdr)
 
 	if _, err := root.Lstat(dst); err == nil {
 		// A previous run may have renamed the file and stopped before
-		// writing the manifest entry.
+		// recording it.
 		if journalValid && len(points) > 0 {
 			if p := points[len(points)-1]; p.sha256 != "" && p.offset == j.info.Size() {
 				if st, err := root.Lstat(dst); err == nil && st.Mode().IsRegular() && st.Size() == p.offset {
-					return entryFor(j, p.sha256), chunksFor(j, opts.ChunkSize, p.chunks), p.offset, nil
+					res := &archived{entry: entryFor(j, p.sha256), chunks: chunksFor(j, opts.ChunkSize, p.chunks), resumed: p.offset}
+					if p.parity != nil && stagedParityOK(fs.ppath, p.parity) {
+						res.parity = p.parity
+					} else if layout != nil {
+						res.note = "staged parity was lost; this file has no parity"
+					}
+					return res, nil
 				}
 			}
 		}
-		return none, nil, 0, fmt.Errorf("%s exists on tape but is not in the manifest", j.rel)
+		return nil, fmt.Errorf("%s exists on tape but is not in the manifest", j.rel)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return none, nil, 0, err
+		return nil, err
 	}
 
+	// Small files are buffered for their parity and are cheap to redo, so
+	// they never resume.
 	var start *resumePoint
-	if journalValid {
+	if journalValid && (layout == nil || layout.Scheme == parity.SchemeWindow) {
 		if start, err = pickResumePoint(root, partial, points, j.info.Size(), opts.ChunkSize); err != nil {
-			return none, nil, 0, err
+			return nil, err
+		}
+		if start != nil && layout != nil && !parityResumable(fs.ppath, layout, start) {
+			start = nil
 		}
 	}
 
 	in, err := openSource(j)
 	if err != nil {
-		return none, nil, 0, err
+		return nil, err
 	}
 	defer in.Close()
 
-	h := sha256.New()
-	var out *os.File
-	var chunks []string
-	var offset int64
+	t := &transfer{opts: opts, in: in, h: sha256.New()}
 	if start != nil {
-		if err := h.(encoding.BinaryUnmarshaler).UnmarshalBinary(start.state); err != nil {
-			return none, nil, 0, fmt.Errorf("restoring checkpoint: %w", err)
+		if err := t.h.(encoding.BinaryUnmarshaler).UnmarshalBinary(start.state); err != nil {
+			return nil, fmt.Errorf("restoring checkpoint: %w", err)
 		}
-		if out, err = root.OpenFile(partial, os.O_WRONLY, 0); err != nil {
-			return none, nil, 0, err
+		if t.out, err = root.OpenFile(partial, os.O_WRONLY, 0); err != nil {
+			return nil, err
 		}
-		offset, chunks = start.offset, start.chunks
-		if err := out.Truncate(offset); err == nil {
-			_, err = out.Seek(offset, io.SeekStart)
+		t.offset, t.chunks = start.offset, start.chunks
+		if err := t.out.Truncate(t.offset); err == nil {
+			_, err = t.out.Seek(t.offset, io.SeekStart)
 		}
 		if err == nil {
-			_, err = in.Seek(offset, io.SeekStart)
+			_, err = in.Seek(t.offset, io.SeekStart)
 		}
 		if err != nil {
-			out.Close()
-			return none, nil, 0, err
+			t.out.Close()
+			return nil, err
 		}
 	} else {
 		if err := root.Remove(partial); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return none, nil, 0, err
+			return nil, err
 		}
 		if err := root.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return none, nil, 0, err
+			return nil, err
 		}
-		if out, err = root.OpenFile(partial, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644); err != nil {
-			return none, nil, 0, err
+		if t.out, err = root.OpenFile(partial, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644); err != nil {
+			return nil, err
 		}
 	}
-	resumed := offset
-
-	ok := false
 	defer func() {
-		if !ok {
-			out.Close()
+		if t.out != nil {
+			t.out.Close()
 		}
 	}()
 
-	jr, err := writeJournal(jpath, hdr, start)
-	if err != nil {
-		return none, nil, 0, err
+	if layout != nil {
+		if err := t.startParity(fs.ppath, layout, start); err != nil {
+			return nil, err
+		}
+		defer t.staging.Close()
 	}
-	defer jr.close()
+	resumed := t.offset
 
-	prog := startProgress(opts.Progress, j.info.Size())
-	prog.done.Store(offset)
-	err = copyChunks(in, out, h, prog, &offset, &chunks, opts, jr)
-	prog.finish()
+	if t.jr, err = writeJournal(fs.jpath, hdr, start); err != nil {
+		return nil, err
+	}
+	defer t.jr.close()
+
+	t.prog = startProgress(opts.Progress, j.info.Size())
+	t.prog.done.Store(t.offset)
+	err = t.copy()
+	t.prog.finish()
 	if err != nil {
-		return none, nil, 0, err
+		return nil, err
 	}
 
 	after, err := in.Stat()
 	if err != nil {
-		return none, nil, 0, err
+		return nil, err
 	}
-	if offset != j.info.Size() || after.Size() != j.info.Size() || !after.ModTime().Equal(j.info.ModTime()) {
-		return none, nil, 0, errors.New("source changed while it was being archived")
+	if t.offset != j.info.Size() || after.Size() != j.info.Size() || !after.ModTime().Equal(j.info.ModTime()) {
+		return nil, errors.New("source changed while it was being archived")
 	}
 
-	if err := out.Sync(); err != nil {
-		return none, nil, 0, err
+	if err := t.out.Sync(); err != nil {
+		return nil, err
 	}
-	ok = true
-	if err := out.Close(); err != nil {
-		return none, nil, 0, err
-	}
-	state, err := h.(encoding.BinaryMarshaler).MarshalBinary()
+	err = t.out.Close()
+	t.out = nil
 	if err != nil {
-		return none, nil, 0, err
+		return nil, err
 	}
-	sum := hex.EncodeToString(h.Sum(nil))
-	if err := jr.append(journalRecord{Offset: offset, State: state, Chunks: pendingChunks(chunks, jr), SHA256: sum}); err != nil {
-		return none, nil, 0, err
+
+	var par *manifest.Parity
+	if layout != nil {
+		if par, err = t.finishParity(j.rel); err != nil {
+			return nil, fmt.Errorf("parity: %w", err)
+		}
+	}
+
+	state, err := t.h.(encoding.BinaryMarshaler).MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	sum := hex.EncodeToString(t.h.Sum(nil))
+	final := journalRecord{Offset: t.offset, State: state, Chunks: pendingChunks(t.chunks, t.jr), SHA256: sum, Parity: par}
+	if err := t.jr.append(final); err != nil {
+		return nil, err
 	}
 	if err := root.Chtimes(partial, j.info.ModTime(), j.info.ModTime()); err != nil {
-		return none, nil, 0, err
+		return nil, err
 	}
 	if err := root.Rename(partial, dst); err != nil {
-		return none, nil, 0, err
+		return nil, err
 	}
-	return entryFor(j, sum), chunksFor(j, opts.ChunkSize, chunks), resumed, nil
+	return &archived{entry: entryFor(j, sum), chunks: chunksFor(j, opts.ChunkSize, t.chunks), parity: par, resumed: resumed}, nil
 }
 
-// copyChunks copies in to out one chunk at a time, hashing each chunk and the
-// whole stream, and writes a journal checkpoint every opts.CheckpointEvery
-// bytes once the data up to that point is synced.
-func copyChunks(in io.Reader, out *os.File, h hash.Hash, prog io.Writer, offset *int64, chunks *[]string, opts PutOptions, jr *journal) error {
-	buf := make([]byte, opts.ChunkSize)
-	lastCheckpoint := *offset
-	for {
-		n, rerr := io.ReadFull(in, buf)
-		if n > 0 {
-			if _, err := out.Write(buf[:n]); err != nil {
+// transfer is one file copy in progress.
+type transfer struct {
+	opts   PutOptions
+	in     io.Reader
+	out    *os.File
+	h      hash.Hash
+	prog   *progress
+	jr     *journal
+	offset int64
+	chunks []string
+
+	layout  *parity.Layout
+	staging *os.File
+	enc     *parity.WindowEncoder // large files
+	small   *bytes.Buffer         // small files, buffered whole
+}
+
+func (t *transfer) startParity(ppath string, l *parity.Layout, start *resumePoint) error {
+	t.layout = l
+	if err := os.MkdirAll(filepath.Dir(ppath), 0o755); err != nil {
+		return err
+	}
+	var err error
+	if start != nil {
+		if t.staging, err = os.OpenFile(ppath, os.O_WRONLY, 0); err != nil {
+			return err
+		}
+		end := int64(len(start.parityHashes)) * l.ShardSize
+		if err := t.staging.Truncate(end); err != nil {
+			return err
+		}
+		if _, err := t.staging.Seek(end, io.SeekStart); err != nil {
+			return err
+		}
+	} else if t.staging, err = os.OpenFile(ppath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644); err != nil {
+		return err
+	}
+	if l.Scheme == parity.SchemeSmall {
+		t.small = bytes.NewBuffer(make([]byte, 0, l.Size))
+		return nil
+	}
+	if t.enc, err = parity.NewWindowEncoder(l, t.offset/l.ShardSize, t.staging); err != nil {
+		return err
+	}
+	if start != nil {
+		t.enc.SetHashes(start.parityHashes)
+	}
+	return nil
+}
+
+func (t *transfer) finishParity(rel string) (*manifest.Parity, error) {
+	par := &manifest.Parity{Path: rel, Layout: *t.layout}
+	if t.small != nil {
+		data, dataHashes, parityHashes, err := parity.EncodeSmall(t.layout, t.small.Bytes())
+		if err != nil {
+			return nil, err
+		}
+		if _, err := t.staging.Write(data); err != nil {
+			return nil, err
+		}
+		par.Hashes, par.DataHashes = parityHashes, dataHashes
+	} else {
+		par.Hashes = t.enc.Hashes()
+	}
+	if int64(len(par.Hashes)) != t.layout.ParityShards() {
+		return nil, errors.New("parity incomplete")
+	}
+	if err := t.staging.Sync(); err != nil {
+		return nil, err
+	}
+	return par, par.Validate()
+}
+
+// readAhead is how many chunks are read ahead of the writer, so a slow
+// source read never leaves the tape drive waiting.
+const readAhead = 4
+
+type readChunk struct {
+	buf []byte
+	n   int
+	err error
+}
+
+// readChunks reads r in chunkSize pieces in its own goroutine. Buffers are
+// handed back through free once used. Closing stop ends the reader early.
+func readChunks(r io.Reader, chunkSize int64, stop <-chan struct{}) (<-chan readChunk, chan<- []byte) {
+	out := make(chan readChunk, readAhead)
+	free := make(chan []byte, readAhead+2)
+	for range readAhead + 2 {
+		free <- make([]byte, chunkSize)
+	}
+	go func() {
+		defer close(out)
+		for {
+			var buf []byte
+			select {
+			case buf = <-free:
+			case <-stop:
+				return
+			}
+			n, err := io.ReadFull(r, buf)
+			select {
+			case out <- readChunk{buf: buf, n: n, err: err}:
+			case <-stop:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return out, free
+}
+
+// copy copies the source to the tape one chunk at a time. For each chunk
+// the tape write, the file hash, the chunk hash and the parity update run in
+// parallel, while the next chunks are already being read. SHA-256 is the
+// slowest step on CPUs without SHA instructions, so running the two hashes
+// side by side matters for keeping the drive streaming.
+//
+// A journal checkpoint is written every opts.CheckpointEvery bytes once the
+// data up to that point is synced. With parity, checkpoints wait for a
+// window boundary so no parity state has to be saved.
+func (t *transfer) copy() error {
+	stop := make(chan struct{})
+	defer close(stop)
+	chunks, free := readChunks(t.in, t.opts.ChunkSize, stop)
+
+	lastCheckpoint := t.offset
+	for rc := range chunks {
+		if rc.n > 0 {
+			if err := t.process(rc.buf[:rc.n]); err != nil {
 				return err
 			}
-			h.Write(buf[:n])
-			prog.Write(buf[:n])
-			c := sha256.Sum256(buf[:n])
-			*chunks = append(*chunks, hex.EncodeToString(c[:]))
-			*offset += int64(n)
 		}
-		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+		free <- rc.buf
+		if rc.err == io.EOF || rc.err == io.ErrUnexpectedEOF {
 			return nil
 		}
-		if rerr != nil {
-			return rerr
+		if rc.err != nil {
+			return rc.err
 		}
-		if *offset-lastCheckpoint >= opts.CheckpointEvery {
-			if err := out.Sync(); err != nil {
+		if t.small == nil && t.offset-lastCheckpoint >= t.opts.CheckpointEvery && (t.enc == nil || t.enc.AtWindowBoundary()) {
+			if err := t.checkpoint(); err != nil {
 				return err
 			}
-			state, err := h.(encoding.BinaryMarshaler).MarshalBinary()
-			if err != nil {
-				return err
-			}
-			if err := jr.append(journalRecord{Offset: *offset, State: state, Chunks: pendingChunks(*chunks, jr)}); err != nil {
-				return err
-			}
-			lastCheckpoint = *offset
-			if err := hook("checkpoint", *offset); err != nil {
+			lastCheckpoint = t.offset
+			if err := hook("checkpoint", t.offset); err != nil {
 				return err
 			}
 		}
 	}
+	return errors.New("source reader stopped unexpectedly")
+}
+
+// process handles one chunk and returns once every step is done.
+func (t *transfer) process(b []byte) error {
+	var wg sync.WaitGroup
+	var writeErr, parityErr error
+	var chunkSum [sha256.Size]byte
+	wg.Go(func() { _, writeErr = t.out.Write(b) })
+	wg.Go(func() { t.h.Write(b) })
+	wg.Go(func() { chunkSum = sha256.Sum256(b) })
+	if t.enc != nil {
+		wg.Go(func() { parityErr = t.enc.Add(b) })
+	}
+	if t.small != nil {
+		t.small.Write(b)
+	}
+	t.prog.Write(b)
+	wg.Wait()
+	if err := errors.Join(writeErr, parityErr); err != nil {
+		return err
+	}
+	t.chunks = append(t.chunks, hex.EncodeToString(chunkSum[:]))
+	t.offset += int64(len(b))
+	return nil
+}
+
+func (t *transfer) checkpoint() error {
+	if err := t.out.Sync(); err != nil {
+		return err
+	}
+	rec := journalRecord{Offset: t.offset, Chunks: pendingChunks(t.chunks, t.jr)}
+	if t.enc != nil {
+		if err := t.staging.Sync(); err != nil {
+			return err
+		}
+		all := t.enc.Hashes()
+		rec.ParityHashes = all[t.jr.parityRecorded:]
+		t.jr.parityRecorded = len(all)
+	}
+	state, err := t.h.(encoding.BinaryMarshaler).MarshalBinary()
+	if err != nil {
+		return err
+	}
+	rec.State = state
+	return t.jr.append(rec)
+}
+
+// parityResumable reports whether a resume point lies on a window boundary
+// and the staged parity up to it is intact.
+func parityResumable(ppath string, l *parity.Layout, p *resumePoint) bool {
+	chunks := p.offset / l.ShardSize
+	if p.offset%l.ShardSize != 0 || chunks%int64(l.K*l.D) != 0 {
+		return false
+	}
+	if int64(len(p.parityHashes)) != chunks/int64(l.K)*int64(l.M) {
+		return false
+	}
+	return stagedShardsOK(ppath, l.ShardSize, p.parityHashes)
+}
+
+// stagedParityOK reports whether the staged parity file holds exactly the
+// parity described by p.
+func stagedParityOK(ppath string, p *manifest.Parity) bool {
+	st, err := os.Stat(ppath)
+	if err != nil || st.Size() != p.Layout.ParitySize() {
+		return false
+	}
+	return stagedShardsOK(ppath, p.Layout.ShardSize, p.Hashes)
+}
+
+func stagedShardsOK(ppath string, shardSize int64, hashes []string) bool {
+	f, err := os.Open(ppath)
+	if err != nil {
+		return len(hashes) == 0
+	}
+	defer f.Close()
+	buf := make([]byte, shardSize)
+	for _, want := range hashes {
+		if _, err := io.ReadFull(f, buf); err != nil {
+			return false
+		}
+		got := sha256.Sum256(buf)
+		if hex.EncodeToString(got[:]) != want {
+			return false
+		}
+	}
+	return true
 }
 
 // pendingChunks returns the chunk hashes not yet recorded in the journal.
@@ -615,7 +927,8 @@ func pickResumePoint(root *os.Root, partial string, points []resumePoint, size, 
 }
 
 func sameHeader(a, b journalHeader) bool {
-	return a.Source == b.Source && a.Path == b.Path && a.Size == b.Size && a.MTime.Equal(b.MTime) && a.ChunkSize == b.ChunkSize
+	return a.Source == b.Source && a.Path == b.Path && a.Size == b.Size && a.MTime.Equal(b.MTime) &&
+		a.ChunkSize == b.ChunkSize && a.ParityM == b.ParityM
 }
 
 func entryFor(j job, sum string) manifest.Entry {

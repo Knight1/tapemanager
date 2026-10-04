@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"github.com/Knight1/tapemanager/internal/parity"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,16 +30,16 @@ func TestSegmentsRoundTrip(t *testing.T) {
 		{Path: "c d", Size: 0, SHA256: sha("c"), MTime: mtime},
 	}
 	ch1 := []Chunks{{Path: "a/b.iso", ChunkSize: 16, SHA256: []string{sha("1"), sha("2"), sha("3")}}}
-	if err := tp.WriteSegment(seg1, ch1, seg1); err != nil {
+	if err := tp.WriteSegment(Segment{Entries: seg1, Chunks: ch1}, seg1); err != nil {
 		t.Fatal(err)
 	}
 	seg2 := []Entry{{Path: "e", Size: 1, SHA256: sha("e"), Ref: &Ref{Tape: "16df0f97-5090-44fe-ba22-7ee000810811", Path: "x"}}}
 	all := append(append([]Entry{}, seg1...), seg2...)
-	if err := tp.WriteSegment(seg2, nil, all); err != nil {
+	if err := tp.WriteSegment(Segment{Entries: seg2}, all); err != nil {
 		t.Fatal(err)
 	}
 	// An empty flush writes nothing.
-	if err := tp.WriteSegment(nil, nil, all); err != nil {
+	if err := tp.WriteSegment(Segment{}, all); err != nil {
 		t.Fatal(err)
 	}
 
@@ -69,7 +70,7 @@ func TestSegmentsIgnoreIncomplete(t *testing.T) {
 	dir := t.TempDir()
 	tp := openTape(t, dir)
 	e := []Entry{{Path: "a", Size: 1, SHA256: sha("a")}}
-	tp.WriteSegment(e, nil, e)
+	tp.WriteSegment(Segment{Entries: e}, e)
 	seg := filepath.Join(dir, Dir, SegmentsDir)
 	for _, n := range []string{"000002.manifest.jsonl.tmp", "000003.chunks.jsonl", "junk", "1.manifest.jsonl", "000000.manifest.jsonl", "+00001.manifest.jsonl", "-00001.manifest.jsonl"} {
 		os.WriteFile(filepath.Join(seg, n), []byte("garbage\n"), 0o644)
@@ -79,7 +80,7 @@ func TestSegmentsIgnoreIncomplete(t *testing.T) {
 		t.Fatalf("got %+v, %v", out, err)
 	}
 	// The next segment number follows the highest complete one.
-	tp.WriteSegment([]Entry{{Path: "b", Size: 1, SHA256: sha("b")}}, nil, nil)
+	tp.WriteSegment(Segment{Entries: []Entry{{Path: "b", Size: 1, SHA256: sha("b")}}}, nil)
 	if _, err := os.Stat(filepath.Join(seg, "000002.manifest.jsonl")); err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +101,7 @@ func TestSegmentDirSymlinkOutOfTape(t *testing.T) {
 	os.MkdirAll(outside, 0o755)
 	os.Symlink(outside, filepath.Join(dir, Dir, SegmentsDir))
 	e := []Entry{{Path: "a", Size: 1, SHA256: sha("a")}}
-	if err := openTape(t, dir).WriteSegment(e, nil, e); err == nil {
+	if err := openTape(t, dir).WriteSegment(Segment{Entries: e}, e); err == nil {
 		t.Fatal("segment written through a symlink out of the tape")
 	}
 	if names, _ := os.ReadDir(outside); len(names) != 0 {
@@ -187,5 +188,48 @@ func TestInitVolumeIsStable(t *testing.T) {
 	b, _ := tp.InitVolume("other", "")
 	if b.ID != a.ID || b.Label != "L1" {
 		t.Fatalf("volume changed: %+v", b)
+	}
+}
+
+func TestParityValidate(t *testing.T) {
+	l := parity.ForFile(200, 16, 2)
+	good := Parity{Path: "a", Layout: *l, Hashes: []string{sha("1"), sha("2")}, DataHashes: make([]string, parity.K)}
+	for i := range good.DataHashes {
+		good.DataHashes[i] = sha("d")
+	}
+	if l.Scheme != parity.SchemeSmall {
+		t.Fatalf("scheme %s", l.Scheme)
+	}
+	if err := good.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	bad := []func(p *Parity){
+		func(p *Parity) { p.Path = "../x" },
+		func(p *Parity) { p.Offset = -1 },
+		func(p *Parity) { p.Hashes = p.Hashes[:1] },
+		func(p *Parity) { p.Hashes[0] = "nope" },
+		func(p *Parity) { p.DataHashes = nil },
+		func(p *Parity) { p.Layout.Scheme = "xor" },
+		func(p *Parity) { p.Layout.Size = 1 << 60; p.Layout.ShardSize = (1<<60 + 19) / 20 },
+	}
+	for i, mutate := range bad {
+		p := good
+		p.Hashes = append([]string(nil), good.Hashes...)
+		p.DataHashes = append([]string(nil), good.DataHashes...)
+		mutate(&p)
+		if err := p.Validate(); err == nil {
+			t.Errorf("case %d accepted", i)
+		}
+	}
+}
+
+func TestReadParityShardBounds(t *testing.T) {
+	tp := openTape(t, t.TempDir())
+	l := parity.ForFile(200, 16, 1)
+	p := Parity{Path: "a", Layout: *l, Segment: 1}
+	for _, i := range []int64{-1, 1, 1 << 40} {
+		if _, err := tp.ReadParityShard(p, i); err == nil {
+			t.Errorf("shard %d accepted", i)
+		}
 	}
 }

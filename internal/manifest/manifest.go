@@ -7,6 +7,8 @@
 //	.tapemgr/volume.json                      tape identity
 //	.tapemgr/segments/NNNNNN.manifest.jsonl   one Entry per archived file
 //	.tapemgr/segments/NNNNNN.chunks.jsonl     chunk hashes for those files
+//	.tapemgr/segments/NNNNNN.parity           Reed-Solomon parity data
+//	.tapemgr/segments/NNNNNN.parity.jsonl     parity layout per file
 //
 // Tape is append-only: every write, even to an existing file, lands at the
 // end of the recorded data. Appending one line per archived file would
@@ -24,6 +26,8 @@ import (
 	"path"
 	"strings"
 	"time"
+
+	"github.com/Knight1/tapemanager/internal/parity"
 )
 
 const (
@@ -76,6 +80,61 @@ type Chunks struct {
 	Path      string   `json:"path"`
 	ChunkSize int64    `json:"chunk_size"`
 	SHA256    []string `json:"sha256"`
+}
+
+// Parity records where a file's parity is stored and how it is laid out.
+type Parity struct {
+	Path   string        `json:"path"`
+	Layout parity.Layout `json:"layout"`
+	// Offset of the file's parity in the segment's parity file. Set when
+	// the segment is written.
+	Offset int64 `json:"offset"`
+	// Hashes of every parity shard, so damaged parity is never used.
+	Hashes []string `json:"hashes"`
+	// DataHashes of the data shards, for small files only. Large files use
+	// their chunk hashes.
+	DataHashes []string `json:"data_hashes,omitempty"`
+
+	// Segment holding the parity data, set when read from tape.
+	Segment int `json:"-"`
+}
+
+// maxParityFileSize bounds layouts read from tape so offset arithmetic
+// cannot overflow.
+const maxParityFileSize = 1 << 50
+
+// Validate checks a parity record read from untrusted input.
+func (p Parity) Validate() error {
+	if !ValidPath(p.Path) {
+		return fmt.Errorf("invalid path %q", p.Path)
+	}
+	if err := p.Layout.Validate(); err != nil {
+		return fmt.Errorf("%s: %w", p.Path, err)
+	}
+	if p.Layout.Size > maxParityFileSize {
+		return fmt.Errorf("%s: parity layout too large", p.Path)
+	}
+	if p.Offset < 0 || p.Offset > maxParityFileSize {
+		return fmt.Errorf("%s: parity offset out of range", p.Path)
+	}
+	if int64(len(p.Hashes)) != p.Layout.ParityShards() {
+		return fmt.Errorf("%s: %d parity hashes, layout needs %d", p.Path, len(p.Hashes), p.Layout.ParityShards())
+	}
+	want := 0
+	if p.Layout.Scheme == parity.SchemeSmall {
+		want = p.Layout.K
+	}
+	if len(p.DataHashes) != want {
+		return fmt.Errorf("%s: wrong number of data shard hashes", p.Path)
+	}
+	for _, list := range [][]string{p.Hashes, p.DataHashes} {
+		for _, h := range list {
+			if !validSHA256(h) {
+				return fmt.Errorf("%s: invalid parity hash", p.Path)
+			}
+		}
+	}
+	return nil
 }
 
 // Volume identifies a tape.

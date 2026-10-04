@@ -15,8 +15,10 @@ import (
 )
 
 const (
-	manifestSuffix = ".manifest.jsonl"
-	chunksSuffix   = ".chunks.jsonl"
+	manifestSuffix   = ".manifest.jsonl"
+	chunksSuffix     = ".chunks.jsonl"
+	paritySuffix     = ".parity"
+	parityListSuffix = ".parity.jsonl"
 )
 
 // Tape gives access to the metadata on a mounted tape. All file access goes
@@ -164,6 +166,43 @@ func (t *Tape) Chunks() (map[string]Chunks, error) {
 	return m, nil
 }
 
+// Parity reads all parity records, keyed by path.
+func (t *Tape) Parity() (map[string]Parity, error) {
+	nums, err := t.segments()
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]Parity)
+	for _, n := range nums {
+		list, err := readFile[Parity](t.root, segmentName(n, parityListSuffix))
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range list {
+			p.Segment = n
+			m[p.Path] = p
+		}
+	}
+	return m, nil
+}
+
+// ReadParityShard reads parity shard i of the file described by p.
+func (t *Tape) ReadParityShard(p Parity, i int64) ([]byte, error) {
+	if i < 0 || i >= p.Layout.ParityShards() {
+		return nil, fmt.Errorf("parity shard %d out of range", i)
+	}
+	f, err := t.root.Open(segmentName(p.Segment, paritySuffix))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b := make([]byte, p.Layout.ShardSize)
+	if _, err := f.ReadAt(b, p.Offset+i*p.Layout.ShardSize); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
 func readFile[T Validator](root *os.Root, name string) ([]T, error) {
 	f, err := root.Open(name)
 	if errors.Is(err, os.ErrNotExist) {
@@ -180,15 +219,23 @@ func readFile[T Validator](root *os.Root, name string) ([]T, error) {
 	return list, nil
 }
 
-// WriteSegment records entries and their chunk hashes as a new segment, and
-// rewrites SHA256SUMS to cover all entries. all must contain every entry on
-// the tape including the new ones.
+// Segment is one batch of records to write to tape.
+type Segment struct {
+	Entries []Entry
+	Chunks  []Chunks
+	// Parity records, with offsets into ParityData.
+	Parity     []Parity
+	ParityData io.Reader
+}
+
+// WriteSegment records a batch as a new segment, and rewrites SHA256SUMS to
+// cover all entries. all must contain every entry on the tape including the
+// new ones.
 //
 // Each file is written in one piece so it stays contiguous on tape. The
-// chunk file comes first and the manifest file last, because the manifest
-// file is what makes the segment count.
-func (t *Tape) WriteSegment(entries []Entry, chunks []Chunks, all []Entry) error {
-	if len(entries) == 0 {
+// manifest file comes last, because it is what makes the segment count.
+func (t *Tape) WriteSegment(seg Segment, all []Entry) error {
+	if len(seg.Entries) == 0 {
 		return nil
 	}
 	nums, err := t.segments()
@@ -205,14 +252,26 @@ func (t *Tape) WriteSegment(entries []Entry, chunks []Chunks, all []Entry) error
 	if err := t.root.MkdirAll(path.Join(Dir, SegmentsDir), 0o755); err != nil {
 		return err
 	}
-	c, err := MarshalJSONL(chunks)
+	if len(seg.Parity) > 0 {
+		if err := t.writeStream(segmentName(next, paritySuffix), seg.ParityData); err != nil {
+			return err
+		}
+		p, err := MarshalJSONL(seg.Parity)
+		if err != nil {
+			return err
+		}
+		if err := t.writeAtomic(segmentName(next, parityListSuffix), p); err != nil {
+			return err
+		}
+	}
+	c, err := MarshalJSONL(seg.Chunks)
 	if err != nil {
 		return err
 	}
 	if err := t.writeAtomic(segmentName(next, chunksSuffix), c); err != nil {
 		return err
 	}
-	m, err := MarshalJSONL(entries)
+	m, err := MarshalJSONL(seg.Entries)
 	if err != nil {
 		return err
 	}
@@ -220,6 +279,19 @@ func (t *Tape) WriteSegment(entries []Entry, chunks []Chunks, all []Entry) error
 		return err
 	}
 	return t.writeSums(all)
+}
+
+func (t *Tape) writeStream(name string, r io.Reader) error {
+	tmp := name + ".tmp"
+	f, err := t.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.CopyBuffer(f, struct{ io.Reader }{r}, make([]byte, 4<<20)); err != nil {
+		f.Close()
+		return err
+	}
+	return finishAtomic(f, nil, func() error { return t.root.Rename(tmp, name) })
 }
 
 func (t *Tape) writeSums(all []Entry) error {
