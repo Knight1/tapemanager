@@ -20,3 +20,13 @@ func TestStartBlockUnavailable(t *testing.T) {
 		t.Error("start block reported for a plain directory")
 	}
 }
+
+func TestFreeSpace(t *testing.T) {
+	n, err := FreeSpace(t.TempDir())
+	if err != nil || n <= 0 {
+		t.Fatalf("%d, %v", n, err)
+	}
+	if _, err := FreeSpace("/does/not/exist"); err == nil {
+		t.Error("missing path accepted")
+	}
+}

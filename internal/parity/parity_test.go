@@ -77,6 +77,16 @@ func set(idx ...int64) map[int64]bool {
 	return m
 }
 
+// repairAll runs RepairWindow and collects the rebuilt chunks.
+func repairAll(l *Layout, bad []int64, ch, ph []string, r Reader) (map[int64][]byte, error) {
+	got := map[int64][]byte{}
+	err := RepairWindow(l, bad, ch, ph, r, func(i int64, b []byte) error {
+		got[i] = append([]byte(nil), b...)
+		return nil
+	})
+	return got, err
+}
+
 func checkRepair(t *testing.T, l *Layout, data []byte, got map[int64][]byte) {
 	t.Helper()
 	for i, b := range got {
@@ -111,7 +121,7 @@ func TestWindowRepairsBurst(t *testing.T) {
 		bad = append(bad, i)
 	}
 	r := &memReader{data: data, parity: par, l: l, lost: set(bad...)}
-	got, err := RepairWindow(l, bad, ch, ph, r)
+	got, err := repairAll(l, bad, ch, ph, r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +136,7 @@ func TestWindowRepairsLastPartialChunk(t *testing.T) {
 	l, data, par, ch, ph := encodeWindow(t, size, 1)
 	last := l.Chunks() - 1
 	r := &memReader{data: data, parity: par, l: l, corrupt: set(last)}
-	got, err := RepairWindow(l, []int64{last}, ch, ph, r)
+	got, err := repairAll(l, []int64{last}, ch, ph, r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +151,7 @@ func TestWindowTooMuchDamage(t *testing.T) {
 	l, data, par, ch, ph := encodeWindow(t, size, 1)
 	// Chunks 0 and D share stripe 0; one parity shard cannot cover both.
 	r := &memReader{data: data, parity: par, l: l, lost: set(0, D)}
-	if _, err := RepairWindow(l, []int64{0, D}, ch, ph, r); !errors.Is(err, ErrUnrecoverable) {
+	if _, err := repairAll(l, []int64{0, D}, ch, ph, r); !errors.Is(err, ErrUnrecoverable) {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -151,7 +161,7 @@ func TestWindowDamagedParity(t *testing.T) {
 	size := int64(K * D * testChunk)
 	l, data, par, ch, ph := encodeWindow(t, size, 2)
 	r := &memReader{data: data, parity: par, l: l, lost: set(3), lostPar: set(l.parityIndex(0, 3, 0))}
-	got, err := RepairWindow(l, []int64{3}, ch, ph, r)
+	got, err := repairAll(l, []int64{3}, ch, ph, r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +170,7 @@ func TestWindowDamagedParity(t *testing.T) {
 	corrupted := append([]byte(nil), par...)
 	corrupted[l.parityIndex(0, 3, 1)*testChunk] ^= 1
 	r = &memReader{data: data, parity: corrupted, l: l, lost: set(3), lostPar: set(l.parityIndex(0, 3, 0))}
-	if _, err := RepairWindow(l, []int64{3}, ch, ph, r); !errors.Is(err, ErrUnrecoverable) {
+	if _, err := repairAll(l, []int64{3}, ch, ph, r); !errors.Is(err, ErrUnrecoverable) {
 		t.Fatalf("err = %v", err)
 	}
 }

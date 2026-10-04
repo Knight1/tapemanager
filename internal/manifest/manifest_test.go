@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"errors"
 	"github.com/Knight1/tapemanager/internal/parity"
 	"os"
 	"path/filepath"
@@ -50,7 +51,7 @@ func TestSegmentsRoundTrip(t *testing.T) {
 	if len(out) != 3 || out[1].Path != "c d" || out[2].Path != "e" || !out[0].MTime.Equal(mtime) {
 		t.Fatalf("got %+v", out)
 	}
-	chunks, err := tp.Chunks()
+	chunks, _, err := tp.Chunks()
 	if err != nil || len(chunks["a/b.iso"].SHA256) != 3 {
 		t.Fatalf("chunks = %+v, %v", chunks, err)
 	}
@@ -164,8 +165,10 @@ func TestLoadChunksRejectsHugeChunkSize(t *testing.T) {
 	os.MkdirAll(filepath.Join(dir, Dir, SegmentsDir), 0o755)
 	os.WriteFile(filepath.Join(dir, Dir, SegmentsDir, "000001.manifest.jsonl"), nil, 0o644)
 	os.WriteFile(filepath.Join(dir, Dir, SegmentsDir, "000001.chunks.jsonl"), []byte(`{"path":"a","chunk_size":4611686018427387904,"sha256":[]}`+"\n"), 0o644)
-	if _, err := openTape(t, dir).Chunks(); err == nil {
-		t.Fatal("huge chunk size accepted")
+	// Chunk hashes are optional: the bad record is skipped and reported.
+	chunks, problems, err := openTape(t, dir).Chunks()
+	if err != nil || len(chunks) != 0 || len(problems) != 1 {
+		t.Fatalf("chunks = %v, problems = %v, err = %v", chunks, problems, err)
 	}
 }
 
@@ -231,5 +234,65 @@ func TestReadParityShardBounds(t *testing.T) {
 		if _, err := tp.ReadParityShard(p, i); err == nil {
 			t.Errorf("shard %d accepted", i)
 		}
+	}
+}
+
+type failReader struct{}
+
+func (failReader) Read([]byte) (int, error) { return 0, os.ErrDeadlineExceeded }
+
+// Leftovers of an aborted segment attempt must not be adopted, and a parity
+// failure must leave the segment committed.
+func TestWriteSegmentLeftoversAndParityFailure(t *testing.T) {
+	dir := t.TempDir()
+	tp := openTape(t, dir)
+	seg := filepath.Join(dir, Dir, SegmentsDir)
+	os.MkdirAll(seg, 0o755)
+	stale := `{"path":"a","layout":{"scheme":"rs-small","k":20,"m":1,"shard_size":1,"size":1},"offset":0,"hashes":["` + sha("1") + `"],"data_hashes":[` + strings.TrimSuffix(strings.Repeat(`"`+sha("2")+`",`, 20), ",") + `]}` + "\n"
+	os.WriteFile(filepath.Join(seg, "000001.parity.jsonl"), []byte(stale), 0o644)
+	os.WriteFile(filepath.Join(seg, "000001.parity"), []byte("x"), 0o644)
+
+	e := []Entry{{Path: "a", Size: 1, SHA256: sha("a")}}
+	if err := tp.WriteSegment(Segment{Entries: e}, e); err != nil {
+		t.Fatal(err)
+	}
+	if par, _, _ := tp.Parity(); len(par) != 0 {
+		t.Fatalf("stale parity adopted: %+v", par)
+	}
+
+	l := parity.ForFile(1, 16, 1)
+	p := Parity{Path: "b", Layout: *l, Hashes: []string{sha("1")}, DataHashes: make([]string, parity.K)}
+	for i := range p.DataHashes {
+		p.DataHashes[i] = sha("2")
+	}
+	e2 := []Entry{{Path: "b", Size: 1, SHA256: sha("b")}}
+	err := tp.WriteSegment(Segment{Entries: e2, Parity: []Parity{p}, ParityData: failReader{}}, append(e, e2...))
+	var pe *ParityError
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v", err)
+	}
+	entries, err := tp.Entries()
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("segment not committed: %v, %v", entries, err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(seg, "000002.parity*")); len(left) != 0 {
+		t.Fatalf("parity leftovers: %v", left)
+	}
+}
+
+func TestEntriesLenientSkipsDamage(t *testing.T) {
+	dir := t.TempDir()
+	tp := openTape(t, dir)
+	e := []Entry{{Path: "a", Size: 1, SHA256: sha("a")}, {Path: "b", Size: 1, SHA256: sha("b")}}
+	tp.WriteSegment(Segment{Entries: e}, e)
+	m := filepath.Join(dir, Dir, SegmentsDir, "000001.manifest.jsonl")
+	b, _ := os.ReadFile(m)
+	os.WriteFile(m, append([]byte("broken\n"), b...), 0o644)
+	if _, err := tp.Entries(); err == nil {
+		t.Fatal("strict read accepted damage")
+	}
+	list, problems, err := tp.EntriesLenient()
+	if err != nil || len(list) != 2 || len(problems) != 1 || list[0].Segment != 1 {
+		t.Fatalf("list = %+v, problems = %v, err = %v", list, problems, err)
 	}
 }

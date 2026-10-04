@@ -43,9 +43,10 @@ func (r pendingRecord) Validate() error {
 }
 
 type pending struct {
-	f       *os.File
-	records []pendingRecord
-	bytes   int64 // content bytes since the last flush
+	f           *os.File
+	records     []pendingRecord
+	bytes       int64 // content bytes since the last flush
+	parityBytes int64 // staged parity waiting for the next flush
 }
 
 // openPending opens the pending log at name, loading records left behind by
@@ -84,6 +85,9 @@ func openPending(name string) (*pending, error) {
 		if r.Entry.Ref == nil {
 			p.bytes += r.Entry.Size
 		}
+		if r.Parity != nil {
+			p.parityBytes += r.Parity.Layout.ParitySize()
+		}
 		good += int64(len(line)) + 1
 	}
 	if err := sc.Err(); err != nil {
@@ -117,6 +121,9 @@ func (p *pending) add(r pendingRecord) error {
 	if r.Entry.Ref == nil {
 		p.bytes += r.Entry.Size
 	}
+	if r.Parity != nil {
+		p.parityBytes += r.Parity.Layout.ParitySize()
+	}
 	return nil
 }
 
@@ -127,7 +134,7 @@ func (p *pending) clear() error {
 	if _, err := p.f.Seek(0, 0); err != nil {
 		return err
 	}
-	p.records, p.bytes = nil, 0
+	p.records, p.bytes, p.parityBytes = nil, 0, 0
 	return p.f.Sync()
 }
 

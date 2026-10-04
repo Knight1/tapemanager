@@ -42,13 +42,20 @@ func paritySetup(t *testing.T) (src, tape string, big, small []byte, o PutOption
 
 func damage(t *testing.T, path string, off int64, n int) {
 	t.Helper()
-	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	junk := bytes.Repeat([]byte{0xAA}, n)
-	if _, err := f.WriteAt(junk, off); err != nil {
+	// Flip the existing bytes, so the damage is guaranteed to change them.
+	buf := make([]byte, n)
+	if _, err := f.ReadAt(buf, off); err != nil {
+		t.Fatal(err)
+	}
+	for i := range buf {
+		buf[i] ^= 0xff
+	}
+	if _, err := f.WriteAt(buf, off); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -82,7 +89,7 @@ func TestParityWrittenToSegment(t *testing.T) {
 	}
 	tp, _ := manifest.Open(tape)
 	defer tp.Close()
-	par, err := tp.Parity()
+	par, _, err := tp.Parity()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +147,7 @@ func TestParityRepairsUnreadableTail(t *testing.T) {
 
 	var log strings.Builder
 	res, _ := Verify(VerifyOptions{TapeRoot: tape, Log: &log})
-	if res.Repairable != 1 || !strings.Contains(log.String(), "unreadable bytes") {
+	if res.Repairable != 1 || !strings.Contains(log.String(), "file is cut short") {
 		t.Fatalf("verify = %+v\n%s", res, log.String())
 	}
 	_, dest := restoreAll(t, tape)
@@ -285,7 +292,7 @@ func TestParityDisabled(t *testing.T) {
 	Put(o)
 	tp, _ := manifest.Open(tape)
 	defer tp.Close()
-	if par, _ := tp.Parity(); len(par) != 0 {
+	if par, _, _ := tp.Parity(); len(par) != 0 {
 		t.Fatalf("parity written although disabled: %d", len(par))
 	}
 	o.Parity = 30

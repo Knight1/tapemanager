@@ -43,7 +43,11 @@ const (
 	// MinChunkSize and MaxChunkSize bound the chunk size accepted from a
 	// tape, so a damaged or crafted record cannot force a huge allocation.
 	MinChunkSize = 16
-	MaxChunkSize = 256 << 20
+	MaxChunkSize = 16 << 20
+
+	// MaxFileSize bounds file sizes read from tape, so size arithmetic
+	// cannot overflow. 1 PiB is far beyond any tape.
+	MaxFileSize = 1 << 50
 
 	maxVolumeFileSize = 64 << 10
 	// maxLine bounds a single JSON line. Chunk lists of very large files
@@ -62,6 +66,9 @@ type Entry struct {
 	// Ref is set when the content was not written because an identical
 	// file already exists on tape. The entry then only records the source.
 	Ref *Ref `json:"ref,omitempty"`
+	// Segment holding the entry, set when read from tape.
+	Segment int `json:"-"`
+
 	// Recovered is set for files found on tape without a manifest record
 	// and recorded by 'archive recover'. Their hash was computed from the
 	// tape, not from the source, and their source is unknown.
@@ -182,8 +189,8 @@ func (e Entry) Validate() error {
 	if !ValidPath(e.Path) {
 		return fmt.Errorf("invalid path %q", e.Path)
 	}
-	if e.Size < 0 {
-		return fmt.Errorf("%s: negative size", e.Path)
+	if e.Size < 0 || e.Size > MaxFileSize {
+		return fmt.Errorf("%s: size %d out of range", e.Path, e.Size)
 	}
 	if !validSHA256(e.SHA256) {
 		return fmt.Errorf("%s: invalid SHA-256 %q", e.Path, e.SHA256)
@@ -241,6 +248,29 @@ func ReadJSONL[T Validator](r io.Reader) ([]T, error) {
 		list = append(list, v)
 	}
 	return list, sc.Err()
+}
+
+// ReadJSONLLenient is like ReadJSONL but skips lines that do not parse or
+// validate, counting them in bad. It is for optional metadata such as chunk
+// hashes and parity, where one damaged line must not make the rest of the
+// tape unusable. A read error ends reading and is returned with the records
+// read so far.
+func ReadJSONLLenient[T Validator](r io.Reader) (list []T, bad int, err error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), maxLine)
+	for sc.Scan() {
+		b := sc.Bytes()
+		if len(b) == 0 {
+			continue
+		}
+		var v T
+		if json.Unmarshal(b, &v) != nil || v.Validate() != nil {
+			bad++
+			continue
+		}
+		list = append(list, v)
+	}
+	return list, bad, sc.Err()
 }
 
 // MarshalJSONL encodes records as JSON Lines.

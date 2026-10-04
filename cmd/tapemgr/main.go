@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -149,6 +150,7 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 	label := fs.String("label", "", "tape label, set when the tape is first used")
 	noDedup := fs.Bool("no-dedup", false, "always write content, even if an identical file is already archived")
 	parityPct := fs.Int("parity", 10, "Reed-Solomon parity overhead in percent (0 to 25, 0 disables)")
+	again := fs.Bool("again", false, "archive files even if they are already on another tape")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -172,17 +174,23 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 		Catalog:  cat,
 		Dedup:    !*noDedup,
 		Parity:   *parityPct,
+		Again:    *again,
 		Log:      stdout,
 		Progress: progressOut(stderr),
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "tapemgr:", err)
-		fmt.Fprintf(stderr, "Archive incomplete: %d files (%s) written before the error. Rerun the same command to continue.\n",
-			sum.Files, archive.FormatBytes(sum.Bytes))
+		if errors.Is(err, archive.ErrTapeFull) {
+			fmt.Fprintf(stderr, "Tape %s is full after %d files (%s). Files already archived will be skipped on the next tape.\n",
+				tapeName(sum.Tape), sum.Files, archive.FormatBytes(sum.Bytes))
+		} else {
+			fmt.Fprintf(stderr, "Archive incomplete: %d files (%s) written before the error. Rerun the same command to continue.\n",
+				sum.Files, archive.FormatBytes(sum.Bytes))
+		}
 		return exitFailure
 	}
-	fmt.Fprintf(stdout, "Archive complete.\nTape:        %s\nFiles:       %d\nSkipped:     %d\nDuplicates:  %d\nBytes:       %s\nDuration:    %s\n",
-		tapeName(sum.Tape), sum.Files, sum.Skipped, sum.Deduped, archive.FormatBytes(sum.Bytes), archive.FormatDuration(sum.Duration))
+	fmt.Fprintf(stdout, "Archive complete.\nTape:        %s\nFiles:       %d\nSkipped:     %d already on this tape, %d on other tapes\nDuplicates:  %d\nBytes:       %s\nDuration:    %s\n",
+		tapeName(sum.Tape), sum.Files, sum.Skipped, sum.Elsewhere, sum.Deduped, archive.FormatBytes(sum.Bytes), archive.FormatDuration(sum.Duration))
 	return exitOK
 }
 
@@ -223,8 +231,8 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	if err != nil && res.Files == 0 {
 		return fail(stderr, err)
 	}
-	fmt.Fprintf(stdout, "\nFiles:       %d\nVerified:    %d\nRepairable:  %d\nFailed:      %d\nReferences:  %d\nBytes:       %s\nDuration:    %s\n\n",
-		res.Files, res.Verified, res.Repairable, res.Failed, res.Refs, archive.FormatBytes(res.Bytes), archive.FormatDuration(res.Duration))
+	fmt.Fprintf(stdout, "\nFiles:       %d\nVerified:    %d\nRepairable:  %d\nFailed:      %d\nProblems:    %d\nReferences:  %d\nBytes:       %s\nDuration:    %s\n\n",
+		res.Files, res.Verified, res.Repairable, res.Failed, res.Problems, res.Refs, archive.FormatBytes(res.Bytes), archive.FormatDuration(res.Duration))
 	if err != nil {
 		fmt.Fprintln(stderr, "tapemgr:", err)
 	}
@@ -234,6 +242,10 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	}
 	if res.Repairable > 0 {
 		fmt.Fprintln(stdout, "The tape is damaged, but parity can rebuild every affected file. Restore them and copy them to another tape.")
+		return exitFailure
+	}
+	if res.Problems > 0 {
+		fmt.Fprintln(stdout, "Tape metadata or parity data is damaged. The files are intact, but their protection is not. Copy them to another tape.")
 		return exitFailure
 	}
 	fmt.Fprintln(stdout, "SHA-256 verification successful.")
@@ -326,9 +338,19 @@ func cmdTapes(args []string, stdout, stderr io.Writer) int {
 	for _, t := range tapes {
 		verified := "never verified"
 		if v := t.LastVerified(); v != nil {
-			status := "OK"
+			var issues []string
 			if v.Failed > 0 {
-				status = fmt.Sprintf("%d FAILED", v.Failed)
+				issues = append(issues, fmt.Sprintf("%d FAILED", v.Failed))
+			}
+			if v.Repairable > 0 {
+				issues = append(issues, fmt.Sprintf("%d REPAIRABLE", v.Repairable))
+			}
+			if v.Problems > 0 {
+				issues = append(issues, fmt.Sprintf("%d PROBLEMS", v.Problems))
+			}
+			status := "OK"
+			if len(issues) > 0 {
+				status = strings.Join(issues, ", ")
 			}
 			verified = fmt.Sprintf("verified %s %s", v.At.Format("2006-01-02"), status)
 		}

@@ -49,8 +49,10 @@ func TestVerifyRejectsTraversalInManifest(t *testing.T) {
 	os.MkdirAll(filepath.Join(tape, manifest.Dir, manifest.SegmentsDir), 0o755)
 	line := `{"path":"../../../../etc/passwd","size":1,"sha256":"` + strings.Repeat("0", 64) + `"}` + "\n"
 	os.WriteFile(filepath.Join(tape, manifest.Dir, manifest.SegmentsDir, "000001.manifest.jsonl"), []byte(line), 0o644)
-	if _, err := Verify(VerifyOptions{TapeRoot: tape, Log: io.Discard}); err == nil {
-		t.Fatal("traversal path accepted")
+	// The bad entry is skipped and reported, never followed.
+	res, err := Verify(VerifyOptions{TapeRoot: tape, Log: io.Discard})
+	if err != nil || res.Problems != 1 || res.Files != 0 || res.Verified != 0 {
+		t.Fatalf("res = %+v, err = %v", res, err)
 	}
 }
 

@@ -16,37 +16,48 @@ type Reader interface {
 	ParityShard(i int64) ([]byte, error) // parity shard i of this file
 }
 
-// RepairWindow rebuilds the given bad chunks of a window-layout file and
-// returns them by index. chunkHashes and parityHashes are the recorded
-// hashes of all data chunks and parity shards.
-func RepairWindow(l *Layout, bad []int64, chunkHashes, parityHashes []string, r Reader) (map[int64][]byte, error) {
+// RepairWindow rebuilds the given bad chunks of a window-layout file. It
+// works one stripe at a time and passes each rebuilt bad chunk to emit, so
+// memory use stays at one stripe however much of the file is damaged. emit
+// may be nil to only check that repair is possible. chunkHashes and
+// parityHashes are the recorded hashes of all data chunks and parity shards.
+func RepairWindow(l *Layout, bad []int64, chunkHashes, parityHashes []string, r Reader, emit func(i int64, chunk []byte) error) error {
 	if l.Scheme != SchemeWindow {
-		return nil, errors.New("not a window layout")
+		return errors.New("not a window layout")
 	}
 	if int64(len(chunkHashes)) != l.Chunks() || int64(len(parityHashes)) != l.ParityShards() {
-		return nil, errors.New("hash lists do not match the layout")
+		return errors.New("hash lists do not match the layout")
 	}
 	type key struct {
 		w int64
 		s int
 	}
-	stripes := map[key]bool{}
+	isBad := map[int64]bool{}
+	var order []key
+	seen := map[key]bool{}
 	for _, i := range bad {
 		if i < 0 || i >= l.Chunks() {
-			return nil, fmt.Errorf("chunk %d out of range", i)
+			return fmt.Errorf("chunk %d out of range", i)
 		}
+		isBad[i] = true
 		w, s, _ := l.locate(i)
-		stripes[key{w, s}] = true
+		if k := (key{w, s}); !seen[k] {
+			seen[k] = true
+			order = append(order, k)
+		}
 	}
 
-	out := map[int64][]byte{}
-	for k := range stripes {
+	for _, k := range order {
 		win := l.window(k.w)
 		n := dataShards(win, k.s)
 		shards := make([][]byte, n+l.M)
 		missing := 0
 		for pos := range n {
 			i := win.first + int64(k.s) + int64(pos)*int64(win.stripes)
+			if isBad[i] {
+				missing++
+				continue
+			}
 			b, err := r.Chunk(i)
 			if err != nil || hashHex(b) != chunkHashes[i] {
 				missing++
@@ -64,30 +75,33 @@ func RepairWindow(l *Layout, bad []int64, chunkHashes, parityHashes []string, r 
 			shards[n+j] = b
 		}
 		if missing > l.M {
-			return nil, fmt.Errorf("%w: %d of %d shards lost in one stripe, %d parity", ErrUnrecoverable, missing, n+l.M, l.M)
+			return fmt.Errorf("%w: %d of %d shards lost in one stripe, %d parity", ErrUnrecoverable, missing, n+l.M, l.M)
 		}
 		c, err := newCoder(n, l.M)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if err := c.ReconstructData(shards); err != nil {
-			return nil, err
+			return err
 		}
 		for pos := range n {
 			i := win.first + int64(k.s) + int64(pos)*int64(win.stripes)
+			if !isBad[i] {
+				continue
+			}
 			size := min(l.ShardSize, l.Size-i*l.ShardSize)
 			chunk := shards[pos][:size]
 			if hashHex(chunk) != chunkHashes[i] {
-				return nil, fmt.Errorf("chunk %d: rebuilt data does not match its hash", i)
+				return fmt.Errorf("chunk %d: rebuilt data does not match its hash", i)
 			}
-			out[i] = chunk
+			if emit != nil {
+				if err := emit(i, chunk); err != nil {
+					return err
+				}
+			}
 		}
 	}
-	result := map[int64][]byte{}
-	for _, i := range bad {
-		result[i] = out[i]
-	}
-	return result, nil
+	return nil
 }
 
 // RepairSmall rebuilds a small file. data is the file as read, with

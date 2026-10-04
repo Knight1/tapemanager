@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -30,6 +31,7 @@ type VerifyResult struct {
 	Repairable int // damaged, but parity can rebuild them
 	Failed     int // damaged beyond repair, or unreadable
 	Refs       int // deduplicated entries, whose content lives elsewhere
+	Problems   int // damaged metadata or parity data
 	Bytes      int64
 	Duration   time.Duration
 }
@@ -40,12 +42,18 @@ var ErrNoEntries = errors.New("no manifest entries to verify")
 // Verify reads every file listed in the tape manifest back from the tape,
 // recomputes its SHA-256 and compares it with the recorded value. Files are
 // read in manifest order, which matches the order they were written, to
-// avoid unnecessary tape repositioning. Read errors do not stop the check:
-// damage is reported as byte ranges, and files with parity are checked for
-// whether they can be rebuilt.
-func Verify(opts VerifyOptions) (VerifyResult, error) {
+// avoid unnecessary tape repositioning. A full verify also reads each
+// segment's parity data right after that segment's files.
+//
+// Read errors do not stop the check: damage is reported as byte ranges, and
+// files with parity are checked for whether they can be rebuilt. Damaged
+// metadata is skipped and reported, so one bad spot does not hide the rest
+// of the tape. A full verify that cannot finish is recorded as failed, so
+// an older passing verification cannot keep allowing purges.
+func Verify(opts VerifyOptions) (res VerifyResult, err error) {
 	start := time.Now()
-	var res VerifyResult
+	prefix := strings.Trim(filepath.ToSlash(opts.Prefix), "/")
+	full := prefix == ""
 
 	// Manifest paths come from the tape. Its root refuses any path or
 	// symlink that would lead outside it.
@@ -55,31 +63,71 @@ func Verify(opts VerifyOptions) (VerifyResult, error) {
 	}
 	defer tape.Close()
 
-	entries, err := tape.Entries()
-	if err != nil {
-		return res, err
-	}
-	chunks, err := tape.Chunks()
-	if err != nil {
-		return res, err
-	}
-	par, err := tape.Parity()
-	if err != nil {
-		return res, err
-	}
-	prefix := strings.Trim(filepath.ToSlash(opts.Prefix), "/")
-
-	if opts.Catalog != nil {
-		if vol, err := tape.Volume(); err == nil && vol != nil {
-			if n, err := pendingCount(opts.Catalog.PendingPath(vol.ID)); err == nil && n > 0 {
-				fmt.Fprintf(opts.Log, "WARNING:   %d archived files are not yet in the tape manifest; rerun 'archive put' to record them\n", n)
+	vol, _ := tape.Volume()
+	if opts.Catalog != nil && full && vol != nil {
+		defer func() {
+			res.Duration = time.Since(start)
+			if err != nil && !errors.Is(err, ErrNoEntries) {
+				res.Failed++
 			}
+			if rerr := recordVerify(opts.Catalog, opts.TapeRoot, vol.ID, res); rerr != nil {
+				err = errors.Join(err, fmt.Errorf("updating catalog: %w", rerr))
+			}
+		}()
+		if n, err := pendingCount(opts.Catalog.PendingPath(vol.ID)); err == nil && n > 0 {
+			fmt.Fprintf(opts.Log, "WARNING:   %d archived files are not yet in the tape manifest; rerun 'archive put' to record them\n", n)
 		}
 	}
 
+	entries, problems, err := tape.EntriesLenient()
+	if err != nil {
+		return res, err
+	}
+	chunks, p2, err := tape.Chunks()
+	if err != nil {
+		return res, err
+	}
+	par, p3, err := tape.Parity()
+	if err != nil {
+		return res, err
+	}
+	for _, p := range append(append(problems, p2...), p3...) {
+		fmt.Fprintf(opts.Log, "PROBLEM:   %s\n", p)
+		res.Problems++
+	}
+
+	var paritySegs map[int][]manifest.Parity
+	if full {
+		paritySegs = map[int][]manifest.Parity{}
+		for _, p := range par {
+			paritySegs[p.Segment] = append(paritySegs[p.Segment], p)
+		}
+	}
+	checkParity := func(seg int) {
+		list := paritySegs[seg]
+		if len(list) == 0 {
+			return
+		}
+		delete(paritySegs, seg)
+		fmt.Fprintf(opts.Log, "PARITY:    segment %d\n", seg)
+		if bad := verifyParity(tape, seg, list, opts.Progress); len(bad) > 0 {
+			for _, b := range bad {
+				fmt.Fprintf(opts.Log, "       DAMAGED: %s\n", b)
+			}
+			res.Problems += len(bad)
+		} else {
+			fmt.Fprintf(opts.Log, "       OK\n")
+		}
+	}
+
+	seg := 0
 	for _, e := range entries {
 		if prefix != "" && e.Path != prefix && !strings.HasPrefix(e.Path, prefix+"/") {
 			continue
+		}
+		if e.Segment != seg {
+			checkParity(seg)
+			seg = e.Segment
 		}
 		res.Files++
 		if e.Ref != nil {
@@ -101,30 +149,70 @@ func Verify(opts VerifyOptions) (VerifyResult, error) {
 			res.Failed++
 		}
 	}
+	checkParity(seg)
+	// Parity of segments whose entries could not be read.
+	for s := range paritySegs {
+		checkParity(s)
+	}
 
 	res.Duration = time.Since(start)
-	if res.Files == 0 {
+	if res.Files == 0 && res.Problems == 0 {
 		return res, ErrNoEntries
-	}
-	if opts.Catalog != nil && prefix == "" {
-		if err := recordVerify(opts.Catalog, opts.TapeRoot, res); err != nil {
-			return res, fmt.Errorf("updating catalog: %w", err)
-		}
 	}
 	return res, nil
 }
 
-func recordVerify(c *catalog.Catalog, tapeRoot string, res VerifyResult) error {
-	t, err := c.Import(tapeRoot)
+// verifyParity reads a segment's parity data from start to end and checks
+// every parity shard against its hash. It returns a description of each
+// file whose parity is damaged.
+func verifyParity(tape *manifest.Tape, seg int, list []manifest.Parity, progOut io.Writer) []string {
+	sort.Slice(list, func(i, j int) bool { return list[i].Offset < list[j].Offset })
+	f, err := tape.OpenParity(seg)
 	if err != nil {
-		return err
+		return []string{fmt.Sprintf("parity data of segment %d: %v", seg, err)}
 	}
-	return c.RecordVerify(t.ID, catalog.Verification{
+	defer f.Close()
+	var total int64
+	for _, p := range list {
+		total += p.Layout.ParitySize()
+	}
+	prog := startProgress(progOut, total)
+	defer prog.finish()
+
+	var bad []string
+	for _, p := range list {
+		buf := make([]byte, p.Layout.ShardSize)
+		damaged := 0
+		for i, want := range p.Hashes {
+			n, err := f.ReadAt(buf, p.Offset+int64(i)*p.Layout.ShardSize)
+			prog.Write(buf)
+			got := sha256.Sum256(buf[:n])
+			if (err != nil && err != io.EOF) || int64(n) != p.Layout.ShardSize || hex.EncodeToString(got[:]) != want {
+				damaged++
+			}
+		}
+		if damaged > 0 {
+			bad = append(bad, fmt.Sprintf("parity of %s: %d of %d pieces damaged", p.Path, damaged, len(p.Hashes)))
+		}
+	}
+	return bad
+}
+
+func recordVerify(c *catalog.Catalog, tapeRoot, id string, res VerifyResult) error {
+	if _, err := c.Import(tapeRoot); err != nil {
+		// The tape manifest may be what is damaged. The verification
+		// result must still be recorded against the known tape.
+		if t, terr := c.Tape(id); terr != nil || t == nil {
+			return err
+		}
+	}
+	return c.RecordVerify(id, catalog.Verification{
 		At:         time.Now().UTC(),
 		Files:      res.Files,
 		Verified:   res.Verified,
 		Repairable: res.Repairable,
 		Failed:     res.Failed,
+		Problems:   res.Problems,
 	})
 }
 
@@ -142,8 +230,8 @@ func verifyFile(tape *manifest.Tape, e manifest.Entry, chunks map[string]manifes
 		return statusFailed, err.Error()
 	}
 	defer tf.Close()
-	if st, err := tf.f.Stat(); err == nil && st.Size() > e.Size {
-		return statusFailed, fmt.Sprintf("file is larger than recorded (%d > %d bytes)", st.Size(), e.Size)
+	if tf.size > e.Size {
+		return statusFailed, fmt.Sprintf("file is larger than recorded (%d > %d bytes)", tf.size, e.Size)
 	}
 
 	p := startProgress(prog, e.Size)
@@ -159,7 +247,7 @@ func verifyFile(tape *manifest.Tape, e manifest.Entry, chunks map[string]manifes
 	if tf.parity == nil {
 		return statusFailed, detail
 	}
-	if _, err := tf.repair(s); err != nil {
+	if err := tf.repair(s, nil); err != nil {
 		return statusFailed, fmt.Sprintf("%s; parity cannot repair it: %v", detail, err)
 	}
 	return statusRepairable, detail

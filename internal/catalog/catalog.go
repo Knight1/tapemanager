@@ -43,6 +43,12 @@ type Verification struct {
 	Verified   int       `json:"verified"`
 	Repairable int       `json:"repairable,omitempty"`
 	Failed     int       `json:"failed"`
+	Problems   int       `json:"problems,omitempty"` // damaged metadata or parity
+}
+
+// Passed reports whether the verification found the tape in full health.
+func (v Verification) Passed() bool {
+	return v.Failed == 0 && v.Repairable == 0 && v.Problems == 0
 }
 
 // LastVerified returns the most recent verification, or nil.
@@ -59,7 +65,7 @@ func (t *Tape) LastVerified() *Verification {
 // degrading and should not be the only copy.
 func (t *Tape) VerifiedSince(at time.Time) bool {
 	v := t.LastVerified()
-	return v != nil && v.Failed == 0 && v.Repairable == 0 && v.At.After(at)
+	return v != nil && v.Passed() && v.At.After(at)
 }
 
 // Hit is one search result.

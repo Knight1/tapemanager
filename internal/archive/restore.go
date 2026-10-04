@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/Knight1/tapemanager/internal/manifest"
-	"github.com/Knight1/tapemanager/internal/parity"
 )
 
 // RestoreOptions configures Restore.
@@ -48,17 +47,21 @@ func Restore(opts RestoreOptions) (res RestoreResult, err error) {
 		return res, err
 	}
 	defer tape.Close()
-	entries, err := tape.Entries()
+	// Damaged metadata is skipped so the rest of the tape stays restorable.
+	entries, problems, err := tape.EntriesLenient()
 	if err != nil {
 		return res, err
 	}
-	chunks, err := tape.Chunks()
+	chunks, p2, err := tape.Chunks()
 	if err != nil {
 		return res, err
 	}
-	par, err := tape.Parity()
+	par, p3, err := tape.Parity()
 	if err != nil {
 		return res, err
+	}
+	for _, p := range append(append(problems, p2...), p3...) {
+		fmt.Fprintf(opts.Log, "PROBLEM:   %s\n", p)
 	}
 
 	if err := os.MkdirAll(opts.Dest, 0o755); err != nil {
@@ -70,6 +73,10 @@ func Restore(opts RestoreOptions) (res RestoreResult, err error) {
 		return res, err
 	}
 	defer dest.Close()
+	noClobber := linkSupported(dest)
+	if !noClobber {
+		fmt.Fprintf(opts.Log, "NOTE:      %s does not support hard links; existing files are checked right before each file is moved into place\n", opts.Dest)
+	}
 
 	prefix := strings.Trim(filepath.ToSlash(opts.Path), "/")
 	matched := 0
@@ -84,7 +91,7 @@ func Restore(opts RestoreOptions) (res RestoreResult, err error) {
 			continue
 		}
 		fmt.Fprintf(opts.Log, "RESTORING: %s\n", e.Path)
-		repaired, err := restoreFile(tape, dest, e, chunks, par, opts.Progress)
+		repaired, err := restoreFile(tape, dest, noClobber, e, chunks, par, opts.Progress)
 		if err != nil {
 			fmt.Fprintf(opts.Log, "       FAILED: %v\n", err)
 			res.Failed++
@@ -105,7 +112,27 @@ func Restore(opts RestoreOptions) (res RestoreResult, err error) {
 	return res, nil
 }
 
-func restoreFile(tape *manifest.Tape, dest *os.Root, e manifest.Entry, chunks map[string]manifest.Chunks, par map[string]manifest.Parity, prog io.Writer) (repaired bool, err error) {
+// linkSupported reports whether the destination supports hard links, which
+// restore uses to move files into place without ever overwriting. FAT and
+// exFAT disks, and some network filesystems, do not.
+func linkSupported(dest *os.Root) bool {
+	probe := ".tapemgr-link-probe"
+	dest.Remove(probe)
+	dest.Remove(probe + "2")
+	f, err := dest.OpenFile(probe, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return false
+	}
+	f.Close()
+	defer dest.Remove(probe)
+	if err := dest.Link(probe, probe+"2"); err != nil {
+		return false
+	}
+	dest.Remove(probe + "2")
+	return true
+}
+
+func restoreFile(tape *manifest.Tape, dest *os.Root, noClobber bool, e manifest.Entry, chunks map[string]manifest.Chunks, par map[string]manifest.Parity, prog io.Writer) (repaired bool, err error) {
 	tf, err := openTapeFile(tape, e, chunks, par)
 	if err != nil {
 		return false, err
@@ -120,16 +147,20 @@ func restoreFile(tape *manifest.Tape, dest *os.Root, e manifest.Entry, chunks ma
 		return false, err
 	}
 	tmp := rel + PartialSuffix
+	// A partial file of our own from an interrupted restore is replaced.
+	if err := dest.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
 	out, err := dest.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return false, err
 	}
-	ok := false
+	closed := false
 	defer func() {
-		if !ok {
+		if !closed {
 			out.Close()
-			dest.Remove(tmp)
 		}
+		dest.Remove(tmp)
 	}()
 
 	p := startProgress(prog, e.Size)
@@ -143,18 +174,12 @@ func restoreFile(tape *manifest.Tape, dest *os.Root, e manifest.Entry, chunks ma
 		if tf.parity == nil {
 			return false, fmt.Errorf("%s; no parity to repair it", detail)
 		}
-		fixed, err := tf.repair(s)
+		err := tf.repair(s, func(off int64, b []byte) error {
+			_, err := out.WriteAt(b, off)
+			return err
+		})
 		if err != nil {
 			return false, fmt.Errorf("%s; parity cannot repair it: %v", detail, err)
-		}
-		for i, b := range fixed {
-			off := i * tf.chunkSize()
-			if tf.parity.Layout.Scheme == parity.SchemeSmall {
-				off = 0
-			}
-			if _, err := out.WriteAt(b, off); err != nil {
-				return false, err
-			}
 		}
 		repaired = true
 	}
@@ -180,20 +205,31 @@ func restoreFile(tape *manifest.Tape, dest *os.Root, e manifest.Entry, chunks ma
 	if err := out.Sync(); err != nil {
 		return false, err
 	}
+	closed = true
 	if err := out.Close(); err != nil {
 		return false, err
 	}
-	ok = true
 	if err := dest.Chtimes(tmp, e.MTime, e.MTime); err != nil {
 		return false, err
 	}
-	// Never replace an existing file: a hard link fails if the name was
+	// Never replace an existing file. A hard link fails if the name was
 	// taken in the meantime, where a rename would silently overwrite.
-	defer dest.Remove(tmp)
-	if err := dest.Link(tmp, rel); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return false, fmt.Errorf("%s already exists in the destination", e.Path)
+	// Without hard links, check right before the rename.
+	if noClobber {
+		if err := dest.Link(tmp, rel); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				return false, fmt.Errorf("%s already exists in the destination", e.Path)
+			}
+			return false, err
 		}
+		return repaired, nil
+	}
+	if _, err := dest.Lstat(rel); err == nil {
+		return false, fmt.Errorf("%s already exists in the destination", e.Path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	if err := dest.Rename(tmp, rel); err != nil {
 		return false, err
 	}
 	return repaired, nil

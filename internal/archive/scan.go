@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/Knight1/tapemanager/internal/manifest"
@@ -21,6 +22,7 @@ type tapeFile struct {
 	chunks *manifest.Chunks // nil if unknown
 	parity *manifest.Parity // nil if none
 	f      *os.File
+	size   int64 // actual size on tape
 }
 
 func openTapeFile(tape *manifest.Tape, e manifest.Entry, chunks map[string]manifest.Chunks, par map[string]manifest.Parity) (*tapeFile, error) {
@@ -35,14 +37,16 @@ func openTapeFile(tape *manifest.Tape, e manifest.Entry, chunks map[string]manif
 	if err != nil {
 		return nil, err
 	}
-	if st, err := f.Stat(); err != nil {
+	st, err := f.Stat()
+	if err != nil {
 		f.Close()
 		return nil, err
-	} else if !st.Mode().IsRegular() {
+	}
+	if !st.Mode().IsRegular() {
 		f.Close()
 		return nil, errors.New("not a regular file")
 	}
-	tf.f = f
+	tf.f, tf.size = f, st.Size()
 	return tf, nil
 }
 
@@ -55,16 +59,25 @@ func (tf *tapeFile) chunkSize() int64 {
 	return DefaultChunkSize
 }
 
+func (tf *tapeFile) numChunks() int64 {
+	cs := tf.chunkSize()
+	return (tf.entry.Size + cs - 1) / cs
+}
+
 // scanResult describes what reading a file back found.
 type scanResult struct {
-	sum        string  // SHA-256 of what was read; valid only without read errors
+	sum        string  // SHA-256 of what was read; valid only if complete
 	readErrors []int64 // chunks that could not be read
-	bad        []int64 // chunks unreadable or not matching their hash
-	data       []byte  // whole file, kept for small-file parity repair
+	bad        []int64 // chunks unreadable or not matching their hash, excluding the tail
+	// tail is the first chunk of a missing end of the file (the file on tape
+	// is shorter than recorded), or -1. Kept as one number so a crafted size
+	// cannot make the scan list billions of chunks.
+	tail int64
+	data []byte // whole file, kept for small-file parity repair
 }
 
 func (s *scanResult) intact(e manifest.Entry) bool {
-	return len(s.readErrors) == 0 && len(s.bad) == 0 && s.sum == e.SHA256
+	return len(s.readErrors) == 0 && len(s.bad) == 0 && s.tail < 0 && s.sum == e.SHA256
 }
 
 // scan reads the file chunk by chunk. A read error marks the chunk and
@@ -75,10 +88,16 @@ func (s *scanResult) intact(e manifest.Entry) bool {
 // chunk run in parallel, so verification keeps the drive streaming.
 func (tf *tapeFile) scan(sink io.WriterAt, prog io.Writer) (*scanResult, error) {
 	size, cs := tf.entry.Size, tf.chunkSize()
-	res := &scanResult{}
+	res := &scanResult{tail: -1}
 	keep := tf.parity != nil && tf.parity.Layout.Scheme == parity.SchemeSmall
 	if keep {
 		res.data = make([]byte, size)
+	}
+	// Only chunks that lie fully inside the file on tape are read.
+	readable := tf.numChunks()
+	if tf.size < size {
+		readable = tf.size / cs
+		res.tail = readable
 	}
 
 	type piece struct {
@@ -95,7 +114,7 @@ func (tf *tapeFile) scan(sink io.WriterAt, prog io.Writer) (*scanResult, error) 
 	}
 	go func() {
 		defer close(pieces)
-		for i := int64(0); i*cs < size; i++ {
+		for i := range readable {
 			var buf []byte
 			select {
 			case buf = <-free:
@@ -144,18 +163,19 @@ func (tf *tapeFile) scan(sink io.WriterAt, prog io.Writer) (*scanResult, error) 
 		}
 		free <- p.buf[:cap(p.buf)]
 	}
-	if len(res.readErrors) == 0 {
+	if len(res.readErrors) == 0 && res.tail < 0 {
 		res.sum = hex.EncodeToString(h.Sum(nil))
 	}
 	return res, nil
 }
 
-// repair rebuilds damaged data with parity. For window layouts it returns
-// the rebuilt chunks by index; for small files the whole file as index 0.
-func (tf *tapeFile) repair(s *scanResult) (map[int64][]byte, error) {
+// repair rebuilds damaged data with parity and passes each rebuilt piece to
+// emit with its file offset. emit may be nil to only check that repair is
+// possible. Memory use stays bounded by one stripe.
+func (tf *tapeFile) repair(s *scanResult, emit func(off int64, b []byte) error) error {
 	p := tf.parity
 	if p == nil {
-		return nil, errors.New("no parity")
+		return errors.New("no parity")
 	}
 	if p.Layout.Scheme == parity.SchemeSmall {
 		shards := make([][]byte, p.Layout.M)
@@ -164,17 +184,43 @@ func (tf *tapeFile) repair(s *scanResult) (map[int64][]byte, error) {
 		}
 		data, err := parity.RepairSmall(&p.Layout, s.data, p.DataHashes, shards, p.Hashes)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		return map[int64][]byte{0: data}, nil
+		// Every shard matching its hash is not enough: the file as a whole
+		// must match too, or the metadata is inconsistent.
+		sum := sha256.Sum256(data)
+		if hex.EncodeToString(sum[:]) != tf.entry.SHA256 {
+			return errors.New("rebuilt file does not match its SHA-256")
+		}
+		if emit != nil {
+			return emit(0, data)
+		}
+		return nil
 	}
+
 	if tf.chunks == nil || tf.chunks.ChunkSize != p.Layout.ShardSize {
-		return nil, errors.New("chunk hashes needed to locate damage are missing")
+		return errors.New("chunk hashes needed to locate damage are missing")
 	}
-	if len(s.bad) == 0 {
-		return nil, errors.New("damage could not be located")
+	bad := s.bad
+	if s.tail >= 0 {
+		// A missing tail longer than all parity can never be rebuilt;
+		// refusing early also keeps the list bounded.
+		missing := tf.numChunks() - s.tail
+		if missing > p.Layout.ParityShards() {
+			return fmt.Errorf("%w: %d chunks missing at the end", parity.ErrUnrecoverable, missing)
+		}
+		for i := s.tail; i < tf.numChunks(); i++ {
+			bad = append(bad, i)
+		}
 	}
-	return parity.RepairWindow(&p.Layout, s.bad, tf.chunks.SHA256, p.Hashes, tf)
+	if len(bad) == 0 {
+		return errors.New("damage could not be located")
+	}
+	var fn func(int64, []byte) error
+	if emit != nil {
+		fn = func(i int64, b []byte) error { return emit(i*p.Layout.ShardSize, b) }
+	}
+	return parity.RepairWindow(&p.Layout, bad, tf.chunks.SHA256, p.Hashes, tf, fn)
 }
 
 // Chunk implements parity.Reader.
@@ -195,20 +241,35 @@ func (tf *tapeFile) ParityShard(i int64) ([]byte, error) {
 
 // describeDamage summarizes a scan for the user.
 func describeDamage(s *scanResult, e manifest.Entry, cs int64) string {
-	switch {
-	case len(s.readErrors) > 0:
-		idx := make([]int, len(s.readErrors))
-		for i, c := range s.readErrors {
+	var parts []string
+	ranges := func(list []int64) string {
+		idx := make([]int, len(list))
+		for i, c := range list {
 			idx[i] = int(c)
 		}
-		return fmt.Sprintf("unreadable bytes: %s", badRanges(idx, cs, e.Size))
-	case len(s.bad) > 0:
-		idx := make([]int, len(s.bad))
-		for i, c := range s.bad {
-			idx[i] = int(c)
+		return badRanges(idx, cs, e.Size)
+	}
+	if len(s.readErrors) > 0 {
+		parts = append(parts, "unreadable bytes: "+ranges(s.readErrors))
+	}
+	var corrupt []int64
+	unreadable := map[int64]bool{}
+	for _, c := range s.readErrors {
+		unreadable[c] = true
+	}
+	for _, c := range s.bad {
+		if !unreadable[c] {
+			corrupt = append(corrupt, c)
 		}
-		return fmt.Sprintf("damaged bytes: %s", badRanges(idx, cs, e.Size))
-	default:
+	}
+	if len(corrupt) > 0 {
+		parts = append(parts, "damaged bytes: "+ranges(corrupt))
+	}
+	if s.tail >= 0 {
+		parts = append(parts, fmt.Sprintf("file is cut short, bytes %d-%d missing", s.tail*cs, e.Size-1))
+	}
+	if len(parts) == 0 {
 		return fmt.Sprintf("SHA-256 mismatch: manifest %s, tape %s", e.SHA256, s.sum)
 	}
+	return strings.Join(parts, "; ")
 }

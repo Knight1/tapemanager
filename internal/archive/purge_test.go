@@ -119,6 +119,7 @@ func TestPurgeDeduplicatedNeedsContentTapeVerified(t *testing.T) {
 	o2.TapeRoot = tape2
 	o2.Source = filepath.Join(src, "a.iso")
 	o2.Prefix = "again/a.iso"
+	o2.Again = true
 	if sum, err := Put(o2); err != nil || sum.Deduped != 1 {
 		t.Fatalf("%+v, %v", sum, err)
 	}

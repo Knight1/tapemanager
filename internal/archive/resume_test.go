@@ -105,9 +105,7 @@ func TestResumeRejectsCorruptPartial(t *testing.T) {
 	testHook = nil
 
 	partial := filepath.Join(tape, "src", "big.bin"+PartialSuffix)
-	f, _ := os.OpenFile(partial, os.O_WRONLY, 0)
-	f.WriteAt([]byte("XXXX"), 500)
-	f.Close()
+	damage(t, partial, 500, 4)
 
 	sum, err := Put(o)
 	if err != nil {
@@ -160,9 +158,7 @@ func TestVerifyReportsDamagedRange(t *testing.T) {
 	if _, err := Put(o); err != nil {
 		t.Fatal(err)
 	}
-	f, _ := os.OpenFile(filepath.Join(tape, "src", "big.bin"), os.O_WRONLY, 0)
-	f.WriteAt([]byte("!"), 40)
-	f.Close()
+	damage(t, filepath.Join(tape, "src", "big.bin"), 40, 1)
 
 	var log strings.Builder
 	res, err := Verify(VerifyOptions{TapeRoot: tape, Log: &log})
@@ -227,6 +223,7 @@ func TestDedup(t *testing.T) {
 	tape2 := filepath.Join(filepath.Dir(tape), "tape2")
 	os.MkdirAll(tape2, 0o755)
 	o.TapeRoot = tape2
+	o.Again = true // archive again although already on tape 1
 	sum, err = Put(o)
 	if err != nil {
 		t.Fatal(err)

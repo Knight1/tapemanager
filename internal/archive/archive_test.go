@@ -58,7 +58,8 @@ func loadChunks(dir string) (map[string]manifest.Chunks, error) {
 		return nil, err
 	}
 	defer tp.Close()
-	return tp.Chunks()
+	c, _, err := tp.Chunks()
+	return c, err
 }
 
 func newCatalog(t *testing.T, tape string) *catalog.Catalog {

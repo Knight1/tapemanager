@@ -47,3 +47,13 @@ func StartBlock(path string) (block int64, ok bool) {
 	block, err = strconv.ParseInt(string(buf[:n]), 10, 64)
 	return block, err == nil && block >= 0
 }
+
+// FreeSpace returns the bytes available on the filesystem holding path.
+// LTFS reports the remaining capacity of the mounted tape.
+func FreeSpace(path string) (int64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, err
+	}
+	return int64(st.Bavail) * int64(st.Bsize), nil
+}

@@ -43,6 +43,23 @@ const (
 	DefaultFlushEvery = 100 << 30
 )
 
+// ErrTapeFull is returned when the next file does not fit on the tape. Files
+// archived until then are fully recorded.
+var ErrTapeFull = errors.New("tape is full")
+
+// freeSpace reports the bytes available at a path. Tests replace it.
+var (
+	freeSpace     = ltfs.FreeSpace
+	realFreeSpace = ltfs.FreeSpace
+)
+
+// metadataReserve estimates the tape space the next segment write needs
+// beyond staged parity: manifest and chunk lists, and a rewritten
+// SHA256SUMS, plus a fixed margin.
+func metadataReserve(entries int, bytes, chunkSize int64) int64 {
+	return 256<<20 + int64(entries)*400 + bytes/chunkSize*100
+}
+
 // testHook lets tests simulate interruptions at named stages.
 var testHook func(stage string, offset int64) error
 
@@ -62,8 +79,12 @@ type PutOptions struct {
 	Catalog  *catalog.Catalog // local catalog, required
 	Dedup    bool             // store a reference instead of content already on tape
 	Parity   int              // parity overhead in percent, 0 for none
-	Log      io.Writer        // per-file output
-	Progress io.Writer        // progress bar output, nil to disable
+	// Again archives files even if this machine already archived them to
+	// another tape. Without it such files are skipped, so a source larger
+	// than one tape continues on the next tape by running put again.
+	Again    bool
+	Log      io.Writer // per-file output
+	Progress io.Writer // progress bar output, nil to disable
 
 	ChunkSize       int64 // default DefaultChunkSize
 	CheckpointEvery int64 // default DefaultCheckpointEvery
@@ -73,13 +94,14 @@ type PutOptions struct {
 
 // PutSummary reports what Put did.
 type PutSummary struct {
-	Tape     *manifest.Volume
-	Files    int
-	Skipped  int
-	Deduped  int
-	Bytes    int64
-	Resumed  int64 // bytes not rewritten thanks to a resume checkpoint
-	Duration time.Duration
+	Tape      *manifest.Volume
+	Files     int
+	Skipped   int // already on this tape
+	Elsewhere int // already archived by this machine to another tape
+	Deduped   int
+	Bytes     int64
+	Resumed   int64 // bytes not rewritten thanks to a resume checkpoint
+	Duration  time.Duration
 }
 
 type job struct {
@@ -116,6 +138,9 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 	m, err := parity.Shards(opts.Parity)
 	if err != nil {
 		return sum, err
+	}
+	if opts.ChunkSize < manifest.MinChunkSize || opts.ChunkSize > manifest.MaxChunkSize {
+		return sum, fmt.Errorf("chunk size must be between %d and %d bytes", manifest.MinChunkSize, manifest.MaxChunkSize)
 	}
 	if m > 0 && opts.ChunkSize > parity.MaxShardSize {
 		return sum, fmt.Errorf("parity needs a chunk size of at most %d bytes", parity.MaxShardSize)
@@ -218,9 +243,14 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 			}
 		}
 		all := append(existing[:len(existing):len(existing)], entries...)
-		seg := manifest.Segment{Entries: entries, Chunks: chunks, Parity: pars, ParityData: io.MultiReader(parityData...)}
+		seg := manifest.Segment{Entries: entries, Chunks: chunks, Parity: pars, ParityData: hookReader{io.MultiReader(parityData...)}}
 		if err := tape.WriteSegment(seg, all); err != nil {
-			return fmt.Errorf("writing manifest segment: %w", err)
+			var pe *manifest.ParityError
+			if !errors.As(err, &pe) {
+				return fmt.Errorf("writing manifest segment: %w", err)
+			}
+			// The files are recorded; only their parity is missing.
+			fmt.Fprintf(opts.Log, "WARNING:   %v; %d files in this batch have no parity\n", err, len(pars))
 		}
 		existing = all
 		// Recorded after the tape write and before clearing, so a crash in
@@ -249,6 +279,20 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 	done := make(map[string]manifest.Entry, len(existing))
 	for _, e := range existing {
 		done[e.Path] = e
+	}
+
+	// Files this machine already archived to other tapes, by source.
+	elsewhere := map[string][]catalog.Hit{}
+	if !opts.Again {
+		written, err := opts.Catalog.Written()
+		if err != nil {
+			return sum, err
+		}
+		for _, h := range written {
+			if h.Tape.ID != vol.ID {
+				elsewhere[h.Entry.Source] = append(elsewhere[h.Entry.Source], h)
+			}
+		}
 	}
 
 	var dedup map[int64][]catalog.Hit
@@ -295,6 +339,11 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 			}
 			return sum, fmt.Errorf("%s: a different version is already archived as %s", j.src, j.rel)
 		}
+		if h := archivedElsewhere(j, elsewhere[j.src]); h != nil {
+			fmt.Fprintf(opts.Log, "SKIPPING:  %s (already on tape %s)\n", j.src, tapeLabel(h.Tape))
+			sum.Elsewhere++
+			continue
+		}
 
 		if opts.Dedup && j.info.Size() >= opts.DedupMinSize && len(dedup[j.info.Size()]) > 0 {
 			e, err := findDuplicate(j, dedup[j.info.Size()])
@@ -309,6 +358,11 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 				sum.Deduped++
 				continue
 			}
+		}
+
+		layout := parity.ForFile(j.info.Size(), opts.ChunkSize, m)
+		if err := checkSpace(opts, tape.Root(), j, layout, pend, len(existing)); err != nil {
+			return sum, err
 		}
 
 		fmt.Fprintf(opts.Log, "ARCHIVING: %s\n       %s\n", j.src, FormatBytes(j.info.Size()))
@@ -349,6 +403,69 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		sum.Resumed += resumed
 	}
 	return sum, nil
+}
+
+// hookReader lets tests make the parity data stream fail.
+type hookReader struct{ r io.Reader }
+
+func (h hookReader) Read(p []byte) (int, error) {
+	if err := hook("parity-data", 0); err != nil {
+		return 0, err
+	}
+	return h.r.Read(p)
+}
+
+// ChunkSizeOrDefault returns the chunk size Put will use.
+func (o PutOptions) ChunkSizeOrDefault() int64 {
+	if o.ChunkSize > 0 {
+		return o.ChunkSize
+	}
+	return DefaultChunkSize
+}
+
+// archivedElsewhere returns a record of j on another tape with the same
+// size and mtime, or nil.
+func archivedElsewhere(j job, hits []catalog.Hit) *catalog.Hit {
+	for i, h := range hits {
+		if h.Entry.Size == j.info.Size() && h.Entry.MTime.Equal(j.info.ModTime()) {
+			return &hits[i]
+		}
+	}
+	return nil
+}
+
+// checkSpace makes sure the next file fits. On tape it needs room for its
+// data, its parity, the parity already staged for the next segment, and the
+// segment's metadata, so the final segment write of a full tape still
+// succeeds. On the catalog disk it needs room for its staged parity.
+func checkSpace(opts PutOptions, root *os.Root, j job, l *parity.Layout, pend *pending, entries int) error {
+	var paritySize int64
+	if l != nil {
+		paritySize = l.ParitySize()
+	}
+	need := j.info.Size() + paritySize + pend.parityBytes +
+		metadataReserve(entries+len(pend.records)+1, pend.bytes+j.info.Size(), opts.ChunkSize)
+	// A partial file from an interrupted run already takes its space.
+	if st, err := root.Lstat(filepath.FromSlash(j.rel) + PartialSuffix); err == nil {
+		need -= min(st.Size(), j.info.Size())
+	}
+	free, err := freeSpace(opts.TapeRoot)
+	if err != nil {
+		return err
+	}
+	if free < need {
+		return fmt.Errorf("%w: %s needs %s, %s free; the remaining files were not archived. Insert a new tape and run the same command again", ErrTapeFull, j.src, FormatBytes(need), FormatBytes(free))
+	}
+	if paritySize > 0 {
+		catFree, err := freeSpace(opts.Catalog.Dir)
+		if err != nil {
+			return err
+		}
+		if catFree < paritySize+64<<20 {
+			return fmt.Errorf("catalog disk at %s is full: %s needs %s for staged parity, %s free", opts.Catalog.Dir, j.src, FormatBytes(paritySize), FormatBytes(catFree))
+		}
+	}
+	return nil
 }
 
 // removeStaleParity deletes staged parity of files that are neither pending
@@ -499,14 +616,19 @@ func archiveFile(fs fileState) (*archived, error) {
 
 	if _, err := root.Lstat(dst); err == nil {
 		// A previous run may have renamed the file and stopped before
-		// recording it.
-		if journalValid && len(points) > 0 {
-			if p := points[len(points)-1]; p.sha256 != "" && p.offset == j.info.Size() {
+		// recording it. Only the source has to match: the chunk size and
+		// parity of the finished file are taken from its journal, whatever
+		// the settings of this run.
+		if oldHdr != nil && sameSource(*oldHdr, hdr) && len(points) > 0 {
+			p := points[len(points)-1]
+			cs := oldHdr.ChunkSize
+			if p.sha256 != "" && p.offset == j.info.Size() && cs >= manifest.MinChunkSize && cs <= manifest.MaxChunkSize &&
+				int64(len(p.chunks)) == (p.offset+cs-1)/cs {
 				if st, err := root.Lstat(dst); err == nil && st.Mode().IsRegular() && st.Size() == p.offset {
-					res := &archived{entry: entryFor(j, p.sha256), chunks: chunksFor(j, opts.ChunkSize, p.chunks), resumed: p.offset}
+					res := &archived{entry: entryFor(j, p.sha256), chunks: chunksFor(j, cs, p.chunks), resumed: p.offset}
 					if p.parity != nil && stagedParityOK(fs.ppath, p.parity) {
 						res.parity = p.parity
-					} else if layout != nil {
+					} else if oldHdr.ParityM > 0 {
 						res.note = "staged parity was lost; this file has no parity"
 					}
 					return res, nil
@@ -522,11 +644,12 @@ func archiveFile(fs fileState) (*archived, error) {
 	// they never resume.
 	var start *resumePoint
 	if journalValid && (layout == nil || layout.Scheme == parity.SchemeWindow) {
-		if start, err = pickResumePoint(root, partial, points, j.info.Size(), opts.ChunkSize); err != nil {
-			return nil, err
+		var accept func(*resumePoint) bool
+		if layout != nil {
+			accept = func(p *resumePoint) bool { return parityResumable(fs.ppath, layout, p) }
 		}
-		if start != nil && layout != nil && !parityResumable(fs.ppath, layout, start) {
-			start = nil
+		if start, err = pickResumePoint(root, partial, points, j.info.Size(), opts.ChunkSize, accept); err != nil {
+			return nil, err
 		}
 	}
 
@@ -777,7 +900,7 @@ func (t *transfer) copy() error {
 		if rc.err != nil {
 			return rc.err
 		}
-		if t.small == nil && t.offset-lastCheckpoint >= t.opts.CheckpointEvery && (t.enc == nil || t.enc.AtWindowBoundary()) {
+		if t.small == nil && t.offset-lastCheckpoint >= t.opts.CheckpointEvery && (t.enc == nil || t.enc.Next()%int64(t.layout.K*t.layout.D) == 0) {
 			if err := t.checkpoint(); err != nil {
 				return err
 			}
@@ -886,9 +1009,10 @@ func pendingChunks(chunks []string, jr *journal) []string {
 
 // pickResumePoint returns the latest checkpoint whose data is fully present
 // in the partial file, after checking that its last chunk reads back
-// correctly. LTFS may lose data written after its last index update, so the
+// correctly and that accept (if set) agrees, for example that the staged
+// parity up to it is intact. Older checkpoints are tried in turn. LTFS may lose data written after its last index update, so the
 // partial file can be shorter than the newest checkpoint.
-func pickResumePoint(root *os.Root, partial string, points []resumePoint, size, chunkSize int64) (*resumePoint, error) {
+func pickResumePoint(root *os.Root, partial string, points []resumePoint, size, chunkSize int64, accept func(*resumePoint) bool) (*resumePoint, error) {
 	st, err := root.Lstat(partial)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -919,11 +1043,15 @@ func pickResumePoint(root *os.Root, partial string, points []resumePoint, size, 
 			continue
 		}
 		c := sha256.Sum256(buf)
-		if hex.EncodeToString(c[:]) == p.chunks[len(p.chunks)-1] {
+		if hex.EncodeToString(c[:]) == p.chunks[len(p.chunks)-1] && (accept == nil || accept(&p)) {
 			return &p, nil
 		}
 	}
 	return nil, nil
+}
+
+func sameSource(a, b journalHeader) bool {
+	return a.Source == b.Source && a.Path == b.Path && a.Size == b.Size && a.MTime.Equal(b.MTime)
 }
 
 func sameHeader(a, b journalHeader) bool {
