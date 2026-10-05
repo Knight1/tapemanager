@@ -250,6 +250,8 @@ func verifyFile(tape *manifest.Tape, e manifest.Entry, chunks map[string]manifes
 		return statusFailed, err.Error()
 	}
 	defer tf.Close()
+	// Encrypted files are checked as stored; no key is needed.
+	e = tf.entry
 	if tf.size > e.Size {
 		return statusFailed, fmt.Sprintf("file is larger than recorded (%d > %d bytes)", tf.size, e.Size)
 	}

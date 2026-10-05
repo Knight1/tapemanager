@@ -84,7 +84,7 @@ func Recover(opts RecoverOptions) (res RecoverResult, err error) {
 	}
 	known := make(map[string]bool, len(existing))
 	for _, e := range existing {
-		known[e.Path] = true
+		known[e.TapePath()] = true
 	}
 
 	type orphan struct {

@@ -15,11 +15,14 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"filippo.io/age"
+	"github.com/Knight1/tapemanager/internal/agestream"
 	"github.com/Knight1/tapemanager/internal/catalog"
 	"github.com/Knight1/tapemanager/internal/ltfs"
 	"github.com/Knight1/tapemanager/internal/manifest"
@@ -97,14 +100,19 @@ type PutOptions struct {
 	// continues where it stopped, and Copies 2 makes a second copy.
 	Copies int
 	// Again archives files even if they already have enough copies.
-	Again    bool
-	Log      io.Writer // per-file output
-	Progress io.Writer // progress bar output, nil to disable
+	Again bool
+	// Recipients, if set, encrypts every written file with age to these
+	// public keys. Each file is stored as <path>.age, a standard age file.
+	Recipients []age.Recipient
+	Log        io.Writer // per-file output
+	Progress   io.Writer // progress bar output, nil to disable
 
 	ChunkSize       int64 // default DefaultChunkSize
 	CheckpointEvery int64 // default DefaultCheckpointEvery
 	DedupMinSize    int64 // default DefaultDedupMinSize
 	FlushEvery      int64 // default DefaultFlushEvery
+
+	recipientNames []string // Recipients as text, for the manifest
 }
 
 // PutSummary reports what Put did.
@@ -155,6 +163,21 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 	}
 	if opts.Copies > MaxCopies {
 		return sum, fmt.Errorf("at most %d copies are supported", MaxCopies)
+	}
+	opts.recipientNames = nil
+	for _, r := range opts.Recipients {
+		st, ok := r.(fmt.Stringer)
+		if !ok {
+			return sum, errors.New("encryption recipient has no text form")
+		}
+		opts.recipientNames = append(opts.recipientNames, st.String())
+	}
+	if len(opts.Recipients) > 0 {
+		// Fail before anything is written if age rejects the recipients,
+		// for example post-quantum and classic keys mixed.
+		if _, err := agestream.NewParams(opts.Recipients...); err != nil {
+			return sum, fmt.Errorf("encryption: %w", err)
+		}
 	}
 	m, err := parity.Shards(opts.Parity)
 	if err != nil {
@@ -259,8 +282,9 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 			// Only files really on tape are recorded; the others are
 			// archived again on the next run.
 			if r.Entry.Ref == nil {
-				st, err := tape.Root().Lstat(filepath.FromSlash(r.Entry.Path))
-				if err != nil || !st.Mode().IsRegular() || st.Size() != r.Entry.Size {
+				stored := r.Entry.Stored()
+				st, err := tape.Root().Lstat(filepath.FromSlash(stored.Path))
+				if err != nil || !st.Mode().IsRegular() || st.Size() != stored.Size {
 					fmt.Fprintf(opts.Log, "WARNING:   %s is no longer complete on tape (interrupted run); it will be archived again\n", r.Entry.Path)
 					continue
 				}
@@ -342,6 +366,26 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 	done := make(map[string]manifest.Entry, len(existing))
 	for _, e := range existing {
 		done[e.Path] = e
+	}
+
+	// Encrypted files are stored as <path>.age. No two files, on tape or
+	// in this run, may end up at the same place.
+	used := map[string]string{}
+	for _, e := range existing {
+		used[e.TapePath()] = e.Path
+	}
+	for _, j := range jobs {
+		if _, ok := done[j.rel]; ok {
+			continue
+		}
+		tp := j.rel
+		if len(opts.Recipients) > 0 {
+			tp += manifest.AgeSuffix
+		}
+		if other, ok := used[tp]; ok && other != j.rel {
+			return sum, fmt.Errorf("%s would be stored on tape as %s, which is already used by %s", j.src, tp, other)
+		}
+		used[tp] = j.rel
 	}
 
 	// Copies on other tapes come from the catalog. The catalog's view of
@@ -457,9 +501,8 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 			}
 		}
 
-		layout := parity.ForFile(j.info.Size(), opts.ChunkSize, m)
-		check := func(reused int64) error {
-			return checkSpace(opts, j, layout, pend, len(existing), reused)
+		check := func(size int64, l *parity.Layout, reused int64) error {
+			return checkSpace(opts, j, size, l, pend, len(existing), reused)
 		}
 
 		fmt.Fprintf(opts.Log, "ARCHIVING: %s\n       %s\n", j.src, FormatBytes(j.info.Size()))
@@ -621,13 +664,13 @@ func tapeList(tapes []catalog.Tape) string {
 // reused is the part of the file already on tape from an interrupted run
 // that is resumed. A partial file that is not resumed does not count: LTFS
 // never reclaims space, so rewriting it needs the full size again.
-func checkSpace(opts PutOptions, j job, l *parity.Layout, pend *pending, entries int, reused int64) error {
+func checkSpace(opts PutOptions, j job, size int64, l *parity.Layout, pend *pending, entries int, reused int64) error {
 	var paritySize int64
 	if l != nil {
 		paritySize = l.ParitySize()
 	}
-	need := j.info.Size() - reused + paritySize + pend.parityBytes +
-		metadataReserve(entries+len(pend.records)+1, pend.bytes+j.info.Size(), opts.ChunkSize)
+	need := size - reused + paritySize + pend.parityBytes +
+		metadataReserve(entries+len(pend.records)+1, pend.bytes+size, opts.ChunkSize)
 	free, err := freeSpace(opts.TapeRoot)
 	if err != nil {
 		return err
@@ -763,9 +806,10 @@ type fileState struct {
 	jpath string // resume journal
 	ppath string // staged parity
 	m     int    // parity shards per stripe, 0 for none
-	// check is called once it is known how much of the file is already on
-	// tape and will be reused, to make sure the rest fits.
-	check func(reused int64) error
+	// check is called once the size on tape, the parity layout and the
+	// part already on tape that will be reused are known, to make sure the
+	// rest fits.
+	check func(size int64, l *parity.Layout, reused int64) error
 }
 
 // archived is the result of archiveFile.
@@ -785,42 +829,65 @@ type archived struct {
 // staged locally; it reaches the tape with the next manifest segment.
 func archiveFile(fs fileState) (*archived, error) {
 	opts, root, j := fs.opts, fs.root, fs.j
-	dst := filepath.FromSlash(j.rel)
+	encrypt := len(opts.Recipients) > 0
+	tapeRel := j.rel
+	if encrypt {
+		tapeRel += manifest.AgeSuffix
+	}
+	dst := filepath.FromSlash(tapeRel)
 	partial := dst + PartialSuffix
-	layout := parity.ForFile(j.info.Size(), opts.ChunkSize, fs.m)
-	hdr := journalHeader{Source: j.src, Path: j.rel, Size: j.info.Size(), MTime: j.info.ModTime(), ChunkSize: opts.ChunkSize, ParityM: fs.m}
+	hdr := journalHeader{Source: j.src, Path: j.rel, Size: j.info.Size(), MTime: j.info.ModTime(), ChunkSize: opts.ChunkSize, ParityM: fs.m, Recipients: opts.recipientNames}
 
 	oldHdr, points, err := loadJournal(fs.jpath)
 	if err != nil {
 		return nil, err
 	}
-	journalValid := oldHdr != nil && sameHeader(*oldHdr, hdr)
+	journalValid := oldHdr != nil && sameHeader(*oldHdr, hdr) && (oldHdr.Age != nil) == encrypt &&
+		(oldHdr.Age == nil || oldHdr.Age.Validate() == nil)
 
 	if _, err := root.Lstat(dst); err == nil {
 		// A previous run may have renamed the file and stopped before
 		// recording it. Only the source has to match: the chunk size and
 		// parity of the finished file are taken from its journal, whatever
 		// the settings of this run.
-		if oldHdr != nil && sameSource(*oldHdr, hdr) && len(points) > 0 {
-			p := points[len(points)-1]
-			cs := oldHdr.ChunkSize
-			if p.sha256 != "" && p.offset == j.info.Size() && cs >= manifest.MinChunkSize && cs <= manifest.MaxChunkSize &&
-				int64(len(p.chunks)) == (p.offset+cs-1)/cs {
-				if st, err := root.Lstat(dst); err == nil && st.Mode().IsRegular() && st.Size() == p.offset {
-					res := &archived{entry: entryFor(j, p.sha256), chunks: chunksFor(j, cs, p.chunks), resumed: p.offset}
-					if p.parity != nil && stagedParityOK(fs.ppath, p.parity) {
-						res.parity = p.parity
-					} else if oldHdr.ParityM > 0 {
-						res.note = "staged parity was lost; this file has no parity"
-					}
-					return res, nil
-				}
-			}
+		if res := finishedEarlier(root, dst, j, fs.ppath, oldHdr, points, encrypt); res != nil {
+			return res, nil
 		}
-		return nil, fmt.Errorf("%s exists on tape but is not in the manifest", j.rel)
+		return nil, fmt.Errorf("%s exists on tape but is not in the manifest", tapeRel)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
+
+	in, err := openSource(j)
+	if err != nil {
+		return nil, err
+	}
+	defer in.Close()
+
+	// For an encrypted file the size on tape follows from its header, so
+	// the parameters are settled first: those of the interrupted write
+	// when resuming, new ones otherwise.
+	var params *agestream.Params
+	newParams := func() error {
+		if !encrypt {
+			return nil
+		}
+		params, err = agestream.NewParams(opts.Recipients...)
+		return err
+	}
+	if journalValid && encrypt {
+		params = oldHdr.Age
+	} else if err := newParams(); err != nil {
+		return nil, err
+	}
+	storedSize := func() int64 {
+		if params != nil {
+			return params.StoredSize(j.info.Size())
+		}
+		return j.info.Size()
+	}
+	size := storedSize()
+	layout := parity.ForFile(size, opts.ChunkSize, fs.m)
 
 	// Small files are buffered for their parity and are cheap to redo, so
 	// they never resume.
@@ -833,9 +900,34 @@ func archiveFile(fs fileState) (*archived, error) {
 			valid := stagedValidPrefix(fs.ppath, layout.ShardSize, points[len(points)-1].parityHashes)
 			accept = func(p *resumePoint) bool { return parityResumable(layout, p, valid) }
 		}
-		if start, err = pickResumePoint(root, partial, points, j.info.Size(), opts.ChunkSize, accept); err != nil {
+		if start, err = pickResumePoint(root, partial, points, size, opts.ChunkSize, accept); err != nil {
 			return nil, err
 		}
+	}
+
+	var note string
+	var crypt *agestream.Encrypter
+	if encrypt {
+		if crypt, err = agestream.NewEncrypter(params, in, j.info.Size(), opts.ChunkSize); err != nil {
+			return nil, err
+		}
+		if start != nil {
+			if err := resumeEncrypter(root, partial, crypt, start); err != nil {
+				// Continuing would mix two versions of the source under
+				// one key and nonce. Start over with a new key instead.
+				note = fmt.Sprintf("could not continue the interrupted encrypted write (%v); started over", err)
+				start = nil
+				if err := newParams(); err != nil {
+					return nil, err
+				}
+				size = storedSize()
+				layout = parity.ForFile(size, opts.ChunkSize, fs.m)
+				if crypt, err = agestream.NewEncrypter(params, in, j.info.Size(), opts.ChunkSize); err != nil {
+					return nil, err
+				}
+			}
+		}
+		hdr.Age = params
 	}
 
 	if fs.check != nil {
@@ -843,18 +935,15 @@ func archiveFile(fs fileState) (*archived, error) {
 		if start != nil {
 			reused = start.offset
 		}
-		if err := fs.check(reused); err != nil {
+		if err := fs.check(size, layout, reused); err != nil {
 			return nil, err
 		}
 	}
 
-	in, err := openSource(j)
-	if err != nil {
-		return nil, err
+	t := &transfer{opts: opts, in: in, h: sha256.New(), crypt: crypt}
+	if crypt != nil {
+		t.in = crypt
 	}
-	defer in.Close()
-
-	t := &transfer{opts: opts, in: in, h: sha256.New()}
 	if start != nil {
 		if err := t.h.(encoding.BinaryUnmarshaler).UnmarshalBinary(start.state); err != nil {
 			return nil, fmt.Errorf("restoring checkpoint: %w", err)
@@ -866,7 +955,7 @@ func archiveFile(fs fileState) (*archived, error) {
 		if err := t.out.Truncate(t.offset); err == nil {
 			_, err = t.out.Seek(t.offset, io.SeekStart)
 		}
-		if err == nil {
+		if err == nil && crypt == nil {
 			_, err = in.Seek(t.offset, io.SeekStart)
 		}
 		if err != nil {
@@ -875,6 +964,15 @@ func archiveFile(fs fileState) (*archived, error) {
 		}
 	} else {
 		if err := root.Remove(partial); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		// A partial file from an interrupted run with the other encryption
+		// setting is never resumed; remove it too.
+		other := filepath.FromSlash(j.rel)
+		if !encrypt {
+			other += manifest.AgeSuffix
+		}
+		if err := root.Remove(other + PartialSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
 		if err := root.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
@@ -903,7 +1001,7 @@ func archiveFile(fs fileState) (*archived, error) {
 	}
 	defer t.jr.close()
 
-	t.prog = startProgress(opts.Progress, j.info.Size())
+	t.prog = startProgress(opts.Progress, size)
 	t.prog.done.Store(t.offset)
 	err = t.copy()
 	t.prog.finish()
@@ -915,7 +1013,7 @@ func archiveFile(fs fileState) (*archived, error) {
 	if err != nil {
 		return nil, err
 	}
-	if t.offset != j.info.Size() || after.Size() != j.info.Size() || !after.ModTime().Equal(j.info.ModTime()) {
+	if t.offset != size || after.Size() != j.info.Size() || !after.ModTime().Equal(j.info.ModTime()) {
 		return nil, errors.New("source changed while it was being archived")
 	}
 
@@ -939,8 +1037,18 @@ func archiveFile(fs fileState) (*archived, error) {
 	if err != nil {
 		return nil, err
 	}
-	sum := hex.EncodeToString(t.h.Sum(nil))
-	final := journalRecord{Offset: t.offset, State: state, Chunks: pendingChunks(t.chunks, t.jr), SHA256: sum, Parity: par}
+	stored := hex.EncodeToString(t.h.Sum(nil))
+	sum := stored
+	var ageInfo *manifest.Age
+	final := journalRecord{Offset: t.offset, State: state, Chunks: pendingChunks(t.chunks, t.jr), Parity: par}
+	if crypt != nil {
+		if sum, err = crypt.PlainSHA256(); err != nil {
+			return nil, err
+		}
+		final.StoredSHA256 = stored
+		ageInfo = &manifest.Age{Size: size, SHA256: stored, Recipients: opts.recipientNames}
+	}
+	final.SHA256 = sum
 	if err := t.jr.append(final); err != nil {
 		return nil, err
 	}
@@ -953,7 +1061,57 @@ func archiveFile(fs fileState) (*archived, error) {
 	if err := syncTapeDir(root, filepath.Dir(dst)); err != nil {
 		return nil, err
 	}
-	return &archived{entry: entryFor(j, sum), chunks: chunksFor(j, opts.ChunkSize, t.chunks), parity: par, resumed: resumed}, nil
+	return &archived{entry: entryFor(j, sum, ageInfo), chunks: chunksFor(j, opts.ChunkSize, t.chunks), parity: par, resumed: resumed, note: note}, nil
+}
+
+// finishedEarlier returns the record of a file that an interrupted run
+// completely wrote and renamed into place, or nil if dst cannot be
+// trusted to be that file.
+func finishedEarlier(root *os.Root, dst string, j job, ppath string, oldHdr *journalHeader, points []resumePoint, encrypt bool) *archived {
+	hdr := journalHeader{Source: j.src, Path: j.rel, Size: j.info.Size(), MTime: j.info.ModTime()}
+	if oldHdr == nil || !sameSource(*oldHdr, hdr) || len(points) == 0 || (oldHdr.Age != nil) != encrypt {
+		return nil
+	}
+	p := points[len(points)-1]
+	cs := oldHdr.ChunkSize
+	size := j.info.Size()
+	var ageInfo *manifest.Age
+	if oldHdr.Age != nil {
+		if oldHdr.Age.Validate() != nil || p.storedSHA256 == "" || len(oldHdr.Recipients) == 0 {
+			return nil
+		}
+		size = oldHdr.Age.StoredSize(j.info.Size())
+		ageInfo = &manifest.Age{Size: size, SHA256: p.storedSHA256, Recipients: oldHdr.Recipients}
+	}
+	if p.sha256 == "" || p.offset != size || cs < manifest.MinChunkSize || cs > manifest.MaxChunkSize ||
+		int64(len(p.chunks)) != (p.offset+cs-1)/cs {
+		return nil
+	}
+	st, err := root.Lstat(dst)
+	if err != nil || !st.Mode().IsRegular() || st.Size() != p.offset {
+		return nil
+	}
+	res := &archived{entry: entryFor(j, p.sha256, ageInfo), chunks: chunksFor(j, cs, p.chunks), resumed: p.offset}
+	if res.entry.Validate() != nil {
+		return nil
+	}
+	if p.parity != nil && stagedParityOK(ppath, p.parity) {
+		res.parity = p.parity
+	} else if oldHdr.ParityM > 0 {
+		res.note = "staged parity was lost; this file has no parity"
+	}
+	return res
+}
+
+// resumeEncrypter positions the encrypter at the resume point, checking
+// what is already on tape against what it would write.
+func resumeEncrypter(root *os.Root, partial string, crypt *agestream.Encrypter, start *resumePoint) error {
+	f, err := root.Open(partial)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return crypt.ResumeAt(start.offset, start.plainState, start.plainChunk, f)
 }
 
 // transfer is one file copy in progress.
@@ -971,6 +1129,8 @@ type transfer struct {
 	staging *os.File
 	enc     *parity.WindowEncoder // large files
 	small   *bytes.Buffer         // small files, buffered whole
+
+	crypt *agestream.Encrypter // encrypted files: in is crypt
 }
 
 func (t *transfer) startParity(ppath string, l *parity.Layout, start *resumePoint) error {
@@ -1158,6 +1318,11 @@ func (t *transfer) checkpoint() error {
 		return err
 	}
 	rec.State = state
+	if t.crypt != nil {
+		if rec.PlainState, rec.PlainChunk, err = t.crypt.Snapshot(t.offset); err != nil {
+			return err
+		}
+	}
 	return t.jr.append(rec)
 }
 
@@ -1280,10 +1445,10 @@ func sameSource(a, b journalHeader) bool {
 
 func sameHeader(a, b journalHeader) bool {
 	return a.Source == b.Source && a.Path == b.Path && a.Size == b.Size && a.MTime.Equal(b.MTime) &&
-		a.ChunkSize == b.ChunkSize && a.ParityM == b.ParityM
+		a.ChunkSize == b.ChunkSize && a.ParityM == b.ParityM && slices.Equal(a.Recipients, b.Recipients)
 }
 
-func entryFor(j job, sum string) manifest.Entry {
+func entryFor(j job, sum string, a *manifest.Age) manifest.Entry {
 	return manifest.Entry{
 		Path:       j.rel,
 		Size:       j.info.Size(),
@@ -1291,6 +1456,7 @@ func entryFor(j job, sum string) manifest.Entry {
 		MTime:      j.info.ModTime(),
 		Source:     j.src,
 		ArchivedAt: time.Now().UTC(),
+		Age:        a,
 	}
 }
 

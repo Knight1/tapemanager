@@ -243,7 +243,7 @@ func TestRestoreWithoutHardLinks(t *testing.T) {
 	defer tp.Close()
 	entries, _ := tp.Entries()
 	for _, e := range entries {
-		_, err := restoreFile(tp, dest, false, e, nil, nil, nil)
+		_, err := restoreFile(tp, dest, false, e, nil, nil, nil, nil)
 		switch e.Path {
 		case "downloads/a.iso":
 			if err == nil {

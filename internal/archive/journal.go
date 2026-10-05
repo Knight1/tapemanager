@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/Knight1/tapemanager/internal/agestream"
 	"github.com/Knight1/tapemanager/internal/manifest"
 )
 
@@ -26,6 +27,12 @@ type journalHeader struct {
 	MTime     time.Time `json:"mtime"`
 	ChunkSize int64     `json:"chunk_size"`
 	ParityM   int       `json:"parity_m,omitempty"`
+	// Age holds the header, nonce and file key of an encrypted file, so an
+	// interrupted write can continue the same encryption. The file key is
+	// secret; journals are only readable by their owner and are deleted
+	// once the file is recorded.
+	Age        *agestream.Params `json:"age,omitempty"`
+	Recipients []string          `json:"recipients,omitempty"`
 }
 
 type journalRecord struct {
@@ -37,6 +44,12 @@ type journalRecord struct {
 	ParityHashes []string `json:"parity_hashes,omitempty"`
 	// Parity is the complete parity record, on the final record only.
 	Parity *manifest.Parity `json:"parity,omitempty"`
+	// For encrypted files: the plaintext hash state at Offset and the
+	// payload chunk that follows, and on the final record the SHA-256 of
+	// the encrypted file (SHA256 then holds the plaintext's).
+	PlainState   []byte `json:"plain_state,omitempty"`
+	PlainChunk   int64  `json:"plain_chunk,omitempty"`
+	StoredSHA256 string `json:"stored_sha256,omitempty"`
 }
 
 // resumePoint is a position a transfer can continue from.
@@ -48,6 +61,9 @@ type resumePoint struct {
 	// parityHashes holds all parity shard hashes up to offset.
 	parityHashes []string
 	parity       *manifest.Parity // final record only
+	plainState   []byte           // encrypted files
+	plainChunk   int64
+	storedSHA256 string // final record of an encrypted file
 }
 
 // fileKey names the per-file state (journal, staged parity) of rel.
@@ -78,16 +94,18 @@ func writeJournal(name string, hdr journalHeader, start *resumePoint) (*journal,
 	}
 	data := append(b, '\n')
 	if start != nil {
-		b, err := json.Marshal(journalRecord{Offset: start.offset, State: start.state, Chunks: start.chunks, SHA256: start.sha256, ParityHashes: start.parityHashes, Parity: start.parity})
+		b, err := json.Marshal(journalRecord{Offset: start.offset, State: start.state, Chunks: start.chunks, SHA256: start.sha256, ParityHashes: start.parityHashes, Parity: start.parity,
+			PlainState: start.plainState, PlainChunk: start.plainChunk, StoredSHA256: start.storedSHA256})
 		if err != nil {
 			return nil, err
 		}
 		data = append(data, append(b, '\n')...)
 	}
-	if err := manifest.WriteFileAtomic(name, data); err != nil {
+	// Owner only: the journal of an encrypted file holds its file key.
+	if err := manifest.WriteFileAtomicPerm(name, data, 0o600); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(name, os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -152,6 +170,9 @@ func loadJournal(name string) (*journalHeader, []resumePoint, error) {
 			sha256:       r.SHA256,
 			parityHashes: parityHashes[:len(parityHashes):len(parityHashes)],
 			parity:       r.Parity,
+			plainState:   r.PlainState,
+			plainChunk:   r.PlainChunk,
+			storedSHA256: r.StoredSHA256,
 		})
 	}
 	return &hdr, points, sc.Err()

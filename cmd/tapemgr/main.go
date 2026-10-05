@@ -29,6 +29,7 @@ Usage:
   tapemgr archive recover [flags]          record files on tape that have no manifest entry
   tapemgr archive restore [flags] --to DIR [path]
                                            copy files from tape, repairing damage with parity
+  tapemgr archive keygen --out FILE        create an age key pair for --encrypt-to
   tapemgr catalog import [flags]           copy the mounted tape's manifest into the catalog
   tapemgr catalog tapes [flags]            list known tapes
   tapemgr catalog search [flags] <query>   find files by path or SHA-256 prefix
@@ -77,6 +78,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		"catalog tapes":   cmdTapes,
 		"catalog search":  cmdSearch,
 		"catalog retire":  cmdRetire,
+		"archive keygen":  cmdArchiveKeygen,
 		"drive list":      cmdDriveList,
 		"drive info":      cmdDriveInfo,
 		"drive check":     cmdDriveCheck,
@@ -178,8 +180,18 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 	copies := fs.Int("copies", 1, "number of different tapes each file should be on; 2 makes a second copy on this tape")
 	again := fs.Bool("again", false, "archive files even if they already have enough copies on other tapes")
 	requireEnc := fs.Bool("require-encryption", envBool("TAPEMGR_REQUIRE_ENCRYPTION"), "refuse to write unless the drive is encrypting (default $TAPEMGR_REQUIRE_ENCRYPTION)")
+	var encryptTo, encryptToFile stringList
+	fs.Var(&encryptTo, "encrypt-to", "encrypt each file with age to this public key (age1...); repeatable")
+	fs.Var(&encryptToFile, "encrypt-to-file", "encrypt to the public keys in this file; repeatable (default $TAPEMGR_ENCRYPT_TO_FILE)")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
+	}
+	if len(encryptTo) == 0 && len(encryptToFile) == 0 && os.Getenv("TAPEMGR_ENCRYPT_TO_FILE") != "" {
+		encryptToFile = append(encryptToFile, os.Getenv("TAPEMGR_ENCRYPT_TO_FILE"))
+	}
+	recipients, err := parseRecipients(encryptTo, encryptToFile)
+	if err != nil {
+		return fail(stderr, err)
 	}
 	if fs.NArg() != 1 {
 		fmt.Fprintln(stderr, "usage: tapemgr archive put [flags] <source>")
@@ -205,17 +217,18 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 	}
 
 	sum, err := archive.Put(archive.PutOptions{
-		TapeRoot: cf.tape,
-		Source:   fs.Arg(0),
-		Prefix:   *prefix,
-		Label:    *label,
-		Catalog:  cat,
-		Dedup:    !*noDedup,
-		Parity:   *parityPct,
-		Copies:   *copies,
-		Again:    *again,
-		Log:      stdout,
-		Progress: progressOut(stderr),
+		TapeRoot:   cf.tape,
+		Source:     fs.Arg(0),
+		Prefix:     *prefix,
+		Label:      *label,
+		Catalog:    cat,
+		Dedup:      !*noDedup,
+		Parity:     *parityPct,
+		Copies:     *copies,
+		Again:      *again,
+		Recipients: recipients,
+		Log:        stdout,
+		Progress:   progressOut(stderr),
 	})
 	if sum.Tape != nil {
 		recordEncryption(cat, sum.Tape.ID, enc, stderr)
@@ -342,6 +355,9 @@ func printEntry(w io.Writer, e manifest.Entry) {
 	}
 	if e.Recovered {
 		ref = "  (recovered)"
+	}
+	if e.Age != nil {
+		ref = "  (encrypted)"
 	}
 	fmt.Fprintf(w, "%s  %12d  %s%s\n", e.SHA256, e.Size, e.Path, ref)
 }
@@ -577,8 +593,17 @@ func cmdRecover(args []string, stdout, stderr io.Writer) int {
 func cmdRestore(args []string, stdout, stderr io.Writer) int {
 	fs, cf := newFlagSet("archive restore", stderr)
 	to := fs.String("to", "", "local directory to restore into (required)")
+	var identities stringList
+	fs.Var(&identities, "identity", "age private key file for encrypted files; repeatable (default $TAPEMGR_IDENTITY)")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
+	}
+	if len(identities) == 0 && os.Getenv("TAPEMGR_IDENTITY") != "" {
+		identities = append(identities, os.Getenv("TAPEMGR_IDENTITY"))
+	}
+	ids, err := parseIdentities(identities)
+	if err != nil {
+		return fail(stderr, err)
 	}
 	if fs.NArg() > 1 || *to == "" {
 		fmt.Fprintln(stderr, "usage: tapemgr archive restore [flags] --to DIR [path]")
@@ -588,11 +613,12 @@ func cmdRestore(args []string, stdout, stderr io.Writer) int {
 		return fail(stderr, err)
 	}
 	opts := archive.RestoreOptions{
-		TapeRoot: cf.tape,
-		Path:     fs.Arg(0),
-		Dest:     *to,
-		Log:      stdout,
-		Progress: progressOut(stderr),
+		TapeRoot:   cf.tape,
+		Path:       fs.Arg(0),
+		Dest:       *to,
+		Log:        stdout,
+		Progress:   progressOut(stderr),
+		Identities: ids,
 	}
 	// The catalog only adds hints about other copies; restore works
 	// without one, and a missing catalog is not created.

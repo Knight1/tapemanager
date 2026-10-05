@@ -34,7 +34,7 @@ func (r pendingRecord) Validate() error {
 		}
 	}
 	if r.Parity != nil {
-		if r.Parity.Path != r.Entry.Path || r.Parity.Layout.Size != r.Entry.Size {
+		if r.Parity.Path != r.Entry.Path || r.Parity.Layout.Size != r.Entry.Stored().Size {
 			return fmt.Errorf("%s: parity record does not match", r.Entry.Path)
 		}
 		return r.Parity.Validate()
@@ -87,7 +87,7 @@ func openPending(name string) (*pending, error) {
 		}
 		p.records = append(p.records, r)
 		if r.Entry.Ref == nil {
-			p.bytes += r.Entry.Size
+			p.bytes += r.Entry.Stored().Size
 		}
 		if r.Parity != nil {
 			p.parityBytes += r.Parity.Layout.ParitySize()
@@ -123,7 +123,7 @@ func (p *pending) add(r pendingRecord) error {
 	}
 	p.records = append(p.records, r)
 	if r.Entry.Ref == nil {
-		p.bytes += r.Entry.Size
+		p.bytes += r.Entry.Stored().Size
 	}
 	if r.Parity != nil {
 		p.parityBytes += r.Parity.Layout.ParitySize()

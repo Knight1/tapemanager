@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"filippo.io/age"
 	"github.com/Knight1/tapemanager/internal/catalog"
 	"github.com/Knight1/tapemanager/internal/manifest"
 )
@@ -26,6 +27,8 @@ type RestoreOptions struct {
 	// Catalog, if set, is used to name other tapes holding a copy of a
 	// file that cannot be restored from this one.
 	Catalog *catalog.Catalog
+	// Identities are the age private keys used to decrypt encrypted files.
+	Identities []age.Identity
 }
 
 // RestoreResult reports what Restore did.
@@ -111,7 +114,7 @@ func Restore(opts RestoreOptions) (res RestoreResult, err error) {
 			continue
 		}
 		fmt.Fprintf(opts.Log, "RESTORING: %s\n", e.Path)
-		repaired, err := restoreFile(tape, dest, noClobber, e, chunks, par, opts.Progress)
+		repaired, err := restoreFile(tape, dest, noClobber, e, chunks, par, opts.Identities, opts.Progress)
 		if err != nil {
 			fmt.Fprintf(opts.Log, "       FAILED: %v\n", err)
 			otherCopies(e)
@@ -153,7 +156,10 @@ func linkSupported(dest *os.Root) bool {
 	return true
 }
 
-func restoreFile(tape *manifest.Tape, dest *os.Root, noClobber bool, e manifest.Entry, chunks map[string]manifest.Chunks, par map[string]manifest.Parity, prog io.Writer) (repaired bool, err error) {
+func restoreFile(tape *manifest.Tape, dest *os.Root, noClobber bool, e manifest.Entry, chunks map[string]manifest.Chunks, par map[string]manifest.Parity, ids []age.Identity, prog io.Writer) (repaired bool, err error) {
+	if e.Age != nil && len(ids) == 0 {
+		return false, fmt.Errorf("encrypted with age; pass --identity with the private key of one of: %s", strings.Join(e.Age.Recipients, ", "))
+	}
 	tf, err := openTapeFile(tape, e, chunks, par)
 	if err != nil {
 		return false, err
@@ -184,14 +190,17 @@ func restoreFile(tape *manifest.Tape, dest *os.Root, noClobber bool, e manifest.
 		dest.Remove(tmp)
 	}()
 
-	p := startProgress(prog, e.Size)
+	// The file on tape is restored and checked as stored first; an
+	// encrypted file is decrypted only once it is known to be intact.
+	stored := tf.entry
+	p := startProgress(prog, stored.Size)
 	s, err := tf.scan(out, p)
 	p.finish()
 	if err != nil {
 		return false, err
 	}
-	if !s.intact(e) {
-		detail := describeDamage(s, e, tf.chunkSize())
+	if !s.intact(stored) {
+		detail := describeDamage(s, stored, tf.chunkSize())
 		if tf.parity == nil {
 			return false, fmt.Errorf("%s; no parity to repair it", detail)
 		}
@@ -204,7 +213,7 @@ func restoreFile(tape *manifest.Tape, dest *os.Root, noClobber bool, e manifest.
 		}
 		repaired = true
 	}
-	if err := out.Truncate(e.Size); err != nil {
+	if err := out.Truncate(stored.Size); err != nil {
 		return false, err
 	}
 
@@ -219,16 +228,27 @@ func restoreFile(tape *manifest.Tape, dest *os.Root, noClobber bool, e manifest.
 		if _, err := io.CopyBuffer(h, struct{ io.Reader }{out}, make([]byte, DefaultChunkSize)); err != nil {
 			return false, err
 		}
-		if got := hex.EncodeToString(h.Sum(nil)); got != e.SHA256 {
+		if got := hex.EncodeToString(h.Sum(nil)); got != stored.SHA256 {
 			return false, fmt.Errorf("restored data does not match the recorded SHA-256 (%s)", got)
 		}
 	}
-	if err := out.Sync(); err != nil {
-		return false, err
-	}
-	closed = true
-	if err := out.Close(); err != nil {
-		return false, err
+	if e.Age != nil {
+		plain, err := decryptRestored(dest, rel, out, stored.Size, e, ids)
+		if err != nil {
+			return false, err
+		}
+		closed = true
+		out.Close()
+		dest.Remove(tmp)
+		tmp = plain
+	} else {
+		if err := out.Sync(); err != nil {
+			return false, err
+		}
+		closed = true
+		if err := out.Close(); err != nil {
+			return false, err
+		}
 	}
 	if err := dest.Chtimes(tmp, e.MTime, e.MTime); err != nil {
 		return false, err
@@ -254,4 +274,52 @@ func restoreFile(tape *manifest.Tape, dest *os.Root, noClobber bool, e manifest.
 		return false, err
 	}
 	return repaired, syncTapeDir(dest, filepath.Dir(rel))
+}
+
+// decryptRestored decrypts the restored age file in src into a new
+// temporary file next to rel and returns its name. The result is kept only
+// if its size and SHA-256 match the original file.
+func decryptRestored(dest *os.Root, rel string, src io.ReaderAt, size int64, e manifest.Entry, ids []age.Identity) (string, error) {
+	r, err := age.Decrypt(io.NewSectionReader(src, 0, size), ids...)
+	if err != nil {
+		var none *age.NoIdentityMatchError
+		if errors.As(err, &none) {
+			return "", fmt.Errorf("none of the given keys can decrypt it; it was encrypted to: %s", strings.Join(e.Age.Recipients, ", "))
+		}
+		return "", fmt.Errorf("decrypting: %w", err)
+	}
+	var rnd [8]byte
+	rand.Read(rnd[:])
+	name := rel + ".tapemgr-restore-" + hex.EncodeToString(rnd[:])
+	f, err := dest.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return "", err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			f.Close()
+			dest.Remove(name)
+		}
+	}()
+	h := sha256.New()
+	// One byte more than expected is read, so trailing data is noticed.
+	n, err := io.CopyBuffer(io.MultiWriter(f, h), io.LimitReader(r, e.Size+1), make([]byte, DefaultChunkSize))
+	if err != nil {
+		return "", fmt.Errorf("decrypting: %w", err)
+	}
+	if n != e.Size {
+		return "", fmt.Errorf("decrypted size %d does not match the recorded %d", n, e.Size)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != e.SHA256 {
+		return "", fmt.Errorf("decrypted data does not match the recorded SHA-256 (%s)", got)
+	}
+	if err := f.Sync(); err != nil {
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	ok = true
+	return name, nil
 }

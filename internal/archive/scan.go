@@ -25,15 +25,19 @@ type tapeFile struct {
 	size   int64 // actual size on tape
 }
 
+// openTapeFile opens the file on tape holding e. For an encrypted file
+// that is the age file, and tf.entry describes it (Entry.Stored): chunk
+// hashes, parity and the scan all work on the encrypted bytes.
 func openTapeFile(tape *manifest.Tape, e manifest.Entry, chunks map[string]manifest.Chunks, par map[string]manifest.Parity) (*tapeFile, error) {
-	tf := &tapeFile{tape: tape, entry: e}
+	s := e.Stored()
+	tf := &tapeFile{tape: tape, entry: s}
 	if c, ok := chunks[e.Path]; ok {
 		tf.chunks = &c
 	}
-	if p, ok := par[e.Path]; ok && p.Layout.Size == e.Size {
+	if p, ok := par[e.Path]; ok && p.Layout.Size == s.Size {
 		tf.parity = &p
 	}
-	f, err := tape.Root().Open(filepath.FromSlash(e.Path))
+	f, err := tape.Root().Open(filepath.FromSlash(s.Path))
 	if err != nil {
 		return nil, err
 	}

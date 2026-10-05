@@ -2,9 +2,14 @@ module github.com/Knight1/tapemanager
 
 go 1.27.1
 
-require github.com/klauspost/reedsolomon v1.14.2
+require (
+	filippo.io/age v1.3.2
+	github.com/klauspost/reedsolomon v1.14.2
+	golang.org/x/crypto v0.57.0
+)
 
 require (
+	filippo.io/hpke v0.4.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
-	golang.org/x/sys v0.30.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
 )

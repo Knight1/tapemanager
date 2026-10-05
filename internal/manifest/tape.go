@@ -449,7 +449,10 @@ func sumsContent(all []Entry) string {
 	var b strings.Builder
 	for _, e := range all {
 		if e.Ref == nil {
-			fmt.Fprintf(&b, "%s  %s\n", e.SHA256, e.Path)
+			// Encrypted files are listed as stored, so sha256sum -c
+			// checks them without the key.
+			s := e.Stored()
+			fmt.Fprintf(&b, "%s  %s\n", s.SHA256, s.Path)
 		}
 	}
 	return b.String()

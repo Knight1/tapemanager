@@ -76,6 +76,49 @@ type Entry struct {
 	// and recorded by 'archive recover'. Their hash was computed from the
 	// tape, not from the source, and their source is unknown.
 	Recovered bool `json:"recovered,omitempty"`
+
+	// Age is set for files stored encrypted with age. The tape then holds
+	// Path plus AgeSuffix, a standard age file; Size and SHA256 above
+	// describe the original content and Age the file on tape.
+	Age *Age `json:"age,omitempty"`
+}
+
+// AgeSuffix is appended to the tape path of age-encrypted files.
+const AgeSuffix = ".age"
+
+// Age describes the encrypted file on tape.
+type Age struct {
+	Size       int64    `json:"size"`
+	SHA256     string   `json:"sha256"`
+	Recipients []string `json:"recipients"` // public keys that can decrypt it
+}
+
+// Limits for age metadata read from tape.
+const (
+	maxRecipients     = 64
+	maxRecipientBytes = 4096
+	// The age header (recipient stanzas) is limited to 1 MiB.
+	maxAgeHeader = 1 << 20
+)
+
+// TapePath is where the file's data is stored on tape.
+func (e Entry) TapePath() string {
+	if e.Age != nil {
+		return e.Path + AgeSuffix
+	}
+	return e.Path
+}
+
+// Stored describes the file as it is on tape: for encrypted files the
+// path, size and SHA-256 of the age file. Integrity checks and parity work
+// on this view and need no key.
+func (e Entry) Stored() Entry {
+	if e.Age == nil {
+		return e
+	}
+	s := e
+	s.Path, s.Size, s.SHA256, s.Age = e.TapePath(), e.Age.Size, e.Age.SHA256, nil
+	return s
 }
 
 // Ref points at the copy of a deduplicated file.
@@ -200,6 +243,33 @@ func (e Entry) Validate() error {
 	}
 	if e.Ref != nil && (!ValidID(e.Ref.Tape) || !ValidPath(e.Ref.Path)) {
 		return fmt.Errorf("%s: invalid reference", e.Path)
+	}
+	if a := e.Age; a != nil {
+		if e.Ref != nil || e.Recovered {
+			return fmt.Errorf("%s: encryption on a reference or recovered file", e.Path)
+		}
+		if !ValidPath(e.TapePath()) {
+			return fmt.Errorf("invalid path %q", e.TapePath())
+		}
+		// At least one tag per 64 KiB and a header, at most a 1 MiB header.
+		min := e.Size + 16*((e.Size+65535)/65536)
+		if e.Size == 0 {
+			min = 16
+		}
+		if a.Size <= min || a.Size > min+maxAgeHeader+16 {
+			return fmt.Errorf("%s: encrypted size %d does not fit size %d", e.Path, a.Size, e.Size)
+		}
+		if !validSHA256(a.SHA256) {
+			return fmt.Errorf("%s: invalid SHA-256 of the encrypted file", e.Path)
+		}
+		if len(a.Recipients) == 0 || len(a.Recipients) > maxRecipients {
+			return fmt.Errorf("%s: %d recipients", e.Path, len(a.Recipients))
+		}
+		for _, r := range a.Recipients {
+			if r == "" || len(r) > maxRecipientBytes || strings.IndexFunc(r, func(c rune) bool { return c <= ' ' || c > '~' }) >= 0 {
+				return fmt.Errorf("%s: invalid recipient", e.Path)
+			}
+		}
 	}
 	return nil
 }
