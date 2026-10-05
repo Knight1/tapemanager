@@ -24,7 +24,7 @@ var (
 // Firmware images below this size are certainly not drive firmware.
 const (
 	minFirmwareSize = 64 << 10
-	maxFirmwareSize = 64 << 20
+	maxFirmwareSize = 16<<20 - 1 // the limit of WRITE BUFFER's offset field
 )
 
 func cmdDriveFirmware(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -99,17 +99,33 @@ func cmdDriveFirmware(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	if err != nil {
 		return fail(stderr, err)
 	}
+	// IBM images name the drive type they are for; check it before sending.
+	ibm, err := drive.CheckIBMImage(d, q, image)
+	if err != nil {
+		return fail(stderr, fmt.Errorf("%s: %w", *file, err))
+	}
+	model := "no check for this vendor; the drive checks the image itself"
+	if ibm != nil {
+		model = fmt.Sprintf("image for %s (load ID %x), matches this drive; image level %s", ibm.ModelID, ibm.LoadID, orDash(ibm.Level))
+		if ibm.Built != "" {
+			model += ", built " + ibm.Built
+		}
+		if ibm.Level == q.Revision {
+			model += " (the level already installed)"
+		}
+	}
 
 	fmt.Fprintf(stdout, `Drive:     %s %s, serial %s (%s)
 Firmware:  %s now
 Image:     %s
            %s, SHA-256 %s
-Buffer:    %s, sent in pieces of %s
+Model:     %s
+Sent in:   pieces of %s
 
 Compare the SHA-256 with the one the vendor publishes for this file. Make
 sure the image is meant for this exact drive model.
 `, q.Vendor, q.Product, serial, f.SG, q.Revision, *file, archive.FormatBytes(int64(len(image))),
-		hex.EncodeToString(sum[:]), archive.FormatBytes(int64(buf.Capacity)), archive.FormatBytes(int64(chunk)))
+		hex.EncodeToString(sum[:]), model, archive.FormatBytes(int64(chunk)))
 	if *dry {
 		fmt.Fprintln(stdout, "\nDry run: the drive and the file passed all checks. Nothing was sent.")
 		return exitOK

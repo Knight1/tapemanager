@@ -1,8 +1,12 @@
 package drive
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -55,17 +59,16 @@ func (e *FirmwareError) Error() string {
 func (e *FirmwareError) Unwrap() error { return e.Err }
 
 // CheckFirmwareImage checks that image can be downloaded to a drive with
-// buffer b, and returns the piece size to use (at most chunk).
+// buffer b, and returns the piece size to use (at most chunk). The buffer
+// capacity the drive reports is not a limit for microcode: IBM LTO-6 images
+// are larger than the 5 MiB it reports for buffer 0 and are accepted. The
+// only limit is the 3-byte offset field of WRITE BUFFER.
 func CheckFirmwareImage(b MicrocodeBuffer, image []byte, chunk int) (int, error) {
 	switch {
 	case len(image) == 0:
 		return 0, errors.New("the firmware file is empty")
-	case b.Capacity <= 0:
-		return 0, errors.New("the drive reports no microcode buffer")
-	case len(image) > b.Capacity:
-		return 0, fmt.Errorf("the firmware file (%d bytes) is larger than the drive's microcode buffer (%d bytes); is it for this drive?", len(image), b.Capacity)
 	case len(image) >= maxOffset:
-		return 0, errors.New("the firmware file is too large")
+		return 0, fmt.Errorf("the firmware file (%d bytes) is larger than WRITE BUFFER can address (%d bytes)", len(image), maxOffset-1)
 	case b.Boundary > 20:
 		return 0, fmt.Errorf("the drive requires offsets aligned to 2^%d bytes, which is not supported", b.Boundary)
 	}
@@ -78,6 +81,93 @@ func CheckFirmwareImage(b MicrocodeBuffer, image []byte, chunk int) (int, error)
 		chunk = align
 	}
 	return chunk, nil
+}
+
+// IBMImage is what the header of an IBM tape drive firmware image says.
+type IBMImage struct {
+	Level   string // firmware level, as INQUIRY will report it
+	LoadID  []byte // drive type the image is for
+	ModelID string // EBCDIC model identifier, decoded
+	modelID []byte
+	Built   string // build date if the header names one (YYYY/MM/DD)
+}
+
+// ErrNotIBMImage means the file has no IBM tape drive firmware header.
+var ErrNotIBMImage = errors.New("not an IBM tape drive firmware image")
+
+var buildDate = regexp.MustCompile(`20[0-9]{2}/[01][0-9]/[0-3][0-9]`)
+
+// ParseIBMImage reads the header of an IBM tape drive firmware image: the
+// length at byte 4, the load ID at 8, the level at 12, an EBCDIC model ID
+// at 0x18 and the magic "IBMTpDrv" at 0x20. Bytes 8 to 0x20 have the same
+// layout as the drive's VPD page 0x03.
+func ParseIBMImage(b []byte) (*IBMImage, error) {
+	if len(b) < 0x28 || string(b[0x20:0x28]) != "IBMTpDrv" {
+		return nil, ErrNotIBMImage
+	}
+	if n := binary.BigEndian.Uint32(b[4:]); int64(n) != int64(len(b)) {
+		return nil, fmt.Errorf("the image header says %d bytes but the file has %d: truncated or damaged", n, len(b))
+	}
+	img := &IBMImage{
+		Level:   printable(b[12:16]),
+		LoadID:  bytes.Clone(b[8:12]),
+		modelID: bytes.Clone(b[0x18:0x20]),
+	}
+	img.ModelID = ebcdic(img.modelID)
+	if m := buildDate.Find(b[:min(len(b), 4096)]); m != nil {
+		img.Built = string(m)
+	}
+	return img, nil
+}
+
+// ebcdic decodes the letters, digits and spaces of an EBCDIC string.
+func ebcdic(b []byte) string {
+	var sb strings.Builder
+	for _, c := range b {
+		switch {
+		case c >= 0xC1 && c <= 0xC9:
+			sb.WriteByte('A' + c - 0xC1)
+		case c >= 0xD1 && c <= 0xD9:
+			sb.WriteByte('J' + c - 0xD1)
+		case c >= 0xE2 && c <= 0xE9:
+			sb.WriteByte('S' + c - 0xE2)
+		case c >= 0xF0 && c <= 0xF9:
+			sb.WriteByte('0' + c - 0xF0)
+		case c == 0x40:
+			sb.WriteByte(' ')
+		case c == 0:
+		default:
+			sb.WriteByte('?')
+		}
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+// CheckIBMImage compares an IBM image with the drive it is meant for, using
+// the drive's VPD page 0x03 (load ID and model ID). It returns nil, nil for
+// drives of other vendors, which have no such check here.
+func CheckIBMImage(d Device, q Inquiry, image []byte) (*IBMImage, error) {
+	if q.Vendor != "IBM" {
+		return nil, nil
+	}
+	img, err := ParseIBMImage(image)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, 255)
+	n, err := d.Do(inquiryCDB(true, 0x03, uint16(len(buf))), DirIn, buf, shortTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("reading the drive's load ID (VPD 0x03): %w", err)
+	}
+	v := buf[:n]
+	if len(v) < 0x20 || v[1] != 0x03 {
+		return nil, errors.New("the drive's load ID page (VPD 0x03) is too short")
+	}
+	if !bytes.Equal(v[8:12], img.LoadID) || !bytes.Equal(v[0x18:0x20], img.modelID) {
+		return nil, fmt.Errorf("the image is for another drive model (image %s / %x, drive %s / %x)",
+			img.ModelID, img.LoadID, ebcdic(v[0x18:0x20]), v[8:12])
+	}
+	return img, nil
 }
 
 // UpdateFirmware downloads image to the drive in pieces of chunk bytes and

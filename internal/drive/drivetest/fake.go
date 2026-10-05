@@ -5,6 +5,7 @@ package drivetest
 
 import (
 	"encoding/binary"
+	"fmt"
 	"time"
 
 	"github.com/Knight1/tapemanager/internal/drive"
@@ -30,6 +31,7 @@ type Fake struct {
 
 	// Firmware: the drive reports Revision (E6R3 unless set). A download
 	// of ImageSize bytes is activated as NewRevision; Received collects it.
+	Vendor         string // IBM unless set
 	Revision       string
 	ImageSize      int
 	NewRevision    string
@@ -83,7 +85,17 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 			if rev == "" {
 				rev = "E6R3"
 			}
-			copy(resp[8:], "IBM     ULT3580-HH6     "+rev)
+			vendor := f.Vendor
+			if vendor == "" {
+				vendor = "IBM"
+			}
+			copy(resp[8:], fmt.Sprintf("%-8s%-16s%s", vendor, "ULT3580-HH6", rev))
+		} else if cdb[2] == 0x03 {
+			resp = make([]byte, 0x25)
+			resp[1], resp[3] = 0x03, 0x21
+			copy(resp[8:], f.LoadID())
+			copy(resp[12:], "E6R3")
+			copy(resp[0x18:], f.ModelID())
 		} else if cdb[2] == 0xC0 {
 			resp = append([]byte{1, 0xC0, 0, 0x27}, "LTO6_E6R3   130808\x0020140808sas_hh      "...)
 		} else if cdb[2] == 0x80 {
@@ -355,5 +367,32 @@ func DiagEntry(key, asc, ascq byte, repeated bool, firmware, medium string, op b
 	for i := range 6 {
 		b[67-i] = byte(ms >> (8 * i))
 	}
+	return b
+}
+
+// Made-up IBM load and model IDs of the fake drive ("TESTID01" in EBCDIC).
+var (
+	FakeLoadID  = []byte{0x11, 0x22, 0x33, 0x44}
+	FakeModelID = []byte{0xE3, 0xC5, 0xE2, 0xE3, 0xC9, 0xC4, 0xF0, 0xF1}
+)
+
+func (f *Fake) LoadID() []byte  { return FakeLoadID }
+func (f *Fake) ModelID() []byte { return FakeModelID }
+
+// IBMImage builds a firmware image with an IBM header for the given load
+// and model IDs, level and total size. The rest is random filler.
+func IBMImage(loadID, modelID []byte, level string, size int, filler func([]byte)) []byte {
+	b := make([]byte, size)
+	if filler != nil {
+		filler(b)
+	}
+	b[0], b[1], b[2], b[3] = 0x48, 0, 0x03, 0x91
+	binary.BigEndian.PutUint32(b[4:], uint32(size))
+	copy(b[8:12], loadID)
+	copy(b[12:16], level)
+	clear(b[16:0x18])
+	copy(b[0x18:0x20], modelID)
+	copy(b[0x20:0x28], "IBMTpDrv")
+	copy(b[0x300:], "2026/01/02")
 	return b
 }

@@ -13,11 +13,15 @@ import (
 	"github.com/Knight1/tapemanager/internal/drive/drivetest"
 )
 
+// firmwareFile writes an image with an IBM header matching the fake drive.
 func firmwareFile(t *testing.T, n int) (string, []byte) {
 	t.Helper()
-	b := make([]byte, n)
-	rand.Read(b)
-	p := filepath.Join(t.TempDir(), "E6R4.ro")
+	return writeImage(t, drivetest.IBMImage(drivetest.FakeLoadID, drivetest.FakeModelID, "E6R4", n, func(b []byte) { rand.Read(b) }))
+}
+
+func writeImage(t *testing.T, b []byte) (string, []byte) {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "image.fmrz")
 	os.WriteFile(p, b, 0o644)
 	return p, b
 }
@@ -39,7 +43,8 @@ func TestCLIFirmwareDryRunAndConfirm(t *testing.T) {
 	f := firmwareFake(t, img)
 
 	code, out := runWithInput("", "drive", "firmware", "--file", file, "--dry-run")
-	if code != 0 || !strings.Contains(out, "Firmware:  E6R3 now") || !strings.Contains(out, "SHA-256") || !strings.Contains(out, "Nothing was sent") || f.Downloads != 0 {
+	if code != 0 || !strings.Contains(out, "Firmware:  E6R3 now") || !strings.Contains(out, "SHA-256") || !strings.Contains(out, "Nothing was sent") || f.Downloads != 0 ||
+		!strings.Contains(out, "image for TESTID01 (load ID 11223344), matches this drive; image level E6R4, built 2026/01/02") {
 		t.Fatalf("dry run: %d %s", code, out)
 	}
 	code, out = runWithInput("wrong\n", "drive", "firmware", "--file", file)
@@ -68,9 +73,17 @@ func TestCLIFirmwareRefuses(t *testing.T) {
 		t.Fatalf("mounted: %s", out)
 	}
 	mountPoints = func(drive.Found, string) ([]string, error) { return nil, nil }
-	f.BufferCapacity = 100 << 10
-	if code, out := runWithInput("", "drive", "firmware", "--file", file, "--yes"); code != exitFailure || !strings.Contains(out, "larger than the drive's microcode buffer") {
-		t.Fatalf("buffer: %s", out)
+	other, _ := writeImage(t, drivetest.IBMImage([]byte{9, 9, 9, 9}, drivetest.FakeModelID, "E6R4", 300<<10, nil))
+	if code, out := runWithInput("", "drive", "firmware", "--file", other, "--yes"); code != exitFailure || !strings.Contains(out, "another drive model") {
+		t.Fatalf("other model: %s", out)
+	}
+	plain, _ := writeImage(t, make([]byte, 300<<10))
+	if code, out := runWithInput("", "drive", "firmware", "--file", plain, "--yes"); code != exitFailure || !strings.Contains(out, "not an IBM tape drive firmware image") {
+		t.Fatalf("plain file: %s", out)
+	}
+	big, _ := writeImage(t, make([]byte, 16<<20))
+	if code, out := runWithInput("", "drive", "firmware", "--file", big, "--yes"); code != exitFailure || !strings.Contains(out, "not a plausible firmware image") {
+		t.Fatalf("too large: %s", out)
 	}
 	small, _ := firmwareFile(t, 1000)
 	if code, out := runWithInput("", "drive", "firmware", "--file", small, "--yes"); code != exitFailure || !strings.Contains(out, "not a plausible firmware image") {
@@ -117,5 +130,34 @@ func TestCLIFirmwareRejectedAndInterrupted(t *testing.T) {
 	code, out = runWithInput("", "drive", "firmware", "--file", file, "--yes")
 	if !strings.Contains(out, "Waiting for the drive to find out") {
 		t.Fatalf("last piece: %d %s", code, out)
+	}
+}
+
+// An image larger than the 5 MiB the drive reports for buffer 0 goes
+// through, as real IBM LTO-6 images do.
+func TestCLIFirmwareLargerThanBuffer(t *testing.T) {
+	file, img := firmwareFile(t, 6<<20)
+	f := firmwareFake(t, img)
+	f.BufferCapacity = 5 << 20
+	if code, out := runWithInput("", "drive", "firmware", "--file", file, "--yes"); code != 0 || !strings.Contains(out, "E6R3 -> E6R4") {
+		t.Fatalf("%d %s", code, out)
+	}
+}
+
+// Drives of other vendors get no model check; the drive decides.
+func TestCLIFirmwareOtherVendor(t *testing.T) {
+	file, img := writeImage(t, make([]byte, 300<<10))
+	f := firmwareFake(t, img)
+	f.Vendor = "HP"
+	if code, out := runWithInput("", "drive", "firmware", "--file", file, "--dry-run"); code != 0 || !strings.Contains(out, "no check for this vendor") {
+		t.Fatalf("%d %s", code, out)
+	}
+}
+
+func TestCLIFirmwareSameLevel(t *testing.T) {
+	file, img := writeImage(t, drivetest.IBMImage(drivetest.FakeLoadID, drivetest.FakeModelID, "E6R3", 300<<10, nil))
+	firmwareFake(t, img)
+	if code, out := runWithInput("", "drive", "firmware", "--file", file, "--dry-run"); code != 0 || !strings.Contains(out, "the level already installed") {
+		t.Fatalf("%d %s", code, out)
 	}
 }

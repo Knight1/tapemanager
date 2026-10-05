@@ -54,8 +54,7 @@ func TestUpdateFirmwareAlignment(t *testing.T) {
 
 func TestUpdateFirmwareRefuses(t *testing.T) {
 	f := drivetest.New()
-	f.BufferCapacity = 1000
-	if err := drive.UpdateFirmware(f, image(1001), 0, nil); err == nil || !strings.Contains(err.Error(), "larger than the drive's microcode buffer") {
+	if err := drive.UpdateFirmware(f, image(1<<24), 0, nil); err == nil || !strings.Contains(err.Error(), "larger than WRITE BUFFER can address") {
 		t.Fatalf("%v", err)
 	}
 	if err := drive.UpdateFirmware(f, nil, 0, nil); err == nil || !strings.Contains(err.Error(), "empty") {
@@ -64,10 +63,8 @@ func TestUpdateFirmwareRefuses(t *testing.T) {
 	if f.Downloads != 0 {
 		t.Fatal("download started")
 	}
-	for _, b := range []drive.MicrocodeBuffer{{Capacity: 0}, {Capacity: 1 << 30}, {Boundary: 30, Capacity: 1 << 20}} {
-		if _, err := drive.CheckFirmwareImage(b, image(1<<24), 0); err == nil {
-			t.Errorf("%+v accepted", b)
-		}
+	if _, err := drive.CheckFirmwareImage(drive.MicrocodeBuffer{Boundary: 30, Capacity: 1 << 20}, image(10), 0); err == nil {
+		t.Error("unsupported alignment accepted")
 	}
 	f = drivetest.New()
 	f.Fail = map[byte]*drive.CommandError{0x3C: {Op: 0x3C, Status: 2, Key: drive.SenseIllegalRequest, ASC: 0x24}}
@@ -118,5 +115,59 @@ func TestFirmwareBuild(t *testing.T) {
 	info, _ := drive.Gather(f)
 	if info.Firmware.Name != "LTO6_E6R3" {
 		t.Fatalf("%+v", info.Firmware)
+	}
+}
+
+// The drive reports 5 MiB for buffer 0, but IBM LTO-6 images are larger and
+// accepted: the buffer capacity is no limit for microcode.
+func TestFirmwareLargerThanBufferDescriptor(t *testing.T) {
+	f := drivetest.New()
+	f.BufferCapacity = 5 << 20
+	img := image(6 << 20)
+	f.ImageSize = len(img)
+	if err := drive.UpdateFirmware(f, img, 0, nil); err != nil || !bytes.Equal(f.Received, img) {
+		t.Fatalf("%v", err)
+	}
+}
+
+func TestCheckIBMImage(t *testing.T) {
+	f := drivetest.New()
+	q, _ := drive.ReadInquiry(f)
+	img := drivetest.IBMImage(drivetest.FakeLoadID, drivetest.FakeModelID, "E6R4", 200<<10, nil)
+	got, err := drive.CheckIBMImage(f, q, img)
+	if err != nil || got.Level != "E6R4" || got.ModelID != "TESTID01" || got.Built != "2026/01/02" {
+		t.Fatalf("%+v %v", got, err)
+	}
+	other := drivetest.IBMImage([]byte{9, 9, 9, 9}, drivetest.FakeModelID, "E6R4", 200<<10, nil)
+	if _, err := drive.CheckIBMImage(f, q, other); err == nil || !strings.Contains(err.Error(), "another drive model") {
+		t.Fatalf("other load ID: %v", err)
+	}
+	otherModel := drivetest.IBMImage(drivetest.FakeLoadID, []byte{0xC1, 0xC2, 0xC3, 0xC4, 0xF1, 0xF2, 0xF3, 0xF4}, "E6R4", 200<<10, nil)
+	if _, err := drive.CheckIBMImage(f, q, otherModel); err == nil || !strings.Contains(err.Error(), "image ABCD1234") {
+		t.Fatalf("other model: %v", err)
+	}
+	if _, err := drive.CheckIBMImage(f, q, image(200<<10)); !errors.Is(err, drive.ErrNotIBMImage) {
+		t.Fatalf("plain file: %v", err)
+	}
+	if _, err := drive.CheckIBMImage(f, q, img[:len(img)-1]); err == nil || !strings.Contains(err.Error(), "truncated or damaged") {
+		t.Fatalf("truncated: %v", err)
+	}
+	// Other vendors: no check here.
+	q.Vendor = "HP"
+	if got, err := drive.CheckIBMImage(f, q, image(10)); got != nil || err != nil {
+		t.Fatalf("%+v %v", got, err)
+	}
+	q.Vendor = "IBM"
+	f.Fail = map[byte]*drive.CommandError{0x12: {Op: 0x12, Status: 2, Key: drive.SenseIllegalRequest, ASC: 0x24}}
+	if _, err := drive.CheckIBMImage(f, q, img); err == nil || !strings.Contains(err.Error(), "VPD 0x03") {
+		t.Fatalf("no VPD: %v", err)
+	}
+}
+
+func TestParseIBMImageShort(t *testing.T) {
+	for _, n := range []int{0, 0x27} {
+		if _, err := drive.ParseIBMImage(make([]byte, n)); !errors.Is(err, drive.ErrNotIBMImage) {
+			t.Fatalf("%d: %v", n, err)
+		}
 	}
 }
