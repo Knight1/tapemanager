@@ -79,7 +79,7 @@ func TestResumeIgnoresBogusJournalOffsets(t *testing.T) {
 	jdir, _ := filepath.Glob(filepath.Join(o.Catalog.Dir, "journal", "*"))
 	jfiles, _ := filepath.Glob(filepath.Join(jdir[0], "*.jsonl"))
 	b, _ := os.ReadFile(jfiles[0])
-	hdr := strings.SplitN(string(b), "\n", 2)[0]
+	hdr, _, _ := strings.Cut(string(b), "\n")
 	bogus := hdr + "\n" +
 		`{"offset":-5,"state":"","chunks":[]}` + "\n" +
 		`{"offset":9223372036854775807,"state":"","chunks":["x"]}` + "\n" +

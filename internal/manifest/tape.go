@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"cmp"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -8,7 +9,7 @@ import (
 	"io"
 	"os"
 	"path"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -205,7 +206,7 @@ func (t *Tape) segments() ([]int, error) {
 		}
 		nums = append(nums, i)
 	}
-	sort.Ints(nums)
+	slices.Sort(nums)
 	return nums, nil
 }
 
@@ -306,7 +307,7 @@ func (t *Tape) ParitySegments() (map[int][]Parity, []string, error) {
 		segs[p.Segment] = append(segs[p.Segment], p)
 	}
 	for _, list := range segs {
-		sort.Slice(list, func(i, j int) bool { return list[i].Offset < list[j].Offset })
+		slices.SortFunc(list, func(a, b Parity) int { return cmp.Compare(a.Offset, b.Offset) })
 	}
 	return segs, problems, nil
 }

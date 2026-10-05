@@ -3,7 +3,7 @@ package drive
 import (
 	"encoding/binary"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 )
@@ -152,7 +152,7 @@ func AnalyzeErrorLog(entries []LogEntry, loaded, current string) []string {
 	for id := range media {
 		ids = append(ids, id)
 	}
-	sort.Strings(ids)
+	slices.Sort(ids)
 	for _, id := range ids {
 		es := media[id]
 		var kinds []string
@@ -187,7 +187,7 @@ func AnalyzeErrorLog(entries []LogEntry, loaded, current string) []string {
 		for f := range older {
 			levels = append(levels, f)
 		}
-		sort.Strings(levels)
+		slices.Sort(levels)
 		n := len(entries) - countCurrent(entries, current)
 		out = append(out, fmt.Sprintf("%d entr%s recorded with older firmware (%s), before the current %s",
 			n, pluralY(n), strings.Join(levels, ", "), current))

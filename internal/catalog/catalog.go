@@ -15,13 +15,13 @@
 package catalog
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -113,8 +113,7 @@ func (c *Catalog) SetRetired(id string, retired bool) (*Tape, error) {
 	}
 	t.Retired = nil
 	if retired {
-		now := time.Now().UTC()
-		t.Retired = &now
+		t.Retired = new(time.Now().UTC())
 	}
 	return t, c.save(t)
 }
@@ -131,7 +130,7 @@ func (cp Copies) Tapes(sum, skip string) []Tape {
 			out = append(out, t)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	slices.SortFunc(out, func(a, b Tape) int { return cmp.Compare(a.ID, b.ID) })
 	return out
 }
 
@@ -434,11 +433,8 @@ func (c *Catalog) Tapes() ([]Tape, error) {
 			tapes = append(tapes, *t)
 		}
 	}
-	sort.Slice(tapes, func(i, j int) bool {
-		if tapes[i].Label != tapes[j].Label {
-			return tapes[i].Label < tapes[j].Label
-		}
-		return tapes[i].ID < tapes[j].ID
+	slices.SortFunc(tapes, func(a, b Tape) int {
+		return cmp.Or(cmp.Compare(a.Label, b.Label), cmp.Compare(a.ID, b.ID))
 	})
 	return tapes, nil
 }

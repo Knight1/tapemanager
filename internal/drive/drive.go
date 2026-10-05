@@ -234,8 +234,7 @@ func TestUnitReady(d Device) error {
 	// asking again gives the real state.
 	for range 3 {
 		_, err = d.Do([]byte{opTestUnitReady, 0, 0, 0, 0, 0}, DirNone, nil, shortTimeout)
-		var ce *CommandError
-		if !errors.As(err, &ce) || ce.Key != SenseUnitAttention {
+		if ce, ok := errors.AsType[*CommandError](err); !ok || ce.Key != SenseUnitAttention {
 			return err
 		}
 	}

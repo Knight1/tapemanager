@@ -61,10 +61,7 @@ func (p *progress) draw() {
 	if p.total > 0 {
 		frac = float64(done) / float64(p.total)
 	}
-	filled := int(frac * width)
-	if filled > width {
-		filled = width
-	}
+	filled := min(int(frac*width), width)
 	rate := float64(done) / time.Since(p.start).Seconds()
 	fmt.Fprintf(p.out, "\r       [%s%s] %3.0f%%  %s/s ",
 		strings.Repeat("=", filled), strings.Repeat(" ", width-filled),

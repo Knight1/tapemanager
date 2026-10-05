@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/Knight1/tapemanager/internal/catalog"
@@ -56,7 +57,7 @@ func checkEncryption(cat *catalog.Catalog, tapeRoot string, require bool, log io
 		if !st.Encrypting() {
 			return nil, fmt.Errorf("tape %s holds encrypted data, but the drive is not encrypting; mount the tape with its LTFS key (see docs/TECHNICAL.md); refusing to add unencrypted data", name)
 		}
-		if k := st.KeyName(); k != "" && len(rec.Encryption.Keys) > 0 && !containsString(rec.Encryption.Keys, k) {
+		if k := st.KeyName(); k != "" && len(rec.Encryption.Keys) > 0 && !slices.Contains(rec.Encryption.Keys, k) {
 			fmt.Fprintf(log, "NOTE:      tape %s was written with key %s; new files are encrypted with key %s, so both keys are needed to read the tape\n",
 				name, strings.Join(rec.Encryption.Keys, ", "), k)
 		}
@@ -84,15 +85,6 @@ func recordEncryption(cat *catalog.Catalog, id string, st *drive.EncryptionStatu
 	if err := cat.RecordDriveEncryption(id, st.KeyName()); err != nil {
 		fmt.Fprintf(stderr, "tapemgr: recording encryption of tape %s in the catalog: %v\n", id, err)
 	}
-}
-
-func containsString(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }
 
 var keyPrefixPattern = regexp.MustCompile(`^[A-Za-z0-9]{3}$`)

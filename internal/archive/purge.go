@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -9,7 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -153,7 +154,7 @@ func PlanPurge(opts PurgeOptions) (*PurgePlan, error) {
 	for t := range tapes {
 		plan.Tapes = append(plan.Tapes, t)
 	}
-	sort.Strings(plan.Tapes)
+	slices.Sort(plan.Tapes)
 	return plan, nil
 }
 
@@ -204,11 +205,11 @@ func purgeCheck(f job, hits []catalog.Hit, byLocation map[string]catalog.Hit, co
 		sum = content.Entry.SHA256
 		tapes = append(tapes, tapeLabel(content.Tape))
 		if len(tapes) >= copies {
-			sort.Strings(tapes)
+			slices.Sort(tapes)
 			return tapes, sum, ""
 		}
 	}
-	sort.Strings(tapes)
+	slices.Sort(tapes)
 	if len(tapes) > 0 {
 		return nil, "", fmt.Sprintf("only %d of %d required verified copies (%s)", len(tapes), copies, strings.Join(tapes, ", "))
 	}
@@ -282,7 +283,7 @@ func (p *PurgePlan) Execute(log io.Writer) (deleted int, err error) {
 	for d := range dirs {
 		list = append(list, d)
 	}
-	sort.Slice(list, func(i, j int) bool { return len(list[i]) > len(list[j]) })
+	slices.SortFunc(list, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
 	for _, d := range list {
 		if err := root.Remove(d); err != nil && !isNotEmpty(err) && !errors.Is(err, os.ErrNotExist) {
 			return deleted, err

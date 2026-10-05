@@ -268,8 +268,7 @@ func TestWriteSegmentLeftoversAndParityFailure(t *testing.T) {
 	}
 	e2 := []Entry{{Path: "b", Size: 1, SHA256: sha("b")}}
 	err := tp.WriteSegment(Segment{Entries: e2, Parity: []Parity{p}, ParityData: failReader{}}, append(e, e2...))
-	var pe *ParityError
-	if !errors.As(err, &pe) {
+	if _, ok := errors.AsType[*ParityError](err); !ok {
 		t.Fatalf("err = %v", err)
 	}
 	entries, err := tp.Entries()

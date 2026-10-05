@@ -57,7 +57,7 @@ func TestReadOnly(t *testing.T) {
 	if err != nil {
 		t.Skip(err)
 	}
-	for _, line := range strings.Split(string(b), "\n") {
+	for line := range strings.SplitSeq(string(b), "\n") {
 		f := strings.Fields(line)
 		if len(f) < 4 || !slices.Contains(strings.Split(f[3], ","), "ro") || strings.Contains(f[1], `\`) {
 			continue

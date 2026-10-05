@@ -162,12 +162,12 @@ an interrupted save can leave the drive unusable.
 	}
 	d.Close()
 	d = nil
-	var fe *drive.FirmwareError
+	fe, isFE := errors.AsType[*drive.FirmwareError](err)
 	switch {
-	case errors.As(err, &fe) && fe.Offset+chunk < len(image):
+	case isFE && fe.Offset+chunk < len(image):
 		fmt.Fprintf(stderr, "tapemgr: %v\nThe image was not complete, so the drive keeps its current firmware. Check the cable and the file, then try again.\n", err)
 		return exitFailure
-	case fe != nil:
+	case isFE:
 		// The last piece failed: the drive may still have saved it.
 		fmt.Fprintf(stderr, "tapemgr: %v\nWaiting for the drive to find out whether it took the update.\n", err)
 	case err != nil:

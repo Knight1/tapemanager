@@ -282,8 +282,7 @@ func restoreFile(tape *manifest.Tape, dest *os.Root, noClobber bool, e manifest.
 func decryptRestored(dest *os.Root, rel string, src io.ReaderAt, size int64, e manifest.Entry, ids []age.Identity) (string, error) {
 	r, err := age.Decrypt(io.NewSectionReader(src, 0, size), ids...)
 	if err != nil {
-		var none *age.NoIdentityMatchError
-		if errors.As(err, &none) {
+		if _, ok := errors.AsType[*age.NoIdentityMatchError](err); ok {
 			return "", fmt.Errorf("none of the given keys can decrypt it; it was encrypted to: %s", strings.Join(e.Age.Recipients, ", "))
 		}
 		return "", fmt.Errorf("decrypting: %w", err)

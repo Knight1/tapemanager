@@ -1,13 +1,14 @@
 package archive
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -198,7 +199,7 @@ func Verify(opts VerifyOptions) (res VerifyResult, err error) {
 // every parity shard against its hash. It returns a description of each
 // file whose parity is damaged.
 func verifyParity(tape *manifest.Tape, seg int, list []manifest.Parity, progOut io.Writer) []string {
-	sort.Slice(list, func(i, j int) bool { return list[i].Offset < list[j].Offset })
+	slices.SortFunc(list, func(a, b manifest.Parity) int { return cmp.Compare(a.Offset, b.Offset) })
 	f, err := tape.OpenParity(seg)
 	if err != nil {
 		return []string{fmt.Sprintf("parity data of segment %d: %v", seg, err)}

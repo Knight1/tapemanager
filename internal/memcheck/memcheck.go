@@ -77,7 +77,7 @@ func cgroupDirs() []string {
 		return nil
 	}
 	var rel string
-	for _, line := range strings.Split(string(b), "\n") {
+	for line := range strings.SplitSeq(string(b), "\n") {
 		if p, ok := strings.CutPrefix(line, "0::"); ok {
 			rel = p
 		}

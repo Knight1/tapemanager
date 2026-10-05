@@ -80,8 +80,7 @@ func TestUpdateFirmwareInterrupted(t *testing.T) {
 	img := image(1 << 20)
 	f.ImageSize, f.NewRevision, f.FailAt = len(img), "F1A0", 512<<10
 	err := drive.UpdateFirmware(f, img, 256<<10, nil)
-	var fe *drive.FirmwareError
-	if !errors.As(err, &fe) || fe.Offset != 512<<10 {
+	if fe, ok := errors.AsType[*drive.FirmwareError](err); !ok || fe.Offset != 512<<10 {
 		t.Fatalf("%v", err)
 	}
 	if q, _ := drive.ReadInquiry(f); q.Revision != "E6R3" {

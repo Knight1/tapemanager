@@ -1,13 +1,14 @@
 package archive
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -140,12 +141,18 @@ func Recover(opts RecoverOptions) (res RecoverResult, err error) {
 	if err != nil {
 		return res, err
 	}
-	sort.SliceStable(orphans, func(i, j int) bool {
-		a, b := orphans[i], orphans[j]
-		if a.known != b.known {
-			return a.known
+	// Files with a known start block first, in tape order; the others
+	// keep their (lexical) order.
+	slices.SortStableFunc(orphans, func(a, b orphan) int {
+		switch {
+		case a.known != b.known && a.known:
+			return -1
+		case a.known != b.known:
+			return 1
+		case a.known:
+			return cmp.Compare(a.block, b.block)
 		}
-		return a.known && a.block < b.block
+		return 0
 	})
 
 	var batch []manifest.Entry

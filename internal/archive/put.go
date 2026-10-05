@@ -328,8 +328,7 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		all := append(existing[:len(existing):len(existing)], entries...)
 		seg := manifest.Segment{Entries: entries, Chunks: chunks, Parity: pars, ParityData: hookReader{io.MultiReader(parityData...)}}
 		if err := tape.WriteSegment(seg, all); err != nil {
-			var pe *manifest.ParityError
-			if !errors.As(err, &pe) {
+			if _, ok := errors.AsType[*manifest.ParityError](err); !ok {
 				return fmt.Errorf("writing manifest segment: %w", err)
 			}
 			// The files are recorded; only their parity is missing.
@@ -1468,8 +1467,7 @@ func pickResumePoint(root *os.Root, partial string, points []resumePoint, size, 
 	}
 	defer f.Close()
 
-	for i := len(points) - 1; i >= 0; i-- {
-		p := points[i]
+	for _, p := range slices.Backward(points) {
 		// The journal is a local file but may be damaged; never trust its
 		// offsets for allocations or seeks without checking them.
 		if p.offset <= 0 || p.offset > st.Size() || p.offset > size ||
