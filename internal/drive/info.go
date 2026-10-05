@@ -11,13 +11,20 @@ type Info struct {
 	Path      string
 	Inquiry   Inquiry
 	Serial    string
-	Ready     error      // nil when a cartridge is loaded and ready
-	Cartridge *Cartridge // nil without a cartridge
-	VHF       *VHF       // nil if the drive does not report it
+	Firmware  FirmwareBuild // zero if the drive does not describe it
+	Ready     error         // nil when a cartridge is loaded and ready
+	Cartridge *Cartridge    // nil without a cartridge
+	VHF       *VHF          // nil if the drive does not report it
 	Alerts    []Alert
 	// Error counters of the drive since it was powered on or the cartridge
 	// was loaded, depending on the drive. nil if not reported.
 	WriteErrors, ReadErrors *ErrorCounters
+	Stats                   *DriveStats       // lifetime statistics, nil if not reported
+	Compression             *Compression      // since the cartridge was loaded, nil if not reported
+	NonMediumErrors         Count             // errors not caused by the tape, such as interface errors
+	CleaningRequired        bool              // sequential access page: cleaning action required
+	ErrorLog                []LogEntry        // the drive\'s error history (used slots)
+	ErrorLogSlots           int               // 0 if the drive keeps no such log
 	Encryption              *EncryptionStatus // nil if the drive has no encryption
 	Algorithms              []Algorithm
 	Problems                []string // information that could not be read
@@ -36,23 +43,15 @@ type Cartridge struct {
 	Partitions      []Capacity
 	WrittenMiB      uint64 // over the cartridge's life
 	ReadMiB         uint64
-	Application     string // software that last formatted it, e.g. "IBM LTFS 2.4.9.0"
-	LTFSVolume      string // LTFS volume UUID from the volume coherency info
-	Errors          *VolumeErrors
+	Application     string       // software that last formatted it, e.g. "IBM LTFS 2.4.9.0"
+	LTFSVolume      string       // LTFS volume UUID from the volume coherency info
+	Stats           *VolumeStats // nil if the drive does not report them
+	WriteProtected  bool
 }
 
 // Capacity of one partition in MiB.
 type Capacity struct {
 	RemainingMiB, MaximumMiB uint64
-}
-
-// VolumeErrors are the error counts the drive keeps for the cartridge in
-// the volume statistics log page (SSC-4).
-type VolumeErrors struct {
-	WriteRetries, WriteUnrecovered uint64 // over the cartridge's life
-	ReadRetries, ReadUnrecovered   uint64
-	// Unrecovered errors during the last mount of the cartridge.
-	LastMountWriteUnrecovered, LastMountReadUnrecovered uint64
 }
 
 var densityNames = map[byte]string{
@@ -79,6 +78,9 @@ func Gather(d Device) (*Info, error) {
 	if info.Serial, err = ReadSerial(d); err != nil {
 		problem("serial number", err)
 	}
+	if fb, err := ReadFirmwareBuild(d, q); err == nil {
+		info.Firmware = fb
+	}
 	info.Ready = TestUnitReady(d)
 
 	if lp, err := ReadLogPage(d, PageDeviceStatus); err == nil {
@@ -94,6 +96,33 @@ func Gather(d Device) (*Info, error) {
 		info.Alerts = parseTapeAlerts(lp)
 	} else if !errors.Is(err, ErrUnsupported) {
 		problem("TapeAlert", err)
+	}
+	if lp, err := ReadLogPage(d, PageDeviceStats); err == nil {
+		info.Stats = parseDriveStats(lp)
+	} else if !errors.Is(err, ErrUnsupported) {
+		problem("device statistics", err)
+	}
+	if lp, err := ReadLogPage(d, PageCompression); err == nil {
+		info.Compression = parseCompression(lp)
+	} else if !errors.Is(err, ErrUnsupported) {
+		problem("compression statistics", err)
+	}
+	if lp, err := ReadLogPage(d, PageNonMediumErrors); err == nil {
+		info.NonMediumErrors = count(lp, 0x0000)
+	} else if !errors.Is(err, ErrUnsupported) {
+		problem("non-medium errors", err)
+	}
+	if lp, err := ReadLogPage(d, PageSequential); err == nil {
+		if v, ok := lp.Uint(0x0100); ok && v != 0 {
+			info.CleaningRequired = true
+		}
+	} else if !errors.Is(err, ErrUnsupported) {
+		problem("sequential access statistics", err)
+	}
+	if entries, slots, err := ReadErrorLog(d); err == nil {
+		info.ErrorLog, info.ErrorLogSlots = entries, slots
+	} else if !errors.Is(err, ErrUnsupported) {
+		problem("error log", err)
 	}
 	for _, c := range []struct {
 		page byte
@@ -170,6 +199,9 @@ func readCartridge(d Device) (*Cartridge, error) {
 	if v, ok := a[AttrVolumeCoherency]; ok {
 		c.LTFSVolume = parseCoherencyUUID(v.Value)
 	}
+	if wp, err := WriteProtected(d); err == nil {
+		c.WriteProtected = wp
+	}
 	c.Partitions = append(c.Partitions, capacityOf(a))
 	// LTFS uses two partitions: a small index partition and the data
 	// partition. A single-partition cartridge rejects partition 1.
@@ -179,7 +211,7 @@ func readCartridge(d Device) (*Cartridge, error) {
 		}
 	}
 	if lp, err := ReadLogPage(d, PageVolumeStats); err == nil {
-		c.Errors = parseVolumeErrors(lp)
+		c.Stats = parseVolumeStats(lp)
 	}
 	return c, nil
 }
@@ -234,21 +266,6 @@ func parseCoherencyUUID(b []byte) string {
 	return ""
 }
 
-func parseVolumeErrors(lp LogPage) *VolumeErrors {
-	get := func(code uint16) uint64 { v, _ := lp.Uint(code); return v }
-	if _, ok := lp.Get(0x0003); !ok {
-		return nil
-	}
-	return &VolumeErrors{
-		WriteRetries:              get(0x0003),
-		WriteUnrecovered:          get(0x0004),
-		ReadRetries:               get(0x0008),
-		ReadUnrecovered:           get(0x0009),
-		LastMountWriteUnrecovered: get(0x000C),
-		LastMountReadUnrecovered:  get(0x000D),
-	}
-}
-
 // Warnings lists conditions that need attention: cleaning requests,
 // TapeAlert flags of warning or critical severity, and errors the drive
 // could not correct.
@@ -272,10 +289,30 @@ func (in *Info) Warnings() []string {
 	if in.ReadErrors != nil && in.ReadErrors.Uncorrected > 0 {
 		w = append(w, fmt.Sprintf("drive reports %d uncorrected read errors", in.ReadErrors.Uncorrected))
 	}
-	if c := in.Cartridge; c != nil && c.Errors != nil {
-		e := c.Errors
-		if e.WriteUnrecovered > 0 || e.ReadUnrecovered > 0 {
-			w = append(w, fmt.Sprintf("cartridge has had %d unrecovered write and %d unrecovered read errors over its life; verify it and consider copying it", e.WriteUnrecovered, e.ReadUnrecovered))
+	if in.CleaningRequired && (in.VHF == nil || !in.VHF.CleanRequired) {
+		w = append(w, "drive reports that cleaning is required; load a cleaning cartridge")
+	}
+	if in.Stats != nil && in.Stats.TemperatureExceeded {
+		w = append(w, "drive mechanism has exceeded its maximum recommended temperature; check cooling")
+	}
+	if c := in.Cartridge; c != nil && c.Serial != "" {
+		n := 0
+		for _, e := range in.ErrorLog {
+			if e.MediumID == c.Serial && e.Key == SenseMediumError {
+				n++
+			}
+		}
+		if n > 0 {
+			w = append(w, fmt.Sprintf("the drive's error log has %d medium error(s) for the loaded cartridge; verify it and copy what you need", n))
+		}
+	}
+	if c := in.Cartridge; c != nil && c.Stats != nil {
+		e := c.Stats
+		if e.WriteUnrecovered.N > 0 || e.ReadUnrecovered.N > 0 {
+			w = append(w, fmt.Sprintf("tape has had %d unrecovered write and %d unrecovered read errors over its life; verify it and consider copying it", e.WriteUnrecovered.N, e.ReadUnrecovered.N))
+		}
+		if e.TemperatureExceeded {
+			w = append(w, "tape has exceeded its maximum recommended temperature")
 		}
 	}
 	return w

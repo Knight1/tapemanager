@@ -36,9 +36,11 @@ Usage:
   tapemgr catalog retire [--undo] <tape>   stop counting a lost or failing tape as a copy
   tapemgr drive list                       list attached tape drives
   tapemgr drive info [flags]               show drive, cartridge, error counters and TapeAlert flags
+  tapemgr drive log [flags]                show and analyze the drive's error history
   tapemgr drive check [flags]              exit 1 if the drive needs cleaning or reports errors
   tapemgr drive load [flags]               load the inserted cartridge
   tapemgr drive eject [flags]              rewind and eject the cartridge (refused while mounted)
+  tapemgr drive firmware --file IMAGE      update the drive's firmware (asks for confirmation)
   tapemgr drive keygen --out FILE          add a new key to an LTFS key file for drive encryption
   tapemgr version
 
@@ -82,6 +84,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		"drive list":      cmdDriveList,
 		"drive info":      cmdDriveInfo,
 		"drive check":     cmdDriveCheck,
+		"drive log":       cmdDriveLog,
 		"drive load":      cmdDriveLoad,
 		"drive eject":     cmdDriveEject,
 		"drive keygen":    cmdDriveKeygen,
@@ -89,6 +92,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) >= 2 {
 		if args[0] == "archive" && args[1] == "purge-source" {
 			return cmdPurge(args[2:], stdin, stdout, stderr)
+		}
+		if args[0] == "drive" && args[1] == "firmware" {
+			return cmdDriveFirmware(args[2:], stdin, stdout, stderr)
 		}
 		if fn, ok := cmds[args[0]+" "+args[1]]; ok {
 			return fn(args[2:], stdout, stderr)

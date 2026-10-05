@@ -1,5 +1,6 @@
 // Package drivetest provides a fake tape drive for tests. Its responses are
-// modeled on an IBM ULT3580-HH6 (LTO-6) with an LTFS cartridge loaded.
+// modeled on an IBM ULT3580-HH6 (LTO-6) with an LTFS cartridge loaded; all
+// identifiers and counters are made up.
 package drivetest
 
 import (
@@ -18,13 +19,26 @@ type Fake struct {
 	Alerts         []int  // active TapeAlert flags
 	WriteUncorr    uint64 // uncorrected write errors (log page 0x02)
 	ReadUncorr     uint64
-	VolumeReadErrs uint64 // unrecovered read errors over the cartridge's life
-	PreventRemoval bool   // unload fails like a drive locked by LTFS
-	WriteProtect   bool   // cartridge write protected
-	Encrypting     bool   // drive encryption on, as after an LTFS mount with a key
-	KeyID          []byte // key ID reported while encrypting
-	NoEncryption   bool   // drive without encryption support
-	DeviceType     byte   // INQUIRY device type, 1 (tape) unless set
+	VolumeReadErrs uint64   // unrecovered read errors over the cartridge's life
+	PreventRemoval bool     // unload fails like a drive locked by LTFS
+	WriteProtect   bool     // cartridge write protected
+	Encrypting     bool     // drive encryption on, as after an LTFS mount with a key
+	KeyID          []byte   // key ID reported while encrypting
+	NoEncryption   bool     // drive without encryption support
+	ErrorLog       [][]byte // tape diagnostic entries (68 bytes each), 12 slots in total
+	NoErrorLog     bool     // drive without the tape diagnostic data page
+
+	// Firmware: the drive reports Revision (E6R3 unless set). A download
+	// of ImageSize bytes is activated as NewRevision; Received collects it.
+	Revision       string
+	ImageSize      int
+	NewRevision    string
+	BufferCapacity int // 5 MiB unless set
+	Boundary       byte
+	Received       []byte
+	Downloads      int  // WRITE BUFFER commands
+	FailAt         int  // fail the WRITE BUFFER at this offset, if > 0
+	DeviceType     byte // INQUIRY device type, 1 (tape) unless set
 	LTFSUUID       string
 	// Fail makes commands with this operation code fail with the given
 	// sense key and code.
@@ -37,7 +51,7 @@ type Fake struct {
 
 // New returns a fake drive with a cartridge loaded.
 func New() *Fake {
-	return &Fake{DevPath: "/dev/sg9", DeviceType: 1, LTFSUUID: "608239c8-5f70-457c-99d4-8a4608c38a4e"}
+	return &Fake{DevPath: "/dev/sg9", DeviceType: 1, LTFSUUID: "00000000-0000-4000-8000-000000000001"}
 }
 
 func (f *Fake) Path() string { return f.DevPath }
@@ -65,9 +79,15 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 		if cdb[1]&1 == 0 {
 			resp = make([]byte, 70)
 			resp[0] = f.DeviceType
-			copy(resp[8:], "IBM     ULT3580-HH6     E6R3")
+			rev := f.Revision
+			if rev == "" {
+				rev = "E6R3"
+			}
+			copy(resp[8:], "IBM     ULT3580-HH6     "+rev)
+		} else if cdb[2] == 0xC0 {
+			resp = append([]byte{1, 0xC0, 0, 0x27}, "LTO6_E6R3   130808\x0020140808sas_hh      "...)
 		} else if cdb[2] == 0x80 {
-			resp = append([]byte{1, 0x80, 0, 10}, "1068035960"...)
+			resp = append([]byte{1, 0x80, 0, 10}, "0000000001"...)
 		} else {
 			return 0, check(op, drive.SenseIllegalRequest, 0x24, 0)
 		}
@@ -81,6 +101,30 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 			return 0, check(op, drive.SenseNotReady, 0x3A, 0)
 		}
 		resp = f.attributes(cdb[7])
+	case 0x3C: // READ BUFFER
+		if cdb[1] != 0x03 || cdb[2] != 0 {
+			return 0, check(op, drive.SenseIllegalRequest, 0x24, 0)
+		}
+		c := f.BufferCapacity
+		if c == 0 {
+			c = 5 << 20
+		}
+		resp = []byte{f.Boundary, byte(c >> 16), byte(c >> 8), byte(c)}
+	case 0x3B: // WRITE BUFFER, download microcode with offsets and save
+		f.Downloads++
+		off := int(cdb[3])<<16 | int(cdb[4])<<8 | int(cdb[5])
+		n := int(cdb[6])<<16 | int(cdb[7])<<8 | int(cdb[8])
+		if cdb[1] != 0x07 || cdb[2] != 0 || n != len(buf) || off != len(f.Received) || off%(1<<f.Boundary) != 0 {
+			return 0, check(op, drive.SenseIllegalRequest, 0x24, 0)
+		}
+		if f.FailAt > 0 && off >= f.FailAt {
+			return 0, check(op, drive.SenseHardwareError, 0x44, 0)
+		}
+		f.Received = append(f.Received, buf...)
+		if len(f.Received) == f.ImageSize && f.NewRevision != "" {
+			f.Revision = f.NewRevision
+		}
+		return 0, nil
 	case 0xA2: // SECURITY PROTOCOL IN, tape data encryption
 		if f.NoEncryption || cdb[1] != 0x20 {
 			return 0, check(op, drive.SenseIllegalRequest, 0x24, 0)
@@ -174,7 +218,39 @@ func (f *Fake) logPage(code byte) []byte {
 		if f.NoMedium {
 			return nil
 		}
-		return page(code, param(1, u32(2)), param(3, u32(1)), param(4, u32(0)), param(8, u32(0)), param(9, u32(f.VolumeReadErrs)))
+		return page(code, param(1, u32(3)), param(3, u32(1)), param(4, u32(0)), param(8, u32(0)), param(9, u32(f.VolumeReadErrs)),
+			param(0x0c, u32(0)), param(0x0d, u32(0)), param(0x0e, u32(20)), param(0x0f, u32(30)),
+			param(0x16, u32(2500000)), param(0x17, u32(10)), param(0x82, []byte{0}), param(0x101, u32(40)))
+	case drive.PageDiagnostics:
+		if f.NoErrorLog {
+			return nil
+		}
+		var params [][]byte
+		for i := range 12 {
+			v := make([]byte, 68)
+			if i < len(f.ErrorLog) {
+				copy(v, f.ErrorLog[i])
+			}
+			params = append(params, param(uint16(i), v))
+		}
+		return page(code, params...)
+	case drive.PageNonMediumErrors:
+		return page(code, param(0, u32(0)))
+	case drive.PageSequential:
+		v := uint64(0)
+		if f.CleanRequired {
+			v = 1
+		}
+		return page(code, param(0, u32(6000)), param(1, u32(2400)), param(0x100, u32(v)))
+	case drive.PageDeviceStats: // made-up values
+		hours := []byte{0, 0, 0x58, 0x58, 0, 0, 0, 0, 0, 0, 0x5a, 0x68, 0, 0, 0x13, 0x88}
+		return page(code, param(0, u32(1000)), param(1, u32(30)), param(2, u32(40000)), param(3, u32(5000)),
+			param(4, u32(60000000)), param(8, u32(100)), param(0x0c, u32(20)), param(0x0e, u32(0)),
+			param(0x0f, u32(1)), param(0x81, []byte{0}), param(0x1000, hours))
+	case drive.PageCompression:
+		return page(code, param(0, u32(120)), param(1, u32(250)), param(2, u32(0)), param(3, u32(3000)),
+			param(4, u32(0)), param(5, u32(2500)), param(6, u32(0)), param(7, u32(6000)), param(8, u32(0)),
+			param(9, u32(2400)), param(0x100, []byte{1}))
 	}
 	return nil
 }
@@ -208,15 +284,15 @@ func (f *Fake) attributes(partition byte) []byte {
 		coherency = append(coherency, byte(len(acsi)>>8), byte(len(acsi)))
 		coherency = append(coherency, acsi...)
 		list = append(list,
-			attr(0x0000, 0, u64(35050)),
-			attr(0x0001, 0, u64(35060)),
-			attr(0x0003, 0, u64(2)),
-			attr(0x0220, 0, u64(18)),
-			attr(0x0221, 0, u64(25)),
+			attr(0x0000, 0, u64(35000)),
+			attr(0x0001, 0, u64(35010)),
+			attr(0x0003, 0, u64(3)),
+			attr(0x0220, 0, u64(20)),
+			attr(0x0221, 0, u64(30)),
 			attr(0x0400, 1, pad("QUANTUM", 8)),
-			attr(0x0401, 1, pad("6220913053", 32)),
+			attr(0x0401, 1, pad("0000000002", 32)),
 			attr(0x0405, 0, []byte{0x5A}),
-			attr(0x0406, 1, []byte("20220913")),
+			attr(0x0406, 1, []byte("20200101")),
 			attr(0x0408, 0, []byte{0}),
 			attr(0x0800, 1, pad("IBM", 8)),
 			attr(0x0801, 1, pad("LTFS", 32)),
@@ -225,7 +301,7 @@ func (f *Fake) attributes(partition byte) []byte {
 			attr(0x080C, 0, coherency),
 		)
 	} else {
-		list = append(list, attr(0x0000, 0, u64(2314049)), attr(0x0001, 0, u64(2314062)))
+		list = append(list, attr(0x0000, 0, u64(2300000)), attr(0x0001, 0, u64(2300010)))
 	}
 	b := make([]byte, 4)
 	for _, a := range list {
@@ -261,4 +337,23 @@ func (f *Fake) securityPage(code uint16) []byte {
 	binary.BigEndian.PutUint16(b, code)
 	binary.BigEndian.PutUint16(b[2:], uint16(len(body)))
 	return append(b, body...)
+}
+
+// DiagEntry builds a tape diagnostic data entry like the IBM drive writes.
+func DiagEntry(key, asc, ascq byte, repeated bool, firmware, medium string, op byte, ms uint64) []byte {
+	b := make([]byte, 68)
+	b[2], b[3] = 0x5a, 0x68
+	b[9] = key
+	if repeated {
+		b[9] |= 0x80
+	}
+	b[10], b[11] = asc, ascq
+	binary.BigEndian.PutUint32(b[12:], 0x0badc0de)
+	copy(b[16:20], firmware)
+	b[24] = op
+	copy(b[28:60], pad(medium, 32))
+	for i := range 6 {
+		b[67-i] = byte(ms >> (8 * i))
+	}
+	return b
 }

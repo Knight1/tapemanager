@@ -6,15 +6,16 @@ import (
 	"time"
 )
 
-// Data encryption capabilities of an IBM ULT3580-HH6 with an LTO-6 cartridge.
-const realEncCapabilities = `00 10 00 58 09 00 00 00 00 00 00 00 00 00 00 00
+// Data encryption capabilities as an IBM ULT3580-HH6 reports them with an
+// LTO-6 cartridge (no identifiers in this page).
+const sampleEncCapabilities = `00 10 00 58 09 00 00 00 00 00 00 00 00 00 00 00
 	00 00 00 00 01 00 00 14 3a 34 00 20 00 0c 00 20 eb 00 00 00 00 00 00 00
 	00 01 00 14 02 00 00 14 3a 3c 00 20 00 3c 00 20 eb 00 00 00 00 00 00 00
 	00 01 00 14 03 00 00 14 ba 3c 00 20 00 3c 00 20 eb 00 00 00 00 00 00 00
 	00 01 00 14`
 
 func TestParseAlgorithmsReal(t *testing.T) {
-	algs := parseAlgorithms(unhex(t, realEncCapabilities))
+	algs := parseAlgorithms(unhex(t, sampleEncCapabilities))
 	if len(algs) != 3 {
 		t.Fatalf("%+v", algs)
 	}
@@ -31,7 +32,7 @@ func TestParseAlgorithmsReal(t *testing.T) {
 		t.Fatal("unknown algorithm name")
 	}
 	// Torn or undersized descriptors stop parsing.
-	b := unhex(t, realEncCapabilities)
+	b := unhex(t, sampleEncCapabilities)
 	if got := parseAlgorithms(b[:50]); len(got) != 1 {
 		t.Fatalf("torn: %+v", got)
 	}
@@ -106,7 +107,7 @@ func TestReadSecurityPageChecks(t *testing.T) {
 }
 
 func FuzzParseEncryption(f *testing.F) {
-	f.Add(unhex(f, realEncCapabilities))
+	f.Add(unhex(f, sampleEncCapabilities))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		parseAlgorithms(b)
 		if s, err := parseEncryptionStatus(b); err == nil {

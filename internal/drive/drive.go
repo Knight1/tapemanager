@@ -117,6 +117,18 @@ func ascText(asc, ascq byte) string {
 		return "load needed"
 	case 0x0412:
 		return "drive offline"
+	case 0x0300:
+		return "write fault"
+	case 0x0900:
+		return "track following error"
+	case 0x0C00:
+		return "write error"
+	case 0x1100:
+		return "unrecovered read error"
+	case 0x1400:
+		return "recorded data not found"
+	case 0x1500:
+		return "positioning error"
 	case 0x2000:
 		return "invalid command"
 	case 0x2400:
@@ -133,8 +145,18 @@ func ascText(asc, ascq byte) string {
 		return "incompatible cartridge"
 	case 0x3003:
 		return "cleaning cartridge installed"
+	case 0x3100:
+		return "medium format corrupted"
 	case 0x3A00:
 		return "no cartridge"
+	case 0x3B00:
+		return "sequential positioning error"
+	case 0x5100:
+		return "erase failure"
+	case 0x5200:
+		return "cartridge fault"
+	case 0x5300:
+		return "cartridge load or eject failed"
 	case 0x3B0E:
 		return "medium source element empty"
 	case 0x4400:

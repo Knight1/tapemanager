@@ -82,15 +82,24 @@ func TestCLIDriveInfo(t *testing.T) {
 		t.Fatalf("%d %s", code, errOut)
 	}
 	for _, want := range []string{
-		"IBM ULT3580-HH6, firmware E6R3, serial 1068035960 (/dev/sg9)",
-		"Status:      ready, idle",
-		"Cleaning:    REQUESTED",
-		"LTO-6 data, serial 6220913053, barcode -, QUANTUM, made 2022-09-13",
+		"IBM ULT3580-HH6, firmware E6R3, serial 0000000001 (/dev/sg9)",
+		"Firmware:      LTO6_E6R3, built 2014-08-08 13:08:08, sas_hh",
+		"Status:        ready, idle",
+		"Cleaning:      REQUESTED; 30 cleanings so far, 100 tape hours since the last one",
+		"Compression:   on; since the cartridge was loaded: written 2.50:1",
+		"Powered on:    40000 hours (4.6 years), 20 power cycles",
+		"1000 cartridge loads, 5000 hours of tape motion, 60000 km of tape",
+		"tape motion by cartridge type: LTO-6 5000 h",
+		"lifetime: 0 hard write errors, 1 hard read error; 0 non-medium errors",
+		"LTO-6 data, serial 0000000002, barcode -, QUANTUM, made 2020-01-01",
+		"Write protect: no",
 		"partition 1: 2.2 TiB free of 2.2 TiB",
-		"Formatted:   IBM LTFS 2.4.9.0",
+		"Formatted by:  IBM LTFS 2.4.9.0",
 		"catalog tape " + vol.ID,
-		"TapeAlert:   20 (critical)",
-		"WARNING:     drive requests cleaning",
+		"Lifetime use:  3 loads, 3 mounts, 40 full passes",
+		"20.0 MiB over its life, 20 MB during the last mount",
+		"TapeAlert:     20 (critical)",
+		"WARNING:  drive requests cleaning",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in\n%s", want, out)
@@ -98,6 +107,21 @@ func TestCLIDriveInfo(t *testing.T) {
 	}
 	if !f.Closed {
 		t.Fatal("device not closed")
+	}
+	// The drive comes first, then the tape, never mixed.
+	drivePart, tapePart, ok := strings.Cut(out, "\nTape\n")
+	if !ok || !strings.HasPrefix(drivePart, "Drive\n") {
+		t.Fatalf("sections:\n%s", out)
+	}
+	for _, d := range []string{"Model:", "Cleaning:", "Compression:", "Powered on:", "TapeAlert:"} {
+		if strings.Contains(tapePart, d) {
+			t.Errorf("%s in the tape section", d)
+		}
+	}
+	for _, c := range []string{"Cartridge:", "Write protect:", "LTFS volume:", "Capacity:", "Written:"} {
+		if strings.Contains(drivePart, c) {
+			t.Errorf("%s in the drive section", c)
+		}
 	}
 
 	// A missing catalog is not created by info.
@@ -112,7 +136,7 @@ func TestCLIDriveInfo(t *testing.T) {
 	f2 := drivetest.New()
 	f2.NoMedium = true
 	useFake(t, f2, fakeFound, nil)
-	if code, out, _ := runCmd(t, "drive", "info", "--catalog", missing); code != 0 || !strings.Contains(out, "no cartridge") || strings.Contains(out, "Cartridge:") {
+	if code, out, _ := runCmd(t, "drive", "info", "--catalog", missing); code != 0 || !strings.Contains(out, "no cartridge loaded") || strings.Contains(out, "Cartridge:") {
 		t.Fatalf("%d %s", code, out)
 	}
 }
@@ -274,5 +298,50 @@ func TestCLIRefusesWriteProtectedTape(t *testing.T) {
 	}
 	if ents, _ := os.ReadDir(tape); len(ents) != 0 {
 		t.Fatalf("tape written: %v", ents)
+	}
+}
+
+func TestCLIDriveLog(t *testing.T) {
+	f := drivetest.New()
+	f.ErrorLog = [][]byte{
+		drivetest.DiagEntry(3, 0x11, 0, false, "E6R3", "0000000002", 0x08, 5*60*1000),
+		drivetest.DiagEntry(3, 0x52, 0, true, "D8E5", "OTHERTAPE1", 0x0A, 0),
+	}
+	useFake(t, f, fakeFound, nil)
+	code, out, _ := runCmd(t, "drive", "log")
+	if code != 0 {
+		t.Fatal(out)
+	}
+	for _, want := range []string{
+		"2 of 12 slots used",
+		"medium error: unrecovered read error",
+		"0000000002, LTO-6 (the loaded cartridge)",
+		"medium error: cartridge fault (repeated)",
+		"During:        write",
+		"Firmware:      D8E5 (now E6R3)",
+		"When:          0h 5m after a power-on",
+		"the loaded cartridge 0000000002 has 1 medium error",
+		"1 entry was recorded with older firmware (D8E5)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in\n%s", want, out)
+		}
+	}
+	_, out, _ = runCmd(t, "drive", "info", "--catalog", t.TempDir())
+	if !strings.Contains(out, "Error log:     2 of 12 slots used; details: tapemgr drive log") ||
+		!strings.Contains(out, "error log has 1 medium error(s) for the loaded cartridge") {
+		t.Fatalf("%s", out)
+	}
+
+	f.ErrorLog = nil
+	if _, out, _ := runCmd(t, "drive", "log"); !strings.Contains(out, "0 of 12 slots used") || !strings.Contains(out, "No errors recorded") {
+		t.Fatal(out)
+	}
+	f.NoErrorLog = true
+	if _, out, _ := runCmd(t, "drive", "log"); !strings.Contains(out, "keeps no error log") {
+		t.Fatal(out)
+	}
+	if _, out, _ := runCmd(t, "drive", "info", "--catalog", t.TempDir()); strings.Contains(out, "Error log:") {
+		t.Fatal("error log line without a log")
 	}
 }

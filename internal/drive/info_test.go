@@ -17,7 +17,7 @@ func TestGather(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Inquiry.Product != "ULT3580-HH6" || info.Serial != "1068035960" || info.Ready != nil || info.Path != f.DevPath {
+	if info.Inquiry.Product != "ULT3580-HH6" || info.Serial != "0000000001" || info.Ready != nil || info.Path != f.DevPath {
 		t.Fatalf("%+v", info)
 	}
 	if info.VHF == nil || !info.VHF.Mounted || info.VHF.CleanRequested {
@@ -27,16 +27,16 @@ func TestGather(t *testing.T) {
 	if c == nil {
 		t.Fatal("no cartridge")
 	}
-	if c.Serial != "6220913053" || c.Format != "LTO-6" || c.Kind != "data" || c.Manufacturer != "QUANTUM" ||
-		c.ManufactureDate != "20220913" || c.LoadCount != 2 || c.WrittenMiB != 18 || c.ReadMiB != 25 ||
+	if c.Serial != "0000000002" || c.Format != "LTO-6" || c.Kind != "data" || c.Manufacturer != "QUANTUM" ||
+		c.ManufactureDate != "20200101" || c.LoadCount != 3 || c.WrittenMiB != 20 || c.ReadMiB != 30 ||
 		c.Application != "IBM LTFS 2.4.9.0" || c.LTFSVolume != f.LTFSUUID || c.Barcode != "" {
 		t.Fatalf("%+v", c)
 	}
-	if len(c.Partitions) != 2 || c.Partitions[1].MaximumMiB != 2314062 || c.Partitions[0].RemainingMiB != 35050 {
+	if len(c.Partitions) != 2 || c.Partitions[1].MaximumMiB != 2300010 || c.Partitions[0].RemainingMiB != 35000 {
 		t.Fatalf("%+v", c.Partitions)
 	}
-	if c.Errors == nil || c.Errors.WriteRetries != 1 {
-		t.Fatalf("%+v", c.Errors)
+	if c.Stats == nil || c.Stats.WriteRetries.N != 1 || !c.Stats.WriteRetries.OK {
+		t.Fatalf("%+v", c.Stats)
 	}
 	if info.WriteErrors == nil || info.WriteErrors.Corrected != 1 || info.ReadErrors == nil {
 		t.Fatalf("%+v %+v", info.WriteErrors, info.ReadErrors)
@@ -116,7 +116,7 @@ func TestGatherDegrades(t *testing.T) {
 	}
 	f.Fail[0x4D] = &drive.CommandError{Op: 0x4D, Status: 2, Key: drive.SenseHardwareError}
 	info, _ = drive.Gather(f)
-	if len(info.Problems) != 4 {
+	if len(info.Problems) != 9 {
 		t.Fatalf("%v", info.Problems)
 	}
 }

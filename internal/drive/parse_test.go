@@ -16,19 +16,18 @@ func unhex(t testing.TB, s string) []byte {
 	return b
 }
 
-// Responses captured from an IBM ULT3580-HH6 (LTO-6, firmware E6R3).
+// Response layouts of an IBM ULT3580-HH6 (LTO-6, firmware E6R3), with
+// identifiers and counters replaced by made-up values.
 const (
-	realWriteErrors = `02 00 00 4c 00 00 40 04 00 00 00 00 00 01 40 04
-		00 00 00 00 00 02 40 04 00 00 00 00 00 03 40 04 00 00 00 01 00 04 40 04
-		00 00 00 01 00 05 40 04 00 00 00 06 00 06 40 04 00 00 00 00 80 00 40 08
+	sampleWriteErrors = `02 00 00 4c 00 00 40 04 00 00 00 00 00 01 40 04
+		00 00 00 00 00 02 40 04 00 00 00 00 00 03 40 04 00 00 00 02 00 04 40 04
+		00 00 00 02 00 05 40 04 00 00 00 09 00 06 40 04 00 00 00 00 80 00 40 08
 		00 00 00 00 00 00 00 00 80 01 40 04 00 00 00 00`
-	realDeviceStatus = `11 00 00 2c 00 00 43 04 b1 17 00 02 00 01 43 02 01 f4
+	sampleDeviceStatus = `11 00 00 2c 00 00 43 04 b1 17 00 02 00 01 43 02 01 f4
 		00 02 43 08 00 00 00 00 00 00 00 00 00 03 43 0c 00 00 00 00 00 00 00 00
 		00 00 00 00`
-	realCoherency = `08 00 00 00 00 00 00 00 09 00 00 00 00 00 00 00 01 00 00
-		00 00 00 00 00 05 00 2b 4c 54 46 53 c0 36 30 38 32 33 39 63 38 2d 35 66
-		37 30 2d 34 35 37 63 2d 39 39 64 34 2d 38 61 34 36 30 38 63 33 38 61 34
-		65 00 01`
+	sampleCoherency = `08 00 00 00 00 00 00 00 09 00 00 00 00 00 00 00 01 00 00
+		00 00 00 00 00 05 00 2b 4c 54 46 53 c0 30 30 30 30 30 30 30 30 2d 30 30 30 30 2d 34 30 30 30 2d 38 30 30 30 2d 30 30 30 30 30 30 30 30 30 30 30 31 00 01`
 )
 
 func TestParseInquiry(t *testing.T) {
@@ -49,13 +48,13 @@ func TestParseInquiry(t *testing.T) {
 }
 
 func TestParseSerial(t *testing.T) {
-	b := append([]byte{1, 0x80, 0, 10}, "1068035960"...)
-	if s, err := parseSerial(b); err != nil || s != "1068035960" {
+	b := append([]byte{1, 0x80, 0, 10}, "0000000001"...)
+	if s, err := parseSerial(b); err != nil || s != "0000000001" {
 		t.Fatalf("%q %v", s, err)
 	}
 	// A page length larger than the data is cut to what was received.
 	b[3] = 200
-	if s, err := parseSerial(b); err != nil || s != "1068035960" {
+	if s, err := parseSerial(b); err != nil || s != "0000000001" {
 		t.Fatalf("%q %v", s, err)
 	}
 	if _, err := parseSerial([]byte{1, 0x83, 0, 0}); err == nil {
@@ -71,7 +70,7 @@ func TestParseSerial(t *testing.T) {
 }
 
 func TestParseLogPageReal(t *testing.T) {
-	lp, err := parseLogPage(unhex(t, realWriteErrors), PageWriteErrors)
+	lp, err := parseLogPage(unhex(t, sampleWriteErrors), PageWriteErrors)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,14 +78,14 @@ func TestParseLogPageReal(t *testing.T) {
 		t.Fatalf("%d params", len(lp))
 	}
 	c := parseErrorCounters(lp)
-	if c.Corrected != 1 || c.Uncorrected != 0 || c.Bytes != 6 || !c.HaveCorrected || !c.HaveUncorr {
+	if c.Corrected != 2 || c.Uncorrected != 0 || c.Bytes != 9 || !c.HaveCorrected || !c.HaveUncorr {
 		t.Fatalf("%+v", c)
 	}
 	if _, ok := lp.Uint(0x7777); ok {
 		t.Fatal("missing parameter found")
 	}
 
-	lp, err = parseLogPage(unhex(t, realDeviceStatus), PageDeviceStatus)
+	lp, err = parseLogPage(unhex(t, sampleDeviceStatus), PageDeviceStatus)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +176,7 @@ func TestParseTapeAlerts(t *testing.T) {
 func TestParseAttributes(t *testing.T) {
 	b := []byte{0, 0, 0, 0,
 		0x04, 0x01, 0x81, 0, 4, 'S', 'N', ' ', ' ',
-		0x00, 0x00, 0x00, 0, 8, 0, 0, 0, 0, 0, 0, 0x88, 0xea,
+		0x00, 0x00, 0x00, 0, 8, 0, 0, 0, 0, 0, 0, 0x88, 0xb8,
 		0x08, 0x06, 0x01, 0, 50, 'x'} // torn: claims 50 bytes
 	b[3] = byte(len(b) - 4)
 	a, err := parseAttributes(b)
@@ -187,7 +186,7 @@ func TestParseAttributes(t *testing.T) {
 	if len(a) != 2 || a.String(AttrSerial) != "SN" || !a[AttrSerial].ReadOnly || a[AttrSerial].Format != 1 {
 		t.Fatalf("%+v", a)
 	}
-	if v, ok := a.Uint(AttrRemainingCapacity); !ok || v != 35050 {
+	if v, ok := a.Uint(AttrRemainingCapacity); !ok || v != 35000 {
 		t.Fatalf("%d %v", v, ok)
 	}
 	if a.String(AttrBarcode) != "" {
@@ -207,8 +206,8 @@ func TestParseAttributes(t *testing.T) {
 }
 
 func TestParseCoherencyUUID(t *testing.T) {
-	b := unhex(t, realCoherency)
-	if u := parseCoherencyUUID(b); u != "608239c8-5f70-457c-99d4-8a4608c38a4e" {
+	b := unhex(t, sampleCoherency)
+	if u := parseCoherencyUUID(b); u != "00000000-0000-4000-8000-000000000001" {
 		t.Fatalf("%q", u)
 	}
 	bad := map[string][]byte{
@@ -279,8 +278,8 @@ func TestCDBs(t *testing.T) {
 }
 
 func FuzzParseLogPage(f *testing.F) {
-	f.Add(unhex(f, realWriteErrors))
-	f.Add(unhex(f, realDeviceStatus))
+	f.Add(unhex(f, sampleWriteErrors))
+	f.Add(unhex(f, sampleDeviceStatus))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		lp, err := parseLogPage(b, 0x02)
 		if err != nil {
@@ -289,13 +288,23 @@ func FuzzParseLogPage(f *testing.F) {
 		parseErrorCounters(lp)
 		parseVHF(lp)
 		parseTapeAlerts(lp)
-		parseVolumeErrors(lp)
+		parseVolumeStats(lp)
+		parseFirmwareBuild(b)
+		if entries, _ := parseErrorLog(lp); len(entries) > 0 {
+			for _, e := range entries {
+				e.Description()
+				e.When()
+			}
+			AnalyzeErrorLog(entries, "x", "y")
+		}
+		parseDriveStats(lp)
+		parseCompression(lp)
 	})
 }
 
 func FuzzParseAttributes(f *testing.F) {
 	f.Add([]byte{0, 0, 0, 9, 0x08, 0x0c, 0, 0, 4, 1, 2, 3, 4})
-	f.Add(unhex(f, realCoherency))
+	f.Add(unhex(f, sampleCoherency))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		parseCoherencyUUID(b)
 		a, err := parseAttributes(b)

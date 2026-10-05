@@ -187,11 +187,11 @@ func TestDriveInfoShowsEncryption(t *testing.T) {
 	f.Encrypting = true
 	f.KeyID = []byte{'T', 'M', 'G', 0, 0, 0, 0, 0, 0, 0, 0, 7}
 	useFake(t, f, fakeFound, nil)
-	if code, out, _ := runCmd(t, "drive", "info", "--catalog", t.TempDir()); code != 0 || !strings.Contains(out, "Encryption:  on, AES-256-GCM, key TMG000000000000000007") {
+	if code, out, _ := runCmd(t, "drive", "info", "--catalog", t.TempDir()); code != 0 || !strings.Contains(out, "Encryption:    on, AES-256-GCM, key TMG000000000000000007") {
 		t.Fatalf("%d %s", code, out)
 	}
 	f.Encrypting = false
-	if _, out, _ := runCmd(t, "drive", "info", "--catalog", t.TempDir()); !strings.Contains(out, "Encryption:  off (drive supports AES-256-GCM for this cartridge)") {
+	if _, out, _ := runCmd(t, "drive", "info", "--catalog", t.TempDir()); !strings.Contains(out, "Encryption:    off (supports AES-256-GCM for the loaded cartridge)") {
 		t.Fatalf("%s", out)
 	}
 }

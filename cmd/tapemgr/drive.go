@@ -172,9 +172,62 @@ func orDash(s string) string {
 	return s
 }
 
+// line prints one labeled line of a section.
+func line(w io.Writer, label, format string, args ...any) {
+	if label != "" {
+		label += ":"
+	}
+	fmt.Fprintf(w, "  %-14s %s\n", label, fmt.Sprintf(format, args...))
+}
+
+// num formats a counter the drive may not report.
+func num(c drive.Count) string {
+	if !c.OK {
+		return "-"
+	}
+	return fmt.Sprint(c.N)
+}
+
+func plural(c drive.Count, one, many string) string {
+	if c.OK && c.N == 1 {
+		return "1 " + one
+	}
+	return num(c) + " " + many
+}
+
+func bytesOf(c drive.Count) string {
+	if !c.OK {
+		return "-"
+	}
+	if c.N > math.MaxInt64 {
+		return fmt.Sprintf("%d bytes", c.N)
+	}
+	return archive.FormatBytes(int64(c.N))
+}
+
+func ratio(c drive.Count) string {
+	if !c.OK {
+		return "-"
+	}
+	return fmt.Sprintf("%d.%02d:1", c.N/100, c.N%100)
+}
+
+// printDriveInfo shows the drive first and the loaded tape second, so
+// what belongs to the drive and what to the cartridge never mixes.
 func printDriveInfo(w io.Writer, info *drive.Info, catalogTape string) {
 	q := info.Inquiry
-	fmt.Fprintf(w, "Drive:       %s %s, firmware %s, serial %s (%s)\n", q.Vendor, q.Product, q.Revision, orDash(info.Serial), info.Path)
+	fmt.Fprintln(w, "Drive")
+	line(w, "Model", "%s %s, firmware %s, serial %s (%s)", q.Vendor, q.Product, q.Revision, orDash(info.Serial), info.Path)
+	if fb := info.Firmware; fb.Name != "" {
+		build := fb.Name
+		if fb.Built != "" {
+			build += ", built " + fb.Built
+		}
+		if fb.Platform != "" {
+			build += ", " + fb.Platform
+		}
+		line(w, "Firmware", "%s", build)
+	}
 
 	status := "ready"
 	switch {
@@ -185,50 +238,81 @@ func printDriveInfo(w io.Writer, info *drive.Info, catalogTape string) {
 	}
 	if v := info.VHF; v != nil {
 		status += ", " + v.ActivityName()
-		if v.WriteProtect {
-			status += ", write protected"
-		}
 	}
-	fmt.Fprintf(w, "Status:      %s\n", status)
+	line(w, "Status", "%s", status)
+
+	clean := ""
 	if v := info.VHF; v != nil {
-		clean := "not needed"
-		if v.CleanRequired {
+		clean = "not needed"
+		if v.CleanRequired || info.CleaningRequired {
 			clean = "REQUIRED"
 		} else if v.CleanRequested {
 			clean = "REQUESTED"
 		}
-		fmt.Fprintf(w, "Cleaning:    %s\n", clean)
+	}
+	if st := info.Stats; st != nil {
+		if clean != "" {
+			clean += "; "
+		}
+		clean += plural(st.Cleanings, "cleaning", "cleanings") + " so far"
+		if st.HoursSinceCleaning.OK {
+			clean += fmt.Sprintf(", %d tape hours since the last one", st.HoursSinceCleaning.N)
+		}
+	}
+	if clean != "" {
+		line(w, "Cleaning", "%s", clean)
 	}
 
-	if c := info.Cartridge; c != nil {
-		date := c.ManufactureDate
-		if len(date) == 8 {
-			date = date[:4] + "-" + date[4:6] + "-" + date[6:]
-		}
-		fmt.Fprintf(w, "Cartridge:   %s %s, serial %s, barcode %s, %s, made %s\n",
-			orDash(c.Format), orDash(c.Kind), orDash(c.Serial), orDash(c.Barcode), orDash(c.Manufacturer), orDash(date))
-		fmt.Fprintf(w, "Loads:       %d\n", c.LoadCount)
-		for i, p := range c.Partitions {
-			label := "Capacity:"
-			if i > 0 {
-				label = ""
+	if e := info.Encryption; e != nil {
+		enc := "off"
+		if e.Encrypting() {
+			enc = "on"
+			if alg := info.EncryptionAlgorithm(); alg != "" {
+				enc += ", " + alg
 			}
-			fmt.Fprintf(w, "%-12s partition %d: %s free of %s\n", label, i, mib(p.RemainingMiB), mib(p.MaximumMiB))
-		}
-		fmt.Fprintf(w, "Lifetime:    %s written, %s read\n", mib(c.WrittenMiB), mib(c.ReadMiB))
-		if c.Application != "" {
-			fmt.Fprintf(w, "Formatted:   %s\n", c.Application)
-		}
-		if c.LTFSVolume != "" {
-			line := c.LTFSVolume
-			if catalogTape != "" {
-				line += ", catalog tape " + catalogTape
+			if k := e.KeyName(); k != "" {
+				enc += ", key " + k
 			}
-			fmt.Fprintf(w, "LTFS volume: %s\n", line)
+		} else if e.Decrypting() {
+			enc = "decrypting only"
 		}
-		if e := c.Errors; e != nil {
-			fmt.Fprintf(w, "Tape errors: write %d retries, %d unrecovered; read %d retries, %d unrecovered (over its life)\n",
-				e.WriteRetries, e.WriteUnrecovered, e.ReadRetries, e.ReadUnrecovered)
+		if !e.Encrypting() {
+			for _, a := range info.Algorithms {
+				if a.Usable {
+					enc += fmt.Sprintf(" (supports %s for the loaded cartridge)", a.Name())
+					break
+				}
+			}
+		}
+		line(w, "Encryption", "%s", enc)
+	}
+	if c := info.Compression; c != nil {
+		comp := "off"
+		if !c.Enabled.OK {
+			comp = "-"
+		} else if c.Enabled.N != 0 {
+			comp = "on"
+		}
+		line(w, "Compression", "%s; since the cartridge was loaded: written %s (%s to %s), read %s (%s to %s)", comp,
+			ratio(c.WriteRatio), bytesOf(c.FromHost), bytesOf(c.ToTape), ratio(c.ReadRatio), bytesOf(c.FromTape), bytesOf(c.ToHost))
+	}
+	if st := info.Stats; st != nil {
+		years := ""
+		if st.PowerOnHours.OK {
+			years = fmt.Sprintf(" (%.1f years)", float64(st.PowerOnHours.N)/8766)
+		}
+		line(w, "Powered on", "%s hours%s, %s", num(st.PowerOnHours), years, plural(st.PowerCycles, "power cycle", "power cycles"))
+		km := "-"
+		if st.MetersOfTape.OK {
+			km = fmt.Sprint(st.MetersOfTape.N / 1000)
+		}
+		line(w, "Lifetime use", "%s cartridge loads, %s hours of tape motion, %s km of tape", num(st.Loads), num(st.HeadHours), km)
+		var byFormat []string
+		for _, f := range st.HeadHoursByFormat {
+			byFormat = append(byFormat, fmt.Sprintf("%s %d h", f.Format, f.Hours))
+		}
+		if len(byFormat) > 0 {
+			line(w, "", "tape motion by cartridge type: %s", strings.Join(byFormat, ", "))
 		}
 	}
 	counters := func(c *drive.ErrorCounters) string {
@@ -237,46 +321,102 @@ func printDriveInfo(w io.Writer, info *drive.Info, catalogTape string) {
 		}
 		return fmt.Sprintf("%d corrected, %d uncorrected", c.Corrected, c.Uncorrected)
 	}
-	fmt.Fprintf(w, "Drive I/O:   write %s; read %s\n", counters(info.WriteErrors), counters(info.ReadErrors))
-
-	if e := info.Encryption; e != nil {
-		line := "off"
-		if e.Encrypting() {
-			line = "on"
-			if alg := info.EncryptionAlgorithm(); alg != "" {
-				line += ", " + alg
-			}
-			if k := e.KeyName(); k != "" {
-				line += ", key " + k
-			}
-		} else if e.Decrypting() {
-			line = "decrypting only"
-		}
-		if !e.Encrypting() {
-			for _, a := range info.Algorithms {
-				if a.Usable {
-					line += fmt.Sprintf(" (drive supports %s for this cartridge)", a.Name())
-					break
-				}
-			}
-		}
-		fmt.Fprintf(w, "Encryption:  %s\n", line)
+	line(w, "Errors", "write %s; read %s (current counters)", counters(info.WriteErrors), counters(info.ReadErrors))
+	if st := info.Stats; st != nil {
+		line(w, "", "lifetime: %s, %s; %s", plural(st.HardWriteErrors, "hard write error", "hard write errors"),
+			plural(st.HardReadErrors, "hard read error", "hard read errors"), plural(info.NonMediumErrors, "non-medium error", "non-medium errors"))
+	}
+	if info.ErrorLogSlots > 0 {
+		line(w, "Error log", "%d of %d slots used%s", len(info.ErrorLog), info.ErrorLogSlots,
+			map[bool]string{true: "; details: tapemgr drive log", false: ""}[len(info.ErrorLog) > 0])
 	}
 	if len(info.Alerts) == 0 {
-		fmt.Fprintln(w, "TapeAlert:   none")
+		line(w, "TapeAlert", "none")
 	}
 	for i, a := range info.Alerts {
-		label := "TapeAlert:"
+		label := "TapeAlert"
 		if i > 0 {
 			label = ""
 		}
-		fmt.Fprintf(w, "%-12s %d (%s) %s\n", label, a.Flag, a.Severity, a.Name)
+		line(w, label, "%d (%s) %s", a.Flag, a.Severity, a.Name)
+	}
+
+	fmt.Fprintln(w, "\nTape")
+	c := info.Cartridge
+	if c == nil {
+		line(w, "", "no cartridge loaded")
+	} else {
+		date := c.ManufactureDate
+		if len(date) == 8 {
+			date = date[:4] + "-" + date[4:6] + "-" + date[6:]
+		}
+		line(w, "Cartridge", "%s %s, serial %s, barcode %s, %s, made %s",
+			orDash(c.Format), orDash(c.Kind), orDash(c.Serial), orDash(c.Barcode), orDash(c.Manufacturer), orDash(date))
+		wp := "no"
+		if c.WriteProtected {
+			wp = "YES"
+		}
+		line(w, "Write protect", "%s", wp)
+		if c.LTFSVolume != "" {
+			vol := c.LTFSVolume
+			if catalogTape != "" {
+				vol += ", catalog tape " + catalogTape
+			}
+			line(w, "LTFS volume", "%s", vol)
+		}
+		if c.Application != "" {
+			line(w, "Formatted by", "%s", c.Application)
+		}
+		for i, p := range c.Partitions {
+			label := "Capacity"
+			if i > 0 {
+				label = ""
+			}
+			line(w, label, "partition %d: %s free of %s", i, mib(p.RemainingMiB), mib(p.MaximumMiB))
+		}
+		vs := c.Stats
+		if vs != nil && vs.NativeCapacityMB.OK && vs.UsedNativeMB.OK {
+			mb := func(n uint64) drive.Count {
+				if n > math.MaxUint64/1_000_000 {
+					return drive.Count{N: math.MaxUint64, OK: true}
+				}
+				return drive.Count{N: n * 1_000_000, OK: true}
+			}
+			line(w, "Used", "%s of %s native, before drive compression", bytesOf(mb(vs.UsedNativeMB.N)), bytesOf(mb(vs.NativeCapacityMB.N)))
+		}
+		usage := fmt.Sprintf("%d loads", c.LoadCount)
+		if vs != nil {
+			usage += ", " + plural(vs.Mounts, "mount", "mounts") + ", " + plural(vs.Passes, "full pass", "full passes")
+		}
+		line(w, "Lifetime use", "%s", usage)
+		last := func(mb drive.Count) string {
+			if vs == nil || !mb.OK {
+				return ""
+			}
+			return fmt.Sprintf(", %d MB during the last mount", mb.N)
+		}
+		var lw, lr drive.Count
+		if vs != nil {
+			lw, lr = vs.LastMountMBWritten, vs.LastMountMBRead
+		}
+		line(w, "Written", "%s over its life%s", mib(c.WrittenMiB), last(lw))
+		line(w, "Read", "%s over its life%s", mib(c.ReadMiB), last(lr))
+		if vs != nil {
+			line(w, "Errors", "write %s retries, %s unrecovered; read %s retries, %s unrecovered (over its life)",
+				num(vs.WriteRetries), num(vs.WriteUnrecovered), num(vs.ReadRetries), num(vs.ReadUnrecovered))
+			line(w, "", "last mount: %s unrecovered write, %s unrecovered read errors",
+				num(vs.LastMountWriteUnrecovered), num(vs.LastMountReadUnrecovered))
+		}
+	}
+
+	if len(info.Problems) > 0 || len(info.Warnings()) > 0 {
+		fmt.Fprintln(w)
 	}
 	for _, p := range info.Problems {
-		fmt.Fprintf(w, "PROBLEM:     %s\n", p)
+		fmt.Fprintf(w, "PROBLEM:  %s\n", p)
 	}
 	for _, warn := range info.Warnings() {
-		fmt.Fprintf(w, "WARNING:     %s\n", warn)
+		fmt.Fprintf(w, "WARNING:  %s\n", warn)
 	}
 }
 
@@ -386,4 +526,70 @@ func requireTape(d drive.Device) error {
 		return fmt.Errorf("%s is not a tape drive (%s %s)", d.Path(), q.Vendor, q.Product)
 	}
 	return nil
+}
+
+func cmdDriveLog(args []string, stdout, stderr io.Writer) int {
+	fs, df := newDriveFlagSet("drive log", stderr)
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	d, _, err := df.open()
+	if err != nil {
+		return fail(stderr, err)
+	}
+	defer d.Close()
+	info, err := drive.Gather(d)
+	if err != nil {
+		return fail(stderr, err)
+	}
+	if info.ErrorLogSlots == 0 {
+		fmt.Fprintln(stdout, "The drive keeps no error log (tape diagnostic data page).")
+		return exitOK
+	}
+	fmt.Fprintf(stdout, "Error log of %s %s (%s): %d of %d slots used, in the order the drive keeps them\n",
+		info.Inquiry.Vendor, info.Inquiry.Product, info.Path, len(info.ErrorLog), info.ErrorLogSlots)
+	for _, e := range info.ErrorLog {
+		fmt.Fprintf(stdout, "\nSlot %d\n", e.Slot)
+		problem := e.Description()
+		if e.Repeated {
+			problem += " (repeated)"
+		}
+		line(stdout, "Problem", "%s", problem)
+		line(stdout, "During", "%s", e.Operation())
+		cart := orDash(e.MediumID)
+		if e.Format != "" {
+			cart += ", " + e.Format
+		}
+		if c := info.Cartridge; c != nil && c.Serial != "" && c.Serial == e.MediumID {
+			cart += " (the loaded cartridge)"
+		}
+		line(stdout, "Cartridge", "%s", cart)
+		fw := orDash(e.Firmware)
+		if e.Firmware != "" && e.Firmware != info.Inquiry.Revision {
+			fw += fmt.Sprintf(" (now %s)", info.Inquiry.Revision)
+		}
+		line(stdout, "Firmware", "%s", fw)
+		if w := e.When(); w != "" {
+			line(stdout, "When", "%s", w)
+		}
+		if e.CleanHours > 0 {
+			line(stdout, "Since cleaning", "%d tape hours", e.CleanHours)
+		}
+		line(stdout, "Codes", "sense %x/%02x/%02x, drive code 0x%08x (for the vendor's service)", e.Key, e.ASC, e.ASCQ, e.VendorCode)
+	}
+	var loaded string
+	if info.Cartridge != nil {
+		loaded = info.Cartridge.Serial
+	}
+	findings := drive.AnalyzeErrorLog(info.ErrorLog, loaded, info.Inquiry.Revision)
+	if len(findings) > 0 {
+		fmt.Fprintln(stdout, "\nAnalysis")
+		for _, f := range findings {
+			fmt.Fprintf(stdout, "  - %s\n", f)
+		}
+	}
+	if len(info.ErrorLog) == 0 {
+		fmt.Fprintln(stdout, "\nNo errors recorded.")
+	}
+	return exitOK
 }
