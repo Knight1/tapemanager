@@ -17,6 +17,7 @@ func TestMain(m *testing.M) {
 	// Tests never talk to a real drive.
 	driveWarnings = func(string) []string { return nil }
 	checkWriteProtect = func(string) error { return nil }
+	driveEncryption = func(string) (*drive.EncryptionStatus, error) { return nil, errors.New("no drive in tests") }
 	openDevice = func(string) (drive.Device, error) { return nil, errors.New("no drive in tests") }
 	os.Exit(m.Run())
 }

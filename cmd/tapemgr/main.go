@@ -38,6 +38,7 @@ Usage:
   tapemgr drive check [flags]              exit 1 if the drive needs cleaning or reports errors
   tapemgr drive load [flags]               load the inserted cartridge
   tapemgr drive eject [flags]              rewind and eject the cartridge (refused while mounted)
+  tapemgr drive keygen --out FILE          add a new key to an LTFS key file for drive encryption
   tapemgr version
 
 Common flags:
@@ -81,6 +82,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		"drive check":     cmdDriveCheck,
 		"drive load":      cmdDriveLoad,
 		"drive eject":     cmdDriveEject,
+		"drive keygen":    cmdDriveKeygen,
 	}
 	if len(args) >= 2 {
 		if args[0] == "archive" && args[1] == "purge-source" {
@@ -116,6 +118,15 @@ func newFlagSet(name string, stderr io.Writer) (*flag.FlagSet, *commonFlags) {
 	fs.StringVar(&cf.catalog, "catalog", envOr("TAPEMGR_CATALOG", "/var/lib/tapemgr"), "local catalog directory")
 	fs.BoolVar(&cf.noMountCheck, "no-mount-check", false, "allow a tape root that is not an LTFS mount")
 	return fs, cf
+}
+
+// envBool reports whether the environment variable is set to a true value.
+func envBool(key string) bool {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func envOr(key, def string) string {
@@ -166,6 +177,7 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 	parityPct := fs.Int("parity", 10, "Reed-Solomon parity overhead in percent (0 to 25, 0 disables)")
 	copies := fs.Int("copies", 1, "number of different tapes each file should be on; 2 makes a second copy on this tape")
 	again := fs.Bool("again", false, "archive files even if they already have enough copies on other tapes")
+	requireEnc := fs.Bool("require-encryption", envBool("TAPEMGR_REQUIRE_ENCRYPTION"), "refuse to write unless the drive is encrypting (default $TAPEMGR_REQUIRE_ENCRYPTION)")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -187,6 +199,10 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(stderr, err)
 	}
+	enc, err := checkEncryption(cat, cf.tape, *requireEnc, stdout)
+	if err != nil {
+		return fail(stderr, err)
+	}
 
 	sum, err := archive.Put(archive.PutOptions{
 		TapeRoot: cf.tape,
@@ -201,6 +217,9 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 		Log:      stdout,
 		Progress: progressOut(stderr),
 	})
+	if sum.Tape != nil {
+		recordEncryption(cat, sum.Tape.ID, enc, stderr)
+	}
 	printDriveWarnings(cf.tape, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "tapemgr:", err)
@@ -382,6 +401,12 @@ func cmdTapes(args []string, stdout, stderr io.Writer) int {
 		if t.Retired != nil {
 			verified = "RETIRED " + t.Retired.Format("2006-01-02") + ", " + verified
 		}
+		if e := t.Encryption; e != nil {
+			verified += ", encrypted"
+			if len(e.Keys) > 0 {
+				verified += " (key " + strings.Join(e.Keys, ", ") + ")"
+			}
+		}
 		fmt.Fprintf(stdout, "%-16s  %s  %8d files  %10s  %s\n",
 			t.Label, t.ID, t.Files, archive.FormatBytes(t.Bytes), verified)
 	}
@@ -506,6 +531,7 @@ func cmdPurge(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 func cmdRecover(args []string, stdout, stderr io.Writer) int {
 	fs, cf := newFlagSet("archive recover", stderr)
 	label := fs.String("label", "", "tape label, if the tape has never been used with tapemgr")
+	requireEnc := fs.Bool("require-encryption", envBool("TAPEMGR_REQUIRE_ENCRYPTION"), "refuse to write unless the drive is encrypting (default $TAPEMGR_REQUIRE_ENCRYPTION)")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -523,6 +549,10 @@ func cmdRecover(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(stderr, err)
 	}
+	enc, err := checkEncryption(cat, cf.tape, *requireEnc, stdout)
+	if err != nil {
+		return fail(stderr, err)
+	}
 	res, err := archive.Recover(archive.RecoverOptions{
 		TapeRoot: cf.tape,
 		Label:    *label,
@@ -530,6 +560,9 @@ func cmdRecover(args []string, stdout, stderr io.Writer) int {
 		Log:      stdout,
 		Progress: progressOut(stderr),
 	})
+	if res.Tape != nil {
+		recordEncryption(cat, res.Tape.ID, enc, stderr)
+	}
 	if err != nil {
 		return fail(stderr, err)
 	}

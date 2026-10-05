@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -38,6 +39,16 @@ type Tape struct {
 	// longer count as copies, so put writes them again and purge does not
 	// rely on them.
 	Retired *time.Time `json:"retired,omitempty"`
+	// Encryption is set once tapemgr wrote to the tape while the drive was
+	// encrypting.
+	Encryption *Encryption `json:"encryption,omitempty"`
+}
+
+// Encryption describes how a tape is encrypted.
+type Encryption struct {
+	Method string    `json:"method"`         // "drive": LTO hardware encryption
+	Keys   []string  `json:"keys,omitempty"` // key IDs used, as in LTFS key files (DKi)
+	Since  time.Time `json:"since"`
 }
 
 // Verification records one run of archive verify.
@@ -70,6 +81,25 @@ func (t *Tape) LastVerified() *Verification {
 func (t *Tape) VerifiedSince(at time.Time) bool {
 	v := t.LastVerified()
 	return v != nil && v.Passed() && v.At.After(at)
+}
+
+// RecordDriveEncryption notes that data was written to tape id while the
+// drive encrypted it with key keyID ("" if the drive reported none).
+func (c *Catalog) RecordDriveEncryption(id, keyID string) error {
+	t, err := c.Tape(id)
+	if err != nil {
+		return err
+	}
+	if t == nil {
+		return fmt.Errorf("tape %s is not in the catalog", id)
+	}
+	if t.Encryption == nil {
+		t.Encryption = &Encryption{Method: "drive", Since: time.Now().UTC()}
+	}
+	if keyID != "" && !slices.Contains(t.Encryption.Keys, keyID) {
+		t.Encryption.Keys = append(t.Encryption.Keys, keyID)
+	}
+	return c.save(t)
 }
 
 // SetRetired marks tape id as retired, or active again.

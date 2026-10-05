@@ -181,3 +181,24 @@ func TestRetiredSurvivesImport(t *testing.T) {
 		t.Fatal("import cleared the retired mark")
 	}
 }
+
+func TestRecordDriveEncryption(t *testing.T) {
+	c, _ := Open(t.TempDir())
+	dir := makeTape(t, "ENC", entry("a", 1, 'a'))
+	tp, _ := c.Import(dir)
+	if err := c.RecordDriveEncryption(tp.ID, "TMG000000000000000001"); err != nil {
+		t.Fatal(err)
+	}
+	c.RecordDriveEncryption(tp.ID, "TMG000000000000000001")
+	c.RecordDriveEncryption(tp.ID, "")
+	c.RecordDriveEncryption(tp.ID, "TMG000000000000000002")
+	// Reimporting keeps it.
+	c.Import(dir)
+	got, _ := c.Tape(tp.ID)
+	if got.Encryption == nil || got.Encryption.Method != "drive" || len(got.Encryption.Keys) != 2 || got.Encryption.Since.IsZero() {
+		t.Fatalf("%+v", got.Encryption)
+	}
+	if err := c.RecordDriveEncryption("00000000-0000-4000-8000-000000000000", "x"); err == nil {
+		t.Fatal("unknown tape accepted")
+	}
+}

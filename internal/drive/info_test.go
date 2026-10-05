@@ -214,3 +214,31 @@ func TestWriteProtected(t *testing.T) {
 		t.Fatal("short header accepted")
 	}
 }
+
+func TestGatherEncryption(t *testing.T) {
+	f := drivetest.New()
+	info, err := drive.Gather(f)
+	if err != nil || info.Encryption == nil || info.Encryption.Encrypting() || len(info.Algorithms) != 3 {
+		t.Fatalf("%+v %v", info, err)
+	}
+	f.Encrypting = true
+	f.KeyID = []byte{'T', 'M', 'G', 9, 8, 7, 6, 5, 4, 3, 2, 1}
+	info, _ = drive.Gather(f)
+	if !info.Encryption.Encrypting() || info.Encryption.KeyName() != "TMG090807060504030201" || info.EncryptionAlgorithm() != "AES-256-GCM" {
+		t.Fatalf("%+v", info.Encryption)
+	}
+	// A drive without encryption is not a problem.
+	f = drivetest.New()
+	f.NoEncryption = true
+	info, _ = drive.Gather(f)
+	if info.Encryption != nil || len(info.Problems) != 0 || info.EncryptionAlgorithm() != "" {
+		t.Fatalf("%+v", info)
+	}
+	// A failing query is.
+	f = drivetest.New()
+	f.Fail = map[byte]*drive.CommandError{0xA2: {Op: 0xA2, Status: 2, Key: drive.SenseHardwareError}}
+	info, _ = drive.Gather(f)
+	if len(info.Problems) != 1 || !strings.Contains(info.Problems[0], "encryption") {
+		t.Fatalf("%v", info.Problems)
+	}
+}

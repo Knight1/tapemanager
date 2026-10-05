@@ -239,6 +239,29 @@ func printDriveInfo(w io.Writer, info *drive.Info, catalogTape string) {
 	}
 	fmt.Fprintf(w, "Drive I/O:   write %s; read %s\n", counters(info.WriteErrors), counters(info.ReadErrors))
 
+	if e := info.Encryption; e != nil {
+		line := "off"
+		if e.Encrypting() {
+			line = "on"
+			if alg := info.EncryptionAlgorithm(); alg != "" {
+				line += ", " + alg
+			}
+			if k := e.KeyName(); k != "" {
+				line += ", key " + k
+			}
+		} else if e.Decrypting() {
+			line = "decrypting only"
+		}
+		if !e.Encrypting() {
+			for _, a := range info.Algorithms {
+				if a.Usable {
+					line += fmt.Sprintf(" (drive supports %s for this cartridge)", a.Name())
+					break
+				}
+			}
+		}
+		fmt.Fprintf(w, "Encryption:  %s\n", line)
+	}
 	if len(info.Alerts) == 0 {
 		fmt.Fprintln(w, "TapeAlert:   none")
 	}

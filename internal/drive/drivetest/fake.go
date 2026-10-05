@@ -21,6 +21,9 @@ type Fake struct {
 	VolumeReadErrs uint64 // unrecovered read errors over the cartridge's life
 	PreventRemoval bool   // unload fails like a drive locked by LTFS
 	WriteProtect   bool   // cartridge write protected
+	Encrypting     bool   // drive encryption on, as after an LTFS mount with a key
+	KeyID          []byte // key ID reported while encrypting
+	NoEncryption   bool   // drive without encryption support
 	DeviceType     byte   // INQUIRY device type, 1 (tape) unless set
 	LTFSUUID       string
 	// Fail makes commands with this operation code fail with the given
@@ -78,6 +81,14 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 			return 0, check(op, drive.SenseNotReady, 0x3A, 0)
 		}
 		resp = f.attributes(cdb[7])
+	case 0xA2: // SECURITY PROTOCOL IN, tape data encryption
+		if f.NoEncryption || cdb[1] != 0x20 {
+			return 0, check(op, drive.SenseIllegalRequest, 0x24, 0)
+		}
+		resp = f.securityPage(binary.BigEndian.Uint16(cdb[2:]))
+		if resp == nil {
+			return 0, check(op, drive.SenseIllegalRequest, 0x24, 0)
+		}
 	case 0x1A: // MODE SENSE(6), header only
 		if f.NoMedium {
 			return 0, check(op, drive.SenseNotReady, 0x3A, 0)
@@ -222,4 +233,32 @@ func (f *Fake) attributes(partition byte) []byte {
 	}
 	binary.BigEndian.PutUint32(b, uint32(len(b)-4))
 	return b
+}
+
+func (f *Fake) securityPage(code uint16) []byte {
+	var body []byte
+	switch code {
+	case 0x0010: // capabilities: like the IBM LTO-6, three AES-256-GCM entries
+		body = make([]byte, 16)
+		body[0] = 0x09
+		for i, flags := range []byte{0x3a, 0x3a, 0xba} {
+			d := []byte{byte(i + 1), 0, 0, 0x14, flags, 0x34, 0, 0x20, 0, 0x0c, 0, 0x20, 0xeb, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0x14}
+			body = append(body, d...)
+		}
+	case 0x0020: // status
+		body = make([]byte, 20)
+		body[8] = 0x10
+		if f.Encrypting {
+			body[1], body[2], body[3] = 2, 3, 1
+			body[7] = 1
+			kad := []byte{1, 0, 0, byte(len(f.KeyID))}
+			body = append(body, append(kad, f.KeyID...)...)
+		}
+	default:
+		return nil
+	}
+	b := make([]byte, 4, 4+len(body))
+	binary.BigEndian.PutUint16(b, code)
+	binary.BigEndian.PutUint16(b[2:], uint16(len(body)))
+	return append(b, body...)
 }

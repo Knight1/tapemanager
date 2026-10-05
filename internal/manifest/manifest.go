@@ -310,6 +310,31 @@ func WriteFileAtomic(name string, data []byte) error {
 	})
 }
 
+// WriteFileAtomicPerm is WriteFileAtomic for files that must never be
+// readable by others, such as key files: the temporary file is created
+// fresh with perm, so the data is never visible with wider permissions.
+func WriteFileAtomicPerm(name string, data []byte, perm os.FileMode) error {
+	tmp := name + ".tmp"
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return err
+	}
+	if err := f.Chmod(perm); err != nil { // independent of the umask
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	return finishAtomic(f, data, func() error {
+		if err := os.Rename(tmp, name); err != nil {
+			return err
+		}
+		return SyncDir(filepath.Dir(name))
+	})
+}
+
 // SyncDir makes creates, renames and removals in dir durable. Filesystems
 // that cannot sync directories (some FUSE and network filesystems) are
 // accepted as they are.

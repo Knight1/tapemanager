@@ -18,6 +18,8 @@ type Info struct {
 	// Error counters of the drive since it was powered on or the cartridge
 	// was loaded, depending on the drive. nil if not reported.
 	WriteErrors, ReadErrors *ErrorCounters
+	Encryption              *EncryptionStatus // nil if the drive has no encryption
+	Algorithms              []Algorithm
 	Problems                []string // information that could not be read
 }
 
@@ -107,6 +109,17 @@ func Gather(d Device) (*Info, error) {
 		}
 		ec := parseErrorCounters(lp)
 		*c.dst = &ec
+	}
+
+	if algs, err := ReadEncryptionAlgorithms(d); err == nil {
+		info.Algorithms = algs
+		if st, err := ReadEncryptionStatus(d); err == nil {
+			info.Encryption = st
+		} else if !errors.Is(err, ErrUnsupported) {
+			problem("encryption status", err)
+		}
+	} else if !errors.Is(err, ErrUnsupported) {
+		problem("encryption capabilities", err)
 	}
 
 	if info.Ready == nil || !errors.Is(info.Ready, ErrNoMedium) {
@@ -266,4 +279,18 @@ func (in *Info) Warnings() []string {
 		}
 	}
 	return w
+}
+
+// EncryptionAlgorithm names the algorithm the drive currently encrypts
+// with, or "" if unknown.
+func (in *Info) EncryptionAlgorithm() string {
+	if in.Encryption == nil {
+		return ""
+	}
+	for _, a := range in.Algorithms {
+		if a.Index == in.Encryption.AlgorithmIndex {
+			return a.Name()
+		}
+	}
+	return ""
 }
