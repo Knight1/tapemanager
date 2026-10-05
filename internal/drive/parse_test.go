@@ -237,6 +237,15 @@ func TestCommandError(t *testing.T) {
 	if !errors.Is(e, ErrNoMedium) || errors.Is(e, ErrUnsupported) || !strings.Contains(e.Error(), "no cartridge") {
 		t.Fatalf("%v", e)
 	}
+	fixed[12], fixed[13] = 0x04, 0x02 // after an eject, cartridge still in the slot
+	e = newCommandError(0x00, 0x02, fixed)
+	if !errors.Is(e, ErrNotLoaded) || errors.Is(e, ErrNoMedium) || !strings.Contains(e.Error(), "load needed") {
+		t.Fatalf("%v", e)
+	}
+	fixed[13] = 0x01 // becoming ready is something else
+	if e = newCommandError(0x00, 0x02, fixed); errors.Is(e, ErrNotLoaded) {
+		t.Fatalf("%v", e)
+	}
 	desc := []byte{0x72, 0x05, 0x53, 0x02, 0, 0, 0, 0}
 	e = newCommandError(0x1B, 0x02, desc)
 	if !errors.Is(e, ErrRemovalPrevented) || !strings.Contains(e.Error(), "illegal request: medium removal prevented") {

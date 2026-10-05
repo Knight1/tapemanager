@@ -67,6 +67,20 @@ func TestCLIFirmwareRefuses(t *testing.T) {
 	if code, out := runWithInput("", "drive", "firmware", "--file", file, "--yes"); code != exitFailure || !strings.Contains(out, "cartridge is loaded") {
 		t.Fatalf("cartridge: %s", out)
 	}
+	// Ejected but not taken out: the drive reports "load needed".
+	f.InSlot = true
+	if code, out := runWithInput("", "drive", "firmware", "--file", file, "--yes"); code != exitFailure || !strings.Contains(out, "still in the drive's slot; take it out") {
+		t.Fatalf("in slot: %s", out)
+	}
+	f.InSlot = false
+	f.Fail = map[byte]*drive.CommandError{0x00: {Op: 0x00, Status: 0x02, Key: drive.SenseNotReady, ASC: 0x04, ASCQ: 0x01}}
+	if code, out := runWithInput("", "drive", "firmware", "--file", file, "--yes"); code != exitFailure || !strings.Contains(out, "not idle") {
+		t.Fatalf("becoming ready: %s", out)
+	}
+	f.Fail = nil
+	if f.Downloads != 0 {
+		t.Fatal("sent firmware to a busy drive")
+	}
 	f.NoMedium = true
 	mountPoints = func(_ drive.Found, _ string) ([]string, error) { return []string{"/mnt/ltfs"}, nil }
 	if code, out := runWithInput("", "drive", "firmware", "--file", file, "--yes"); code != exitFailure || !strings.Contains(out, "mounted at /mnt/ltfs") {

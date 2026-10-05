@@ -88,8 +88,15 @@ func cmdDriveFirmware(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	if len(mps) > 0 {
 		return fail(stderr, fmt.Errorf("a tape is mounted at %s; unmount it and eject the cartridge first", strings.Join(mps, ", ")))
 	}
-	if err := drive.TestUnitReady(d); !errors.Is(err, drive.ErrNoMedium) {
+	switch err := drive.TestUnitReady(d); {
+	case errors.Is(err, drive.ErrNoMedium):
+	case errors.Is(err, drive.ErrNotLoaded):
+		// After an eject the cartridge stays in the slot until taken out.
+		return fail(stderr, errors.New("the ejected cartridge is still in the drive's slot; take it out, then run this again"))
+	case err == nil:
 		return fail(stderr, errors.New("a cartridge is loaded; eject it first ('tapemgr drive eject')"))
+	default:
+		return fail(stderr, fmt.Errorf("the drive is not idle (%v); wait a moment and run this again", err))
 	}
 	buf, err := drive.ReadMicrocodeBuffer(d)
 	if err != nil {

@@ -73,6 +73,8 @@ func (e *CommandError) Is(target error) bool {
 	switch target {
 	case ErrNoMedium:
 		return e.Key == SenseNotReady && e.ASC == 0x3A
+	case ErrNotLoaded:
+		return e.Key == SenseNotReady && e.ASC == 0x04 && e.ASCQ == 0x02
 	case ErrUnsupported:
 		return e.Key == SenseIllegalRequest && (e.ASC == 0x20 || e.ASC == 0x24)
 	case ErrRemovalPrevented:
@@ -82,7 +84,10 @@ func (e *CommandError) Is(target error) bool {
 }
 
 var (
-	ErrNoMedium         = errors.New("no cartridge in the drive")
+	ErrNoMedium = errors.New("no cartridge in the drive")
+	// ErrNotLoaded is a cartridge in the drive that is not loaded, as after
+	// an eject while it still sits in the slot.
+	ErrNotLoaded        = errors.New("the cartridge is not loaded (ejected but still in the slot)")
 	ErrUnsupported      = errors.New("not supported by the drive")
 	ErrRemovalPrevented = errors.New("cartridge removal is prevented (is the tape still mounted?)")
 )

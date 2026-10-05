@@ -139,6 +139,15 @@ func TestCLIDriveInfo(t *testing.T) {
 	if code, out, _ := runCmd(t, "drive", "info", "--catalog", missing); code != 0 || !strings.Contains(out, "no cartridge loaded") || strings.Contains(out, "Cartridge:") {
 		t.Fatalf("%d %s", code, out)
 	}
+
+	f3 := drivetest.New()
+	f3.InSlot = true
+	useFake(t, f3, fakeFound, nil)
+	code, out, errOut = runCmd(t, "drive", "info", "--catalog", missing)
+	if code != 0 || !strings.Contains(out, "cartridge ejected, still in the slot") || !strings.Contains(out, "take it out, or load it again") ||
+		strings.Contains(out, "Cartridge:") || strings.Contains(out+errOut, "PROBLEM") {
+		t.Fatalf("%d %s %s", code, out, errOut)
+	}
 }
 
 func TestCLIDriveCheck(t *testing.T) {

@@ -65,6 +65,27 @@ func TestGatherNoCartridge(t *testing.T) {
 	}
 }
 
+// After an eject the cartridge stays in the slot. The drive then reports
+// "load needed", and reading the cartridge memory fails with a medium
+// error that must not be reported as a problem.
+func TestGatherEjectedInSlot(t *testing.T) {
+	f := drivetest.New()
+	f.InSlot = true
+	info, err := drive.Gather(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(info.Ready, drive.ErrNotLoaded) || info.Cartridge != nil || len(info.Problems) != 0 {
+		t.Fatalf("%+v", info)
+	}
+	if slices.Contains(f.Commands, 0x8C) {
+		t.Fatal("cartridge memory read while unloaded")
+	}
+	if err := drive.Load(f); err != nil || f.InSlot || drive.TestUnitReady(f) != nil {
+		t.Fatalf("load: %v", err)
+	}
+}
+
 func TestWarnings(t *testing.T) {
 	f := drivetest.New()
 	f.CleanRequested = true

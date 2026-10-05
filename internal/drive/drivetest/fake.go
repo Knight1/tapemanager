@@ -15,6 +15,7 @@ import (
 type Fake struct {
 	DevPath        string
 	NoMedium       bool
+	InSlot         bool // an ejected cartridge still in the slot: not ready, load needed
 	CleanRequested bool
 	CleanRequired  bool
 	Alerts         []int  // active TapeAlert flags
@@ -60,6 +61,17 @@ func (f *Fake) Path() string { return f.DevPath }
 
 func (f *Fake) Close() error { f.Closed = true; return nil }
 
+// notReady is the drive's answer to commands that need a loaded cartridge.
+func (f *Fake) notReady(op byte) error {
+	switch {
+	case f.NoMedium:
+		return check(op, drive.SenseNotReady, 0x3A, 0)
+	case f.InSlot:
+		return check(op, drive.SenseNotReady, 0x04, 0x02)
+	}
+	return nil
+}
+
 func check(op, key, asc, ascq byte) error {
 	return &drive.CommandError{Op: op, Status: 0x02, Key: key, ASC: asc, ASCQ: ascq}
 }
@@ -73,10 +85,7 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 	var resp []byte
 	switch op {
 	case 0x00: // TEST UNIT READY
-		if f.NoMedium {
-			return 0, check(op, drive.SenseNotReady, 0x3A, 0)
-		}
-		return 0, nil
+		return 0, f.notReady(op)
 	case 0x12: // INQUIRY
 		if cdb[1]&1 == 0 {
 			resp = make([]byte, 70)
@@ -112,6 +121,9 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 		if f.NoMedium {
 			return 0, check(op, drive.SenseNotReady, 0x3A, 0)
 		}
+		if f.InSlot { // the IBM LTO-6 cannot reach the cartridge memory then
+			return 0, check(op, drive.SenseMediumError, 0x04, 0x10)
+		}
 		resp = f.attributes(cdb[7])
 	case 0x3C: // READ BUFFER
 		if cdb[1] != 0x03 || cdb[2] != 0 {
@@ -146,8 +158,8 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 			return 0, check(op, drive.SenseIllegalRequest, 0x24, 0)
 		}
 	case 0x1A: // MODE SENSE(6), header only
-		if f.NoMedium {
-			return 0, check(op, drive.SenseNotReady, 0x3A, 0)
+		if err := f.notReady(op); err != nil {
+			return 0, err
 		}
 		resp = []byte{3, 0x68, 0x10, 0}
 		if f.WriteProtect {
@@ -157,6 +169,10 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 		if cdb[4]&1 == 1 {
 			f.Loaded++
 			f.NoMedium = false
+			f.InSlot = false
+			return 0, nil
+		}
+		if f.InSlot {
 			return 0, nil
 		}
 		if f.NoMedium {
@@ -201,7 +217,7 @@ func (f *Fake) logPage(code byte) []byte {
 		return page(code, param(3, u32(0)), param(5, u32(2)), param(6, u32(f.ReadUncorr)))
 	case drive.PageDeviceStatus:
 		vhf := []byte{0xB1, 0x17, 0x00, 0x02}
-		if f.NoMedium {
+		if f.NoMedium || f.InSlot {
 			vhf[1] = 0
 		}
 		if f.CleanRequested {
@@ -227,7 +243,7 @@ func (f *Fake) logPage(code byte) []byte {
 		}
 		return page(code, params...)
 	case drive.PageVolumeStats:
-		if f.NoMedium {
+		if f.NoMedium || f.InSlot {
 			return nil
 		}
 		return page(code, param(1, u32(3)), param(3, u32(1)), param(4, u32(0)), param(8, u32(0)), param(9, u32(f.VolumeReadErrs)),

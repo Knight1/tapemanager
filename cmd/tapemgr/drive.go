@@ -233,6 +233,8 @@ func printDriveInfo(w io.Writer, info *drive.Info, catalogTape string) {
 	switch {
 	case errors.Is(info.Ready, drive.ErrNoMedium):
 		status = "no cartridge"
+	case errors.Is(info.Ready, drive.ErrNotLoaded):
+		status = "cartridge ejected, still in the slot"
 	case info.Ready != nil:
 		status = "not ready: " + info.Ready.Error()
 	}
@@ -343,9 +345,12 @@ func printDriveInfo(w io.Writer, info *drive.Info, catalogTape string) {
 
 	fmt.Fprintln(w, "\nTape")
 	c := info.Cartridge
-	if c == nil {
+	switch {
+	case c == nil && errors.Is(info.Ready, drive.ErrNotLoaded):
+		line(w, "", "cartridge ejected but still in the slot; take it out, or load it again ('tapemgr drive load')")
+	case c == nil:
 		line(w, "", "no cartridge loaded")
-	} else {
+	default:
 		date := c.ManufactureDate
 		if len(date) == 8 {
 			date = date[:4] + "-" + date[4:6] + "-" + date[6:]

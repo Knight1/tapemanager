@@ -151,7 +151,9 @@ func Gather(d Device) (*Info, error) {
 		problem("encryption capabilities", err)
 	}
 
-	if info.Ready == nil || !errors.Is(info.Ready, ErrNoMedium) {
+	// An unloaded cartridge's memory cannot be read either; the drive
+	// answers with a misleading medium error.
+	if !errors.Is(info.Ready, ErrNoMedium) && !errors.Is(info.Ready, ErrNotLoaded) {
 		if c, err := readCartridge(d); err == nil {
 			info.Cartridge = c
 		} else if !errors.Is(err, ErrNoMedium) {
