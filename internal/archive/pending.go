@@ -98,8 +98,25 @@ func openPending(name string) (*pending, error) {
 		f.Close()
 		return nil, fmt.Errorf("%s: %w", name, err)
 	}
-	// Cut off a torn tail so new records start on a clean line.
-	if err := f.Truncate(good); err != nil {
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if good > st.Size() {
+		// The last record is complete but a crash cut off its newline.
+		// Add it, so the next record does not join that line and make
+		// both unreadable.
+		if _, err := f.WriteAt([]byte{'\n'}, st.Size()); err != nil {
+			f.Close()
+			return nil, err
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return nil, err
+		}
+	} else if err := f.Truncate(good); err != nil {
+		// Cut off a torn tail so new records start on a clean line.
 		f.Close()
 		return nil, err
 	}

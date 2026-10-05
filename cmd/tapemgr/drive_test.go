@@ -19,7 +19,15 @@ func TestMain(m *testing.M) {
 	checkWriteProtect = func(string) error { return nil }
 	driveEncryption = func(string) (*drive.EncryptionStatus, error) { return nil, errors.New("no drive in tests") }
 	openDevice = func(string) (drive.Device, error) { return nil, errors.New("no drive in tests") }
-	os.Exit(m.Run())
+	// Never touch the host's real lock.
+	dir, err := os.MkdirTemp("", "tapemgr-lock")
+	if err != nil {
+		panic(err)
+	}
+	lockPath = filepath.Join(dir, "tapemgr.lock")
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
 }
 
 // useFake routes drive commands to a fake drive with the given mounts.

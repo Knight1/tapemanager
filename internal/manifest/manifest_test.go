@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func openTape(t *testing.T, dir string) *Tape {
@@ -312,5 +313,61 @@ func TestWriteFileAtomicAfterCrash(t *testing.T) {
 	}
 	if _, err := os.Stat(name + ".tmp"); !os.IsNotExist(err) {
 		t.Fatal("temporary file left behind")
+	}
+}
+
+// A label from a tape is shown to the user: control characters must not
+// survive reading it, and new labels must not contain them.
+func TestVolumeLabelCleaned(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, Dir), 0o755)
+	os.WriteFile(filepath.Join(dir, Dir, VolumeName), []byte(`{"id":"00000000-0000-4000-8000-000000000001","label":"A\nSHA-256 verification successful.\u001b[2K","ltfs_uuid":"../x"}`), 0o644)
+	tp, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tp.Close()
+	v, err := tp.Volume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Label != "A?SHA-256 verification successful.?[2K" || v.LTFSUUID != "" {
+		t.Fatalf("volume = %+v", v)
+	}
+	if long := CleanLabel(strings.Repeat("ä", 100)); len(long) > MaxLabel || !utf8.ValidString(long) {
+		t.Fatalf("long label %q", long)
+	}
+
+	tp2, _ := Open(t.TempDir())
+	defer tp2.Close()
+	if _, err := tp2.InitVolume("bad\x1blabel", ""); err == nil {
+		t.Fatal("label with an escape accepted")
+	}
+	if v, err := tp2.InitVolume("TAPE-0001", ""); err != nil || v.Label != "TAPE-0001" {
+		t.Fatalf("%+v %v", v, err)
+	}
+}
+
+// WriteFileNew never replaces an existing file and leaves no temporary
+// files behind.
+func TestWriteFileNew(t *testing.T) {
+	dir := t.TempDir()
+	name := filepath.Join(dir, "key")
+	if err := WriteFileNew(name, []byte("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFileNew(name, []byte("second"), 0o600); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("err = %v", err)
+	}
+	b, _ := os.ReadFile(name)
+	st, _ := os.Stat(name)
+	if string(b) != "first" || st.Mode().Perm() != 0o600 {
+		t.Fatalf("%q %v", b, st.Mode())
+	}
+	if ents, _ := os.ReadDir(dir); len(ents) != 1 {
+		t.Fatalf("%d files left", len(ents))
+	}
+	if err := writeExclusive(name, []byte("x"), 0o600); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("exclusive: %v", err)
 	}
 }

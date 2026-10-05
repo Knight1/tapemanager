@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"filippo.io/age"
 )
 
 func recoverOpts(t *testing.T, tape string) RecoverOptions {
@@ -107,5 +109,39 @@ func TestRecoverRefusesWithPendingRecords(t *testing.T) {
 	testHook = nil
 	if _, err := Recover(recoverOpts(t, tape)); err == nil {
 		t.Fatal("recover ran with pending records")
+	}
+}
+
+// A SHA256SUMS.tmp left by a crash is tapemgr's own metadata, never data.
+func TestRecoverIgnoresSumsTemp(t *testing.T) {
+	src, tape := setup(t)
+	put(t, src, tape)
+	writeFile(t, filepath.Join(tape, "SHA256SUMS.tmp"), "half a sums file")
+	res, err := Recover(recoverOpts(t, tape))
+	if err != nil || res.Files != 0 {
+		t.Fatalf("res = %+v, %v", res, err)
+	}
+}
+
+// An orphan with the name an encrypted file is recorded under would give
+// two manifest records with one path.
+func TestRecoverSkipsNameOfEncryptedFile(t *testing.T) {
+	src, tape, _ := encSetup(t)
+	id, _ := age.GenerateX25519Identity()
+	if _, err := Put(encOpts(t, src, tape, id)); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(tape, "downloads", "a.iso"), "other tool")
+	res, err := Recover(recoverOpts(t, tape))
+	if err != nil || res.Files != 0 {
+		t.Fatalf("res = %+v, %v", res, err)
+	}
+	entries, _ := loadEntries(tape)
+	seen := map[string]bool{}
+	for _, e := range entries {
+		if seen[e.Path] {
+			t.Fatalf("two records for %s", e.Path)
+		}
+		seen[e.Path] = true
 	}
 }

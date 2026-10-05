@@ -202,3 +202,50 @@ func TestRecordDriveEncryption(t *testing.T) {
 		t.Fatal("unknown tape accepted")
 	}
 }
+
+// A torn last record of the written log costs only that record, never the
+// next one appended after it.
+func TestWrittenLogTornTail(t *testing.T) {
+	c, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "00000000-0000-4000-8000-000000000001"
+	if err := c.RecordWritten(id, []manifest.Entry{entry("a", 1, 'a')}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(c.writtenPath(id), os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString(`{"path":"torn","si`)
+	f.Close()
+	if err := c.RecordWritten(id, []manifest.Entry{entry("b", 1, 'b')}); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := c.Written()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, h := range hits {
+		paths = append(paths, h.Entry.Path)
+	}
+	if strings.Join(paths, ",") != "a,b" {
+		t.Fatalf("written = %v", paths)
+	}
+}
+
+// A tape record must describe the tape its file is named after; its ID
+// names further catalog files.
+func TestTapeRecordIDMismatch(t *testing.T) {
+	c, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "00000000-0000-4000-8000-000000000001"
+	os.WriteFile(c.recordPath(id), []byte(`{"id":"../../escape"}`), 0o644)
+	if _, err := c.Tape(id); err == nil || !strings.Contains(err.Error(), "record is for tape") {
+		t.Fatalf("err = %v", err)
+	}
+}

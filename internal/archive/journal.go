@@ -21,12 +21,15 @@ import (
 // Records are appended and synced only after the file data up to their
 // offset has been synced to tape.
 type journalHeader struct {
-	Source    string    `json:"source"`
-	Path      string    `json:"path"`
-	Size      int64     `json:"size"`
-	MTime     time.Time `json:"mtime"`
-	ChunkSize int64     `json:"chunk_size"`
-	ParityM   int       `json:"parity_m,omitempty"`
+	Source string    `json:"source"`
+	Path   string    `json:"path"`
+	Size   int64     `json:"size"`
+	MTime  time.Time `json:"mtime"`
+	// Change is the source's changeID: a rewrite that kept the mtime must
+	// not be resumed into the old transfer.
+	Change    string `json:"change,omitempty"`
+	ChunkSize int64  `json:"chunk_size"`
+	ParityM   int    `json:"parity_m,omitempty"`
 	// Age holds the header, nonce and file key of an encrypted file, so an
 	// interrupted write can continue the same encryption. The file key is
 	// secret; journals are only readable by their owner and are deleted

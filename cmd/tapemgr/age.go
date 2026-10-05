@@ -120,7 +120,11 @@ func cmdArchiveKeygen(args []string, stdout, stderr io.Writer) int {
 		return fail(stderr, err)
 	}
 	data := fmt.Sprintf("# created by tapemgr\n# public key: %s\n%s\n", public, secret)
-	if err := manifest.WriteFileAtomicPerm(*out, []byte(data), 0o600); err != nil {
+	// Exclusive: a key created there in the meantime is never replaced.
+	if err := manifest.WriteFileNew(*out, []byte(data), 0o600); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fail(stderr, fmt.Errorf("%s already exists; choose another file", *out))
+		}
 		return fail(stderr, err)
 	}
 	fmt.Fprintf(stdout, `Private key written to %[1]s.

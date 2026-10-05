@@ -355,7 +355,13 @@ func (e *Encrypter) Snapshot(off int64) (state []byte, next int64, err error) {
 // changed source is detected (ErrSourceChanged) before anything is written
 // under the same key and nonce.
 func (e *Encrypter) ResumeAt(off int64, state []byte, next int64, written io.ReaderAt) error {
-	if off < 0 || off > e.size || next != e.chunkAt(off) {
+	// A checkpoint at the very end follows the last chunk (see Snapshot).
+	end := off == e.size
+	expect := e.chunkAt(off)
+	if end {
+		expect = e.chunks
+	}
+	if off < 0 || off > e.size || next != expect {
 		return errors.New("checkpoint does not match the encrypted file")
 	}
 	h := sha256.New()
@@ -368,15 +374,17 @@ func (e *Encrypter) ResumeAt(off int64, state []byte, next int64, written io.Rea
 	e.pos, e.curIdx = off, -1
 
 	// Compare what is on tape before off with what would be written.
-	from := e.start
+	var from int64
 	var want []byte
 	if off <= e.start {
 		from, want = 0, append(bytes.Clone(e.p.Header), e.p.Nonce...)[:off]
 	} else {
-		if err := e.seal(next); err != nil {
+		// At the end, the last chunk is compared; it was hashed already.
+		i := min(next, e.chunks-1)
+		if err := e.seal(i); err != nil {
 			return err
 		}
-		from = e.start + next*sealedSize
+		from = e.start + i*sealedSize
 		want = e.cur[:off-from]
 	}
 	if len(want) == 0 {

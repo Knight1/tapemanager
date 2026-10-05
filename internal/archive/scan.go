@@ -94,6 +94,15 @@ func (tf *tapeFile) scan(sink io.WriterAt, prog io.Writer) (*scanResult, error) 
 	size, cs := tf.entry.Size, tf.chunkSize()
 	res := &scanResult{tail: -1}
 	keep := tf.parity != nil && tf.parity.Layout.Scheme == parity.SchemeSmall
+	// Read-ahead buffers, and for small-file parity the whole file plus
+	// what a repair of it takes (shards and the rebuilt file).
+	need := int64(readAhead+2) * cs
+	if keep {
+		need += 3*size + 2*int64(tf.parity.Layout.M)*tf.parity.Layout.ShardSize
+	}
+	if err := ensureMemory(need, "reading "+tf.entry.Path); err != nil {
+		return nil, err
+	}
 	if keep {
 		res.data = make([]byte, size)
 	}
@@ -204,6 +213,10 @@ func (tf *tapeFile) repair(s *scanResult, emit func(off int64, b []byte) error) 
 
 	if tf.chunks == nil || tf.chunks.ChunkSize != p.Layout.ShardSize {
 		return errors.New("chunk hashes needed to locate damage are missing")
+	}
+	// One stripe at a time: its shards plus padded copies.
+	if err := ensureMemory(2*int64(p.Layout.K+p.Layout.M)*p.Layout.ShardSize, "repairing "+tf.entry.Path); err != nil {
+		return err
 	}
 	bad := s.bad
 	if s.tail >= 0 {

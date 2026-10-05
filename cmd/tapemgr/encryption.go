@@ -101,13 +101,14 @@ var keyPrefixPattern = regexp.MustCompile(`^[A-Za-z0-9]{3}$`)
 // manager format: alternating DK= and DKi= lines).
 func cmdDriveKeygen(args []string, stdout, stderr io.Writer) int {
 	fs, _ := newFlagSet("drive keygen", stderr)
-	out := fs.String("out", "", "LTFS key file to add the key to (created if missing)")
+	out := fs.String("out", "", "new LTFS key file (an existing one only with --append)")
 	prefix := fs.String("prefix", "TMG", "three letters or digits that start the key ID")
+	appendKey := fs.Bool("append", false, "add the key to an existing key file instead of refusing it")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
 	if *out == "" || fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "usage: tapemgr drive keygen --out FILE [--prefix ABC]")
+		fmt.Fprintln(stderr, "usage: tapemgr drive keygen --out FILE [--append] [--prefix ABC]")
 		return exitUsage
 	}
 	if !keyPrefixPattern.MatchString(*prefix) {
@@ -118,6 +119,8 @@ func cmdDriveKeygen(args []string, stdout, stderr io.Writer) int {
 	var old []byte
 	st, err := os.Lstat(*out)
 	switch {
+	case err == nil && !*appendKey:
+		return fail(stderr, fmt.Errorf("%s already exists; pass --append to add a new key to it", *out))
 	case err == nil:
 		if !st.Mode().IsRegular() {
 			return fail(stderr, fmt.Errorf("%s is not a regular file", *out))
@@ -156,7 +159,15 @@ func cmdDriveKeygen(args []string, stdout, stderr io.Writer) int {
 	data = fmt.Appendf(data, "DK=%s\nDKi=%s\n", base64.StdEncoding.EncodeToString(key[:]), dki)
 	// The old file stays in place until the new one is complete: losing
 	// the key file means losing every tape encrypted with it.
-	if err := manifest.WriteFileAtomicPerm(*out, data, 0o600); err != nil {
+	write := manifest.WriteFileAtomicPerm
+	if len(old) == 0 && !*appendKey {
+		// A new file: never replace one that appeared in the meantime.
+		write = manifest.WriteFileNew
+	}
+	if err := write(*out, data, 0o600); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fail(stderr, fmt.Errorf("%s already exists; pass --append to add a new key to it", *out))
+		}
 		return fail(stderr, err)
 	}
 	fmt.Fprintf(stdout, `Added key %[1]s to %[2]s.

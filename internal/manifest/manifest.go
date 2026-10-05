@@ -19,6 +19,8 @@ package manifest
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -403,6 +405,50 @@ func WriteFileAtomicPerm(name string, data []byte, perm os.FileMode) error {
 		}
 		return SyncDir(filepath.Dir(name))
 	})
+}
+
+// WriteFileNew creates name with data and perm, failing with an error
+// matching os.ErrExist if it exists, even if it appears while this runs. The
+// complete file is linked into place, so a crash never leaves a partial
+// file under name. Filesystems without hard links get an exclusive create
+// instead.
+func WriteFileNew(name string, data []byte, perm os.FileMode) error {
+	var rnd [8]byte
+	rand.Read(rnd[:])
+	tmp := name + ".new-" + hex.EncodeToString(rnd[:])
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+	if err := f.Chmod(perm); err != nil { // independent of the umask
+		f.Close()
+		return err
+	}
+	if err := finishAtomic(f, data, func() error { return nil }); err != nil {
+		return err
+	}
+	err = os.Link(tmp, name)
+	if err != nil && !errors.Is(err, os.ErrExist) {
+		// No hard links (FAT, some network filesystems).
+		return writeExclusive(name, data, perm)
+	}
+	if err != nil {
+		return err
+	}
+	return SyncDir(filepath.Dir(name))
+}
+
+func writeExclusive(name string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return err
+	}
+	if err := finishAtomic(f, data, func() error { return SyncDir(filepath.Dir(name)) }); err != nil {
+		os.Remove(name) // created above, so it is this partial file
+		return err
+	}
+	return nil
 }
 
 // SyncDir makes creates, renames and removals in dir durable. Filesystems

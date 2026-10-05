@@ -29,6 +29,7 @@ Usage:
   tapemgr archive recover [flags]          record files on tape that have no manifest entry
   tapemgr archive restore [flags] --to DIR [path]
                                            copy files from tape, repairing damage with parity
+  tapemgr archive repair-volume [flags]    rebuild a damaged or missing volume record from the catalog
   tapemgr archive keygen --out FILE        create an age key pair for --encrypt-to
   tapemgr catalog import [flags]           copy the mounted tape's manifest into the catalog
   tapemgr catalog tapes [flags]            list known tapes
@@ -41,7 +42,7 @@ Usage:
   tapemgr drive load [flags]               load the inserted cartridge
   tapemgr drive eject [flags]              rewind and eject the cartridge (refused while mounted)
   tapemgr drive firmware --file IMAGE      update the drive's firmware (asks for confirmation)
-  tapemgr drive keygen --out FILE          add a new key to an LTFS key file for drive encryption
+  tapemgr drive keygen --out FILE          create an LTFS key file for drive encryption (--append adds to one)
   tapemgr version
 
 Common flags:
@@ -55,7 +56,7 @@ Run 'tapemgr <group> <command> -h' for command flags.
 `
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.Stdin, termSafe{os.Stdout}, termSafe{os.Stderr}))
 }
 
 // Exit codes.
@@ -90,8 +91,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		"drive keygen":    cmdDriveKeygen,
 	}
 	if len(args) >= 2 {
+		lock, err := takeLock(args[0] + " " + args[1])
+		if err != nil {
+			return fail(stderr, err)
+		}
+		defer lock.Unlock()
 		if args[0] == "archive" && args[1] == "purge-source" {
 			return cmdPurge(args[2:], stdin, stdout, stderr)
+		}
+		if args[0] == "archive" && args[1] == "repair-volume" {
+			return cmdRepairVolume(args[2:], stdin, stdout, stderr)
 		}
 		if args[0] == "drive" && args[1] == "firmware" {
 			return cmdDriveFirmware(args[2:], stdin, stdout, stderr)
@@ -161,7 +170,11 @@ func (cf *commonFlags) checkTape() error {
 // progressOut returns stderr when it is a terminal, so progress bars do not
 // end up in logs or pipes.
 func progressOut(stderr io.Writer) io.Writer {
-	f, ok := stderr.(*os.File)
+	w := stderr
+	if u, ok := w.(interface{ Unwrap() io.Writer }); ok {
+		w = u.Unwrap()
+	}
+	f, ok := w.(*os.File)
 	if !ok {
 		return nil
 	}

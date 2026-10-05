@@ -14,6 +14,7 @@ import (
 	"github.com/Knight1/tapemanager/internal/catalog"
 	"github.com/Knight1/tapemanager/internal/ltfs"
 	"github.com/Knight1/tapemanager/internal/manifest"
+	"github.com/Knight1/tapemanager/internal/memcheck"
 )
 
 // VerifyOptions configures Verify.
@@ -73,6 +74,11 @@ func Verify(opts VerifyOptions) (res VerifyResult, err error) {
 	if opts.Catalog != nil && full && (vol != nil || volErr != nil) {
 		defer func() {
 			res.Duration = time.Since(start)
+			// Too little memory on this machine says nothing about the
+			// tape: nothing is recorded, an earlier result stands.
+			if errors.Is(err, memcheck.ErrNoMemory) {
+				return
+			}
 			if err != nil && !errors.Is(err, ErrNoEntries) {
 				res.Failed++
 			}
@@ -156,7 +162,13 @@ func Verify(opts VerifyOptions) (res VerifyResult, err error) {
 			continue
 		}
 		fmt.Fprintf(opts.Log, "VERIFYING: %s\n", e.Path)
-		switch status, detail := verifyFile(tape, e, chunks, par, opts.Progress); status {
+		status, detail, ferr := verifyFile(tape, e, chunks, par, opts.Progress)
+		if ferr != nil {
+			// Not the tape's fault: stop, and never count it as damage.
+			res.Duration = time.Since(start)
+			return res, fmt.Errorf("verification stopped at %s: %w", e.Path, ferr)
+		}
+		switch status {
 		case statusOK:
 			fmt.Fprintf(opts.Log, "       OK\n")
 			res.Verified++
@@ -244,35 +256,42 @@ const (
 	statusFailed
 )
 
-func verifyFile(tape *manifest.Tape, e manifest.Entry, chunks map[string]manifest.Chunks, par map[string]manifest.Parity, prog io.Writer) (fileStatus, string) {
+// verifyFile checks one file. err is set only for problems of this machine
+// (not enough memory), which say nothing about the tape.
+func verifyFile(tape *manifest.Tape, e manifest.Entry, chunks map[string]manifest.Chunks, par map[string]manifest.Parity, prog io.Writer) (status fileStatus, detail string, err error) {
 	tf, err := openTapeFile(tape, e, chunks, par)
 	if err != nil {
-		return statusFailed, err.Error()
+		return statusFailed, err.Error(), nil
 	}
 	defer tf.Close()
 	// Encrypted files are checked as stored; no key is needed.
 	e = tf.entry
 	if tf.size > e.Size {
-		return statusFailed, fmt.Sprintf("file is larger than recorded (%d > %d bytes)", tf.size, e.Size)
+		return statusFailed, fmt.Sprintf("file is larger than recorded (%d > %d bytes)", tf.size, e.Size), nil
 	}
 
 	p := startProgress(prog, e.Size)
 	s, err := tf.scan(nil, p)
 	p.finish()
+	if errors.Is(err, memcheck.ErrNoMemory) {
+		return statusFailed, "", err
+	}
 	if err != nil {
-		return statusFailed, err.Error()
+		return statusFailed, err.Error(), nil
 	}
 	if s.intact(e) {
-		return statusOK, ""
+		return statusOK, "", nil
 	}
-	detail := describeDamage(s, e, tf.chunkSize())
+	detail = describeDamage(s, e, tf.chunkSize())
 	if tf.parity == nil {
-		return statusFailed, detail
+		return statusFailed, detail, nil
 	}
-	if err := tf.repair(s, nil); err != nil {
-		return statusFailed, fmt.Sprintf("%s; parity cannot repair it: %v", detail, err)
+	if err := tf.repair(s, nil); errors.Is(err, memcheck.ErrNoMemory) {
+		return statusFailed, "", err
+	} else if err != nil {
+		return statusFailed, fmt.Sprintf("%s; parity cannot repair it: %v", detail, err), nil
 	}
-	return statusRepairable, detail
+	return statusRepairable, detail, nil
 }
 
 // hashStream reads r to the end in chunkSize pieces and returns the SHA-256

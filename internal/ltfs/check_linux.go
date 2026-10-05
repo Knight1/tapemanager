@@ -1,9 +1,10 @@
 package ltfs
 
 import (
-	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -33,8 +34,15 @@ func VolumeUUID(path string) string {
 	if err != nil {
 		return ""
 	}
-	return string(buf[:n])
+	// The value comes from the tape and ends up in the catalog.
+	u := strings.TrimRight(string(buf[:n]), "\x00\n")
+	if !uuidPattern.MatchString(u) {
+		return ""
+	}
+	return strings.ToLower(u)
 }
+
+var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // StartBlock returns the tape block where the file at path begins, as
 // reported by LTFS, so files can be read in tape order. ok is false if
@@ -72,16 +80,24 @@ func FreeSpace(path string) (int64, error) {
 	return int64(st.Bavail) * int64(st.Bsize), nil
 }
 
+// Replaceable in tests.
+var (
+	setxattr   = syscall.Setxattr
+	volumeUUID = VolumeUUID
+)
+
 // SyncIndex makes LTFS write its index to tape now, so everything written
 // so far survives a host crash. LTFS otherwise writes the index only every
 // few minutes or at unmount, and after a crash rolls back to the last one.
-// It returns nil for directories that are not LTFS mounts.
+// It returns nil for directories that are not LTFS mounts (no volume UUID).
+// On LTFS every error counts, including "not supported": callers drop
+// their local copy of records once this returns nil.
 func SyncIndex(root string) error {
-	err := syscall.Setxattr(root, "user.ltfs.sync", []byte("1"), 0)
-	if err == nil || errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENODATA) {
+	err := setxattr(root, "user.ltfs.sync", []byte("1"), 0)
+	if err == nil {
 		return nil
 	}
-	if CheckMounted(root) != nil {
+	if volumeUUID(root) == "" {
 		return nil // not LTFS, for example a test directory
 	}
 	return fmt.Errorf("forcing the LTFS index to tape: %w", err)

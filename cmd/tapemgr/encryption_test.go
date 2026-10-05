@@ -154,8 +154,15 @@ func TestDriveKeygen(t *testing.T) {
 	if st, _ := os.Stat(keys); st.Mode().Perm() != 0o600 {
 		t.Fatalf("mode %o", st.Mode().Perm())
 	}
-	// A second key is added; the first is kept.
-	if code, _, _ := runCmd(t, "drive", "keygen", "--out", keys, "--prefix", "AB1"); code != 0 {
+	// An existing key file is never touched without --append.
+	if code, _, errOut := runCmd(t, "drive", "keygen", "--out", keys, "--prefix", "AB1"); code != exitFailure || !strings.Contains(errOut, "pass --append") {
+		t.Fatalf("existing file without --append: %d %s", code, errOut)
+	}
+	if b1, _ := os.ReadFile(keys); string(b1) != string(b) {
+		t.Fatal("key file changed without --append")
+	}
+	// With --append a second key is added; the first is kept.
+	if code, _, _ := runCmd(t, "drive", "keygen", "--out", keys, "--prefix", "AB1", "--append"); code != 0 {
 		t.Fatal("second key")
 	}
 	b2, _ := os.ReadFile(keys)
@@ -164,12 +171,12 @@ func TestDriveKeygen(t *testing.T) {
 	}
 
 	os.Chmod(keys, 0o640)
-	if code, _, errOut := runCmd(t, "drive", "keygen", "--out", keys); code != exitFailure || !strings.Contains(errOut, "chmod 600") {
+	if code, _, errOut := runCmd(t, "drive", "keygen", "--out", keys, "--append"); code != exitFailure || !strings.Contains(errOut, "chmod 600") {
 		t.Fatalf("readable by group: %d %s", code, errOut)
 	}
 	link := filepath.Join(dir, "link")
 	os.Symlink(keys, link)
-	if code, _, errOut := runCmd(t, "drive", "keygen", "--out", link); code != exitFailure || !strings.Contains(errOut, "not a regular file") {
+	if code, _, errOut := runCmd(t, "drive", "keygen", "--out", link, "--append"); code != exitFailure || !strings.Contains(errOut, "not a regular file") {
 		t.Fatalf("symlink: %d %s", code, errOut)
 	}
 	for _, bad := range []string{"AB", "ABCD", "A/B", "a:b"} {

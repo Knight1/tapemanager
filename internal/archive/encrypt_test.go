@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -181,6 +182,10 @@ func TestEncryptedResume(t *testing.T) {
 // The source changed after the interruption, keeping size and mtime: the
 // write starts over with a new key instead of mixing versions.
 func TestEncryptedResumeSourceChanged(t *testing.T) {
+	// Without a change ID (other platforms), the comparison with what is
+	// already on tape must catch the rewrite.
+	changeID = func(fs.FileInfo) string { return "" }
+	defer func() { changeID = fileChangeID }()
 	src, tape, big := encSetup(t)
 	id := ageIdentity(t)
 	o := encOpts(t, src, tape, id)
@@ -459,5 +464,31 @@ func TestEncryptedResumeWithParity(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(filepath.Join(dest, "downloads", "big.bin")); !bytes.Equal(got, big) {
 		t.Fatal("repaired file differs")
+	}
+}
+
+// A source rewritten with its old mtime kept is noticed by its change ID
+// before anything is resumed: the file is written anew.
+func TestResumeSourceRewrittenSameMtime(t *testing.T) {
+	src, tape, big := encSetup(t)
+	id := ageIdentity(t)
+	o := encOpts(t, src, tape, id)
+	path := filepath.Join(src, "big.bin")
+	crashAt(t, "checkpoint", 100<<10)
+	Put(o)
+	testHook = nil
+
+	st, _ := os.Stat(path)
+	changed := bytes.Clone(big)
+	changed[200<<10] ^= 0xff // after the checkpoint
+	os.WriteFile(path, changed, 0o644)
+	os.Chtimes(path, st.ModTime(), st.ModTime())
+
+	sum, err := Put(o)
+	if err != nil || sum.Resumed != 0 {
+		t.Fatalf("%+v %v", sum, err)
+	}
+	if got := decryptFile(t, filepath.Join(tape, "downloads", "big.bin.age"), id); !bytes.Equal(got, changed) {
+		t.Fatal("file does not hold the new version")
 	}
 }

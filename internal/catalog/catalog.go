@@ -194,13 +194,28 @@ func (c *Catalog) RecordWritten(id string, entries []manifest.Entry) error {
 	if err := os.MkdirAll(filepath.Join(c.Dir, "written"), 0o755); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(c.writtenPath(id), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(c.writtenPath(id), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
 	if err := manifest.SyncDir(filepath.Dir(c.writtenPath(id))); err != nil {
 		f.Close()
 		return err
+	}
+	// A crash can leave a torn last record. Start on a new line, so only
+	// that record is lost and not the first one written now.
+	if st, err := f.Stat(); err != nil {
+		f.Close()
+		return err
+	} else if st.Size() > 0 {
+		last := make([]byte, 1)
+		if _, err := f.ReadAt(last, st.Size()-1); err != nil {
+			f.Close()
+			return err
+		}
+		if last[0] != '\n' {
+			data = append([]byte{'\n'}, data...)
+		}
 	}
 	if _, err := f.Write(data); err != nil {
 		f.Close()
@@ -269,25 +284,7 @@ func (c *Catalog) FindTape(ltfsUUID string, entries []manifest.Entry) string {
 			}
 			continue
 		}
-		if len(entries) == 0 {
-			continue
-		}
-		known, err := c.Entries(t.ID)
-		if err != nil {
-			continue
-		}
-		sums := make(map[string]string, len(known))
-		for _, e := range known {
-			sums[e.Path] = e.SHA256
-		}
-		all := true
-		for _, e := range entries[:min(len(entries), 50)] {
-			if sums[e.Path] != e.SHA256 {
-				all = false
-				break
-			}
-		}
-		if all {
+		if len(entries) > 0 && c.Matches(t.ID, entries) {
 			match = append(match, t.ID)
 		}
 	}
@@ -295,6 +292,29 @@ func (c *Catalog) FindTape(ltfsUUID string, entries []manifest.Entry) string {
 		return match[0]
 	}
 	return ""
+}
+
+// Matches reports whether entries read from a tape agree with the
+// cataloged manifest of tape id: each of the first 50 has the same path and
+// SHA-256 there. It is false for no entries or an unknown tape.
+func (c *Catalog) Matches(id string, entries []manifest.Entry) bool {
+	if len(entries) == 0 {
+		return false
+	}
+	known, err := c.Entries(id)
+	if err != nil || len(known) == 0 {
+		return false
+	}
+	sums := make(map[string]string, len(known))
+	for _, e := range known {
+		sums[e.Path] = e.SHA256
+	}
+	for _, e := range entries[:min(len(entries), 50)] {
+		if sums[e.Path] != e.SHA256 {
+			return false
+		}
+	}
+	return true
 }
 
 // JournalDir returns the directory for resume journals of tape id.
@@ -386,6 +406,10 @@ func (c *Catalog) Tape(id string) (*Tape, error) {
 	var t Tape
 	if err := json.Unmarshal(b, &t); err != nil {
 		return nil, fmt.Errorf("%s: %w", c.recordPath(id), err)
+	}
+	// The ID names further files; a record must not point elsewhere.
+	if t.ID != id {
+		return nil, fmt.Errorf("%s: record is for tape %q", c.recordPath(id), t.ID)
 	}
 	return &t, nil
 }

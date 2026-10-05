@@ -83,8 +83,10 @@ func Recover(opts RecoverOptions) (res RecoverResult, err error) {
 		return res, err
 	}
 	known := make(map[string]bool, len(existing))
+	names := make(map[string]bool, len(existing)) // manifest paths
 	for _, e := range existing {
 		known[e.TapePath()] = true
+		names[e.Path] = true
 	}
 
 	type orphan struct {
@@ -108,7 +110,15 @@ func Recover(opts RecoverOptions) (res RecoverResult, err error) {
 			}
 			return nil
 		}
-		if rel == manifest.SumsName || known[rel] {
+		// SHA256SUMS.tmp is left by a crash while it was rewritten; the
+		// next write replaces it.
+		if rel == manifest.SumsName || rel == manifest.SumsName+".tmp" || known[rel] {
+			return nil
+		}
+		if names[rel] {
+			// An encrypted file is recorded under this name and stored
+			// with the age suffix; two records must not share a path.
+			fmt.Fprintf(opts.Log, "IGNORED:   %s (the name of an encrypted file on this tape)\n", rel)
 			return nil
 		}
 		if strings.HasSuffix(rel, PartialSuffix) {

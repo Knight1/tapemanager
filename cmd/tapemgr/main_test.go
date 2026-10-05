@@ -171,3 +171,37 @@ func TestCLIRestoreRepairs(t *testing.T) {
 		t.Fatal("restore without --to accepted")
 	}
 }
+
+func TestCLIRepairVolume(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "dl")
+	tape := filepath.Join(base, "tape")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(tape, 0o755)
+	os.WriteFile(filepath.Join(src, "f"), []byte("data"), 0o644)
+	common := []string{"--tape", tape, "--catalog", filepath.Join(base, "cat"), "--no-mount-check"}
+	if code, _, errOut := runCmd(t, append(append([]string{"archive", "put", "--label", "T-7"}, common...), src)...); code != 0 {
+		t.Fatal(errOut)
+	}
+	vol := filepath.Join(tape, ".tapemgr", "volume.json")
+	good, _ := os.ReadFile(vol)
+	os.WriteFile(vol, []byte("{broken"), 0o644)
+
+	code, out := runWithInput("n\n", append([]string{"archive", "repair-volume"}, common...)...)
+	if code != exitFailure || !strings.Contains(out, "Aborted. Nothing was written.") || !strings.Contains(out, "T-7") || !strings.Contains(out, "records on the tape match") {
+		t.Fatalf("abort: %d %s", code, out)
+	}
+	if b, _ := os.ReadFile(vol); string(b) != "{broken" {
+		t.Fatal("written without confirmation")
+	}
+	code, out = runWithInput("y\n", append([]string{"archive", "repair-volume"}, common...)...)
+	if code != 0 || !strings.Contains(out, "rebuilt") {
+		t.Fatalf("repair: %d %s", code, out)
+	}
+	if b, _ := os.ReadFile(vol); !strings.Contains(string(b), `"label": "T-7"`) || len(b) == 0 {
+		t.Fatalf("record %q (was %q)", b, good)
+	}
+	if code, out := runWithInput("", append([]string{"archive", "repair-volume", "--yes"}, common...)...); code != exitFailure || !strings.Contains(out, "nothing to repair") {
+		t.Fatalf("second run: %d %s", code, out)
+	}
+}

@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -64,14 +66,95 @@ func (t *Tape) Volume() (*Volume, error) {
 	if !ValidID(v.ID) {
 		return nil, fmt.Errorf("%s: invalid volume ID %q", VolumeName, v.ID)
 	}
+	// The label is shown to the user; a crafted one must not forge lines.
+	v.Label = CleanLabel(v.Label)
+	if !ValidID(strings.ToLower(v.LTFSUUID)) {
+		v.LTFSUUID = ""
+	}
 	return &v, nil
+}
+
+// ErrVolumeMissing means the tape has tapemgr records but no volume record.
+var ErrVolumeMissing = errors.New("the tape has tapemgr records but no volume record (.tapemgr/volume.json); rebuild it with 'tapemgr archive repair-volume'")
+
+// HasRecords reports whether the tape holds any tapemgr manifest segment.
+func (t *Tape) HasRecords() (bool, error) {
+	nums, err := t.segments()
+	return len(nums) > 0, err
+}
+
+// RepairVolume writes v as the tape's volume record, replacing a damaged or
+// missing one. A damaged file is kept as volume.json.damaged first.
+func (t *Tape) RepairVolume(v Volume) error {
+	if !ValidID(v.ID) {
+		return fmt.Errorf("invalid volume ID %q", v.ID)
+	}
+	v.Label = CleanLabel(v.Label)
+	if err := t.root.MkdirAll(Dir, 0o755); err != nil {
+		return err
+	}
+	name := path.Join(Dir, VolumeName)
+	if f, err := t.root.Open(name); err == nil {
+		old, rerr := io.ReadAll(io.LimitReader(f, maxVolumeFileSize))
+		f.Close()
+		if rerr == nil {
+			rerr = t.writeAtomic(name+".damaged", old)
+		}
+		if rerr != nil {
+			return fmt.Errorf("keeping the damaged record: %w", rerr)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	return t.writeAtomic(name, append(b, '\n'))
+}
+
+// MaxLabel is the longest tape label kept.
+const MaxLabel = 128
+
+// CleanLabel replaces control characters in a label read from a tape and
+// cuts it to MaxLabel bytes.
+func CleanLabel(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || r == utf8.RuneError {
+			return '?'
+		}
+		return r
+	}, s)
+	if len(s) > MaxLabel {
+		s = strings.ToValidUTF8(s[:MaxLabel], "")
+	}
+	return s
+}
+
+// ValidLabel reports whether a label given by the user can be stored as it
+// is.
+func ValidLabel(s string) bool {
+	return utf8.ValidString(s) && CleanLabel(s) == s
 }
 
 // InitVolume returns the tape identity, creating it on first use.
 func (t *Tape) InitVolume(label, ltfsUUID string) (*Volume, error) {
 	v, err := t.Volume()
-	if err != nil || v != nil {
-		return v, err
+	if err != nil {
+		return nil, fmt.Errorf("%w; if the tape is otherwise fine, rebuild the record with 'tapemgr archive repair-volume'", err)
+	}
+	if v != nil {
+		return v, nil
+	}
+	// A tape with records but no identity lost its volume record. A new
+	// identity would make it a different tape to the catalog.
+	if nums, err := t.segments(); err != nil {
+		return nil, err
+	} else if len(nums) > 0 {
+		return nil, ErrVolumeMissing
+	}
+	if !ValidLabel(label) {
+		return nil, fmt.Errorf("invalid tape label %q: control characters, or longer than %d bytes", label, MaxLabel)
 	}
 	v = &Volume{ID: newID(), Label: label, LTFSUUID: ltfsUUID, Created: time.Now().UTC()}
 	b, err := json.MarshalIndent(v, "", "  ")

@@ -256,3 +256,66 @@ func TestCatalogUpdated(t *testing.T) {
 		t.Fatalf("hits = %+v", hits)
 	}
 }
+
+// A partial file that cannot be cut back to the resume point must stop the
+// run; writing on would put the rest at the start of the file.
+func TestResumeTruncateFails(t *testing.T) {
+	_, tape, data, o := bigSetup(t)
+	crashAt(t, "checkpoint", 512)
+	if _, err := Put(o); !errors.Is(err, errCrash) {
+		t.Fatalf("err = %v", err)
+	}
+	testHook = nil
+	errTrunc := errors.New("truncate failed")
+	truncateFile = func(*os.File, int64) error { return errTrunc }
+	_, err := Put(o)
+	truncateFile = (*os.File).Truncate
+	if !errors.Is(err, errTrunc) {
+		t.Fatalf("err = %v", err)
+	}
+	if entries, _ := loadEntries(tape); len(entries) != 0 {
+		t.Fatalf("recorded %d files after a failed resume", len(entries))
+	}
+	if _, err := Put(o); err != nil {
+		t.Fatal(err)
+	}
+	checkTapeFile(t, tape, data)
+}
+
+// A crash between recording a file and deleting its journal leaves the
+// journal; the next run removes it, and with it the staged parity.
+func TestRecordedJournalRemoved(t *testing.T) {
+	_, tape, data, o := bigSetup(t)
+	o.Parity = 10
+	if _, err := Put(o); err != nil {
+		t.Fatal(err)
+	}
+	vol := loadVolumeID(t, tape)
+	jpath := journalPath(o.Catalog.JournalDir(vol), "src/big.bin")
+	ppath := filepath.Join(o.Catalog.ParityDir(vol), fileKey("src/big.bin")+".bin")
+	writeFile(t, jpath, "{}\n")
+	writeFile(t, ppath, "stale parity")
+	if _, err := Put(o); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{jpath, ppath} {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s left behind: %v", p, err)
+		}
+	}
+	checkTapeFile(t, tape, data)
+}
+
+func loadVolumeID(t *testing.T, tape string) string {
+	t.Helper()
+	tp, err := manifest.Open(tape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tp.Close()
+	v, err := tp.Volume()
+	if err != nil || v == nil {
+		t.Fatalf("%v %v", v, err)
+	}
+	return v.ID
+}

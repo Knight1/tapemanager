@@ -26,6 +26,7 @@ import (
 	"github.com/Knight1/tapemanager/internal/catalog"
 	"github.com/Knight1/tapemanager/internal/ltfs"
 	"github.com/Knight1/tapemanager/internal/manifest"
+	"github.com/Knight1/tapemanager/internal/memcheck"
 	"github.com/Knight1/tapemanager/internal/parity"
 )
 
@@ -67,6 +68,18 @@ var (
 
 // readOnly reports a read-only mount. Tests replace it.
 var readOnly = ltfs.ReadOnly
+
+// changeID identifies a version of a source file (see fileChangeID). Tests
+// replace it.
+var changeID = fileChangeID
+
+// ensureMemory checks that an allocation fits in free memory. Tests
+// replace it.
+var ensureMemory = memcheck.Ensure
+
+// truncateFile cuts a partial file back to its resume point. Tests replace
+// it.
+var truncateFile = (*os.File).Truncate
 
 // metadataReserve estimates the tape space the next segment write needs
 // beyond staged parity: manifest and chunk lists, and a rewritten
@@ -358,6 +371,7 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 		}
 	}
 
+	removeRecordedJournals(journalDir, existing)
 	removeStaleParity(parityDir, journalDir)
 	if err := tape.EnsureSums(existing); err != nil {
 		return sum, err
@@ -690,6 +704,26 @@ func checkSpace(opts PutOptions, j job, size int64, l *parity.Layout, pend *pend
 	return nil
 }
 
+// removeRecordedJournals deletes resume journals of files already in the
+// tape manifest. A crash between recording a file and deleting its journal
+// leaves one behind; such a file is never written again, and its journal
+// would keep its staged parity forever.
+func removeRecordedJournals(journalDir string, existing []manifest.Entry) {
+	names, _ := filepath.Glob(filepath.Join(journalDir, "*.jsonl"))
+	if len(names) == 0 {
+		return
+	}
+	recorded := make(map[string]bool, len(existing))
+	for _, e := range existing {
+		recorded[fileKey(e.Path)] = true
+	}
+	for _, n := range names {
+		if recorded[strings.TrimSuffix(filepath.Base(n), ".jsonl")] {
+			os.Remove(n)
+		}
+	}
+}
+
 // removeStaleParity deletes staged parity of files that are neither pending
 // nor in progress. It runs after pending records were flushed, so only
 // files with a resume journal still need their staged parity.
@@ -836,7 +870,7 @@ func archiveFile(fs fileState) (*archived, error) {
 	}
 	dst := filepath.FromSlash(tapeRel)
 	partial := dst + PartialSuffix
-	hdr := journalHeader{Source: j.src, Path: j.rel, Size: j.info.Size(), MTime: j.info.ModTime(), ChunkSize: opts.ChunkSize, ParityM: fs.m, Recipients: opts.recipientNames}
+	hdr := journalHeader{Source: j.src, Path: j.rel, Size: j.info.Size(), MTime: j.info.ModTime(), Change: changeID(j.info), ChunkSize: opts.ChunkSize, ParityM: fs.m, Recipients: opts.recipientNames}
 
 	oldHdr, points, err := loadJournal(fs.jpath)
 	if err != nil {
@@ -930,6 +964,20 @@ func archiveFile(fs fileState) (*archived, error) {
 		hdr.Age = params
 	}
 
+	// Read-ahead buffers and the parity state: a window of parity for
+	// large files, or the whole file and its shards for small ones.
+	need := int64(readAhead+2) * opts.ChunkSize
+	if layout != nil {
+		if layout.Scheme == parity.SchemeSmall {
+			need += 2*layout.Size + int64(layout.K+layout.M)*layout.ShardSize
+		} else {
+			need += int64(layout.D*layout.M+1) * layout.ShardSize
+		}
+	}
+	if err := ensureMemory(need, "archiving "+j.src); err != nil {
+		return nil, err
+	}
+
 	if fs.check != nil {
 		var reused int64
 		if start != nil {
@@ -952,7 +1000,9 @@ func archiveFile(fs fileState) (*archived, error) {
 			return nil, err
 		}
 		t.offset, t.chunks = start.offset, start.chunks
-		if err := t.out.Truncate(t.offset); err == nil {
+		// err is the outer one: a failed truncate or seek must stop the
+		// resume, or the rest would be written at the start of the file.
+		if err = truncateFile(t.out, t.offset); err == nil {
 			_, err = t.out.Seek(t.offset, io.SeekStart)
 		}
 		if err == nil && crypt == nil {
@@ -1068,7 +1118,7 @@ func archiveFile(fs fileState) (*archived, error) {
 // completely wrote and renamed into place, or nil if dst cannot be
 // trusted to be that file.
 func finishedEarlier(root *os.Root, dst string, j job, ppath string, oldHdr *journalHeader, points []resumePoint, encrypt bool) *archived {
-	hdr := journalHeader{Source: j.src, Path: j.rel, Size: j.info.Size(), MTime: j.info.ModTime()}
+	hdr := journalHeader{Source: j.src, Path: j.rel, Size: j.info.Size(), MTime: j.info.ModTime(), Change: changeID(j.info)}
 	if oldHdr == nil || !sameSource(*oldHdr, hdr) || len(points) == 0 || (oldHdr.Age != nil) != encrypt {
 		return nil
 	}
@@ -1440,12 +1490,11 @@ func pickResumePoint(root *os.Root, partial string, points []resumePoint, size, 
 }
 
 func sameSource(a, b journalHeader) bool {
-	return a.Source == b.Source && a.Path == b.Path && a.Size == b.Size && a.MTime.Equal(b.MTime)
+	return a.Source == b.Source && a.Path == b.Path && a.Size == b.Size && a.MTime.Equal(b.MTime) && a.Change == b.Change
 }
 
 func sameHeader(a, b journalHeader) bool {
-	return a.Source == b.Source && a.Path == b.Path && a.Size == b.Size && a.MTime.Equal(b.MTime) &&
-		a.ChunkSize == b.ChunkSize && a.ParityM == b.ParityM && slices.Equal(a.Recipients, b.Recipients)
+	return sameSource(a, b) && a.ChunkSize == b.ChunkSize && a.ParityM == b.ParityM && slices.Equal(a.Recipients, b.Recipients)
 }
 
 func entryFor(j job, sum string, a *manifest.Age) manifest.Entry {

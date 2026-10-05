@@ -123,7 +123,7 @@ func (e LogEntry) When() string {
 	return fmt.Sprintf("%dh %dm after a power-on", h, m)
 }
 
-// Findings summarizes the error history for the user. loaded is the serial
+// AnalyzeErrorLog summarizes the error history for the user. loaded is the serial
 // of the cartridge in the drive, current the drive's firmware level.
 func AnalyzeErrorLog(entries []LogEntry, loaded, current string) []string {
 	if len(entries) == 0 {
