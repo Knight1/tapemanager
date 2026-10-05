@@ -154,7 +154,7 @@ an interrupted save can leave the drive unusable.
 	prog := progressOut(stderr)
 	err = drive.UpdateFirmware(d, image, chunk, func(done, total int) {
 		if prog != nil {
-			fmt.Fprintf(prog, "\rSending firmware: %3d%%", done*100/total)
+			fmt.Fprint(prog, firmwareProgress(done, total, chunk))
 		}
 	})
 	if prog != nil {
@@ -186,4 +186,17 @@ an interrupted save can leave the drive unusable.
 	}
 	fmt.Fprintf(stdout, "Firmware updated: %s -> %s.\n", q.Revision, after.Revision)
 	return exitOK
+}
+
+// firmwareProgress returns the progress line shown after done of total
+// bytes were sent. The drive answers the last piece only after it saved the
+// image to flash, often after its restart, so the line says so before that
+// piece is sent instead of seeming to hang.
+func firmwareProgress(done, total, chunk int) string {
+	// Clear the line: the last-piece note is longer than what replaces it.
+	line := fmt.Sprintf("\r\033[KSending firmware: %3d%%", done*100/total)
+	if done < total && total-done <= chunk {
+		line += ", last piece: the drive saves the firmware and restarts before it answers, this takes several minutes"
+	}
+	return line
 }

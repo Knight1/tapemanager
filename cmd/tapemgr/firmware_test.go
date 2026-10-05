@@ -175,3 +175,26 @@ func TestCLIFirmwareSameLevel(t *testing.T) {
 		t.Fatalf("%d %s", code, out)
 	}
 }
+
+func TestFirmwareProgress(t *testing.T) {
+	const chunk = 256
+	for _, c := range []struct {
+		done, total int
+		saving      bool
+	}{
+		{256, 1024, false},
+		{512, 1024, false},
+		{768, 1024, true}, // the next piece is the last
+		{1000, 1024, true},
+		{1024, 1024, false},
+		{256, 257, true},
+	} {
+		got := firmwareProgress(c.done, c.total, chunk)
+		if !strings.HasPrefix(got, "\r\033[KSending firmware: ") || strings.Contains(got, "restarts") != c.saving {
+			t.Errorf("%d/%d: %q", c.done, c.total, got)
+		}
+	}
+	if got := firmwareProgress(1024, 1024, chunk); got != "\r\033[KSending firmware: 100%" {
+		t.Errorf("done: %q", got)
+	}
+}
