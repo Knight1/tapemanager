@@ -138,7 +138,7 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 		f.Downloads++
 		off := int(cdb[3])<<16 | int(cdb[4])<<8 | int(cdb[5])
 		n := int(cdb[6])<<16 | int(cdb[7])<<8 | int(cdb[8])
-		if cdb[1] != 0x07 || cdb[2] != 0 || n != len(buf) || off != len(f.Received) || off%(1<<f.Boundary) != 0 {
+		if cdb[1] != 0x07 || cdb[2] != 0 || n != len(buf) || off != len(f.Received) || off%f.alignment() != 0 {
 			return 0, check(op, drive.SenseIllegalRequest, 0x24, 0)
 		}
 		if f.FailAt > 0 && off >= f.FailAt {
@@ -411,4 +411,18 @@ func IBMImage(loadID, modelID []byte, level string, size int, filler func([]byte
 	copy(b[0x20:0x28], "IBMTpDrv")
 	copy(b[0x300:], "2026/01/02")
 	return b
+}
+
+// alignment is the offset alignment the fake drive enforces. Like the real
+// drive, it accepts any power of two up to 2^23 and treats bytes the
+// standard does not define (IBM H991 reports 0x86) as 64-byte alignment.
+func (f *Fake) alignment() int {
+	switch {
+	case f.Boundary == 0xFF:
+		return 1
+	case f.Boundary < 24:
+		return 1 << f.Boundary
+	default:
+		return 64
+	}
 }

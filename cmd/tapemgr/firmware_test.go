@@ -190,11 +190,36 @@ func TestFirmwareProgress(t *testing.T) {
 		{256, 257, true},
 	} {
 		got := firmwareProgress(c.done, c.total, chunk)
-		if !strings.HasPrefix(got, "\r\033[KSending firmware: ") || strings.Contains(got, "restarts") != c.saving {
+		// Same width for every line, no escape sequences, fits 80 columns.
+		if !strings.HasPrefix(got, "\rSending firmware: ") || strings.Contains(got, "restarts") != c.saving ||
+			len(got) != 1+firmwareProgressWidth || firmwareProgressWidth >= 80 || strings.ContainsRune(got, 0x1b) {
 			t.Errorf("%d/%d: %q", c.done, c.total, got)
 		}
 	}
-	if got := firmwareProgress(1024, 1024, chunk); got != "\r\033[KSending firmware: 100%" {
+	if got := firmwareProgress(1024, 1024, chunk); strings.TrimRight(got, " ") != "\rSending firmware: 100%" {
 		t.Errorf("done: %q", got)
+	}
+	// Through the terminal filter, the line arrives unchanged.
+	var b strings.Builder
+	termSafe{&b}.Write([]byte(firmwareProgress(768, 1024, chunk)))
+	if b.String() != firmwareProgress(768, 1024, chunk) {
+		t.Errorf("filtered: %q", b.String())
+	}
+}
+
+// IBM LTO-6 firmware H991 reports an offset boundary byte (0x86) that the
+// standard does not define; E6R3 reports a valid one. Both must work.
+func TestCLIFirmwareUndefinedBoundary(t *testing.T) {
+	for _, b := range []byte{0x86, 0xFF, 0} {
+		file, img := firmwareFile(t, 600<<10)
+		f := firmwareFake(t, img)
+		f.Boundary = b
+		code, out := runWithInput("0000000001\n", "drive", "firmware", "--file", file)
+		if code != 0 || !strings.Contains(out, "Firmware updated") || !bytes.Equal(f.Received, img) || f.Downloads != 3 {
+			t.Fatalf("boundary %#x: %d %d pieces %s", b, code, f.Downloads, out)
+		}
+		if note := strings.Contains(out, "offset alignment 0x86, which the SCSI standard does not define"); note != (b == 0x86) {
+			t.Fatalf("boundary %#x: %s", b, out)
+		}
 	}
 }

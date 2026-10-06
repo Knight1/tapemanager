@@ -132,15 +132,21 @@ func FuzzIBMImage(f *testing.F) {
 func FuzzCheckFirmwareImage(f *testing.F) {
 	f.Add(byte(0), 9462288, 0)
 	f.Add(byte(20), 1, 256<<10)
+	f.Add(byte(0x86), 9462288, 0)
+	f.Add(byte(0xFF), 9462288, 0)
 	f.Fuzz(func(t *testing.T, boundary byte, size, chunk int) {
 		if size < 0 || size > 1<<25 {
 			return
 		}
-		chunkOut, err := CheckFirmwareImage(MicrocodeBuffer{Boundary: int(boundary)}, make([]byte, size), chunk)
+		mb := parseMicrocodeBuffer([]byte{boundary, 0, 0, 0})
+		chunkOut, err := CheckFirmwareImage(mb, make([]byte, size), chunk)
 		if err != nil {
 			return
 		}
-		align := 1 << boundary
+		align := DefaultFirmwareChunk
+		if mb.Boundary != BoundaryUndefined {
+			align = 1 << mb.Boundary
+		}
 		if chunkOut <= 0 || chunkOut%align != 0 || chunkOut >= maxOffset {
 			t.Fatalf("chunk %d for boundary %d", chunkOut, boundary)
 		}

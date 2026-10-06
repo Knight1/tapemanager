@@ -106,6 +106,10 @@ func cmdDriveFirmware(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	if err != nil {
 		return fail(stderr, err)
 	}
+	pieces := archive.FormatBytes(int64(chunk))
+	if buf.Boundary == drive.BoundaryUndefined {
+		pieces += fmt.Sprintf(" (the drive reports offset alignment 0x%02x, which the SCSI standard does not define; pieces this size suit any alignment)", buf.Raw)
+	}
 	// IBM images name the drive type they are for; check it before sending.
 	ibm, err := drive.CheckIBMImage(d, q, image)
 	if err != nil {
@@ -132,7 +136,7 @@ Sent in:   pieces of %s
 Compare the SHA-256 with the one the vendor publishes for this file. Make
 sure the image is meant for this exact drive model.
 `, q.Vendor, q.Product, serial, f.SG, q.Revision, *file, archive.FormatBytes(int64(len(image))),
-		hex.EncodeToString(sum[:]), model, archive.FormatBytes(int64(chunk)))
+		hex.EncodeToString(sum[:]), model, pieces)
 	if *dry {
 		fmt.Fprintln(stdout, "\nDry run: the drive and the file passed all checks. Nothing was sent.")
 		return exitOK
@@ -191,12 +195,19 @@ an interrupted save can leave the drive unusable.
 // firmwareProgress returns the progress line shown after done of total
 // bytes were sent. The drive answers the last piece only after it saved the
 // image to flash, often after its restart, so the line says so before that
-// piece is sent instead of seeming to hang.
+// piece is sent instead of seeming to hang. Every line is padded to the
+// same width, so a shorter line overwrites a longer one without leftovers;
+// escape sequences cannot be used because stderr shows them as text. The
+// width stays below 80 columns, since a wrapped line cannot be overwritten.
 func firmwareProgress(done, total, chunk int) string {
-	// Clear the line: the last-piece note is longer than what replaces it.
-	line := fmt.Sprintf("\r\033[KSending firmware: %3d%%", done*100/total)
+	line := fmt.Sprintf("Sending firmware: %3d%%", done*100/total)
 	if done < total && total-done <= chunk {
-		line += ", last piece: the drive saves the firmware and restarts before it answers, this takes several minutes"
+		line += firmwareSavingNote
 	}
-	return line
+	return fmt.Sprintf("\r%-*s", firmwareProgressWidth, line)
 }
+
+const (
+	firmwareSavingNote    = ", the drive saves it and restarts (minutes)"
+	firmwareProgressWidth = len("Sending firmware: 100%") + len(firmwareSavingNote)
+)

@@ -28,9 +28,21 @@ const (
 
 // MicrocodeBuffer describes where firmware images are downloaded to.
 type MicrocodeBuffer struct {
-	Boundary int // offsets must be multiples of 1 << Boundary
-	Capacity int // largest image the drive accepts, in bytes
+	// Boundary: offsets must be multiples of 1 << Boundary. It is
+	// BoundaryUndefined when the drive reports a value the standard does
+	// not define.
+	Boundary int
+	Capacity int  // largest image the drive accepts, in bytes
+	Raw      byte // the offset boundary byte as the drive reported it
 }
+
+// BoundaryUndefined marks an offset boundary byte outside the standard.
+// IBM LTO-6 firmware E6R3 reports a valid boundary, H991 reports 0x86.
+// Pieces are then sent at offsets aligned to DefaultFirmwareChunk, which
+// meets any boundary a drive can sensibly require; a drive that still
+// refuses an offset rejects that piece, and since the image is then
+// incomplete, it keeps its current firmware.
+const BoundaryUndefined = -1
 
 // ReadMicrocodeBuffer asks the drive about its microcode buffer.
 func ReadMicrocodeBuffer(d Device) (MicrocodeBuffer, error) {
@@ -42,7 +54,23 @@ func ReadMicrocodeBuffer(d Device) (MicrocodeBuffer, error) {
 	if n < 4 {
 		return MicrocodeBuffer{}, errShort
 	}
-	return MicrocodeBuffer{Boundary: int(buf[0]), Capacity: int(buf[1])<<16 | int(buf[2])<<8 | int(buf[3])}, nil
+	return parseMicrocodeBuffer(buf), nil
+}
+
+// parseMicrocodeBuffer decodes a READ BUFFER descriptor. The offset
+// boundary is a power of two, with 0xFF meaning no alignment; a power
+// beyond the 3-byte offset field is not defined.
+func parseMicrocodeBuffer(b []byte) MicrocodeBuffer {
+	m := MicrocodeBuffer{Raw: b[0], Capacity: int(b[1])<<16 | int(b[2])<<8 | int(b[3])}
+	switch {
+	case b[0] == 0xFF:
+		m.Boundary = 0
+	case b[0] < 24:
+		m.Boundary = int(b[0])
+	default:
+		m.Boundary = BoundaryUndefined
+	}
+	return m
 }
 
 // FirmwareError is a download that failed partway. The drive activates an
@@ -71,8 +99,13 @@ func CheckFirmwareImage(b MicrocodeBuffer, image []byte, chunk int) (int, error)
 		return 0, fmt.Errorf("the firmware file (%d bytes) is larger than WRITE BUFFER can address (%d bytes)", len(image), maxOffset-1)
 	case b.Boundary > 20:
 		return 0, fmt.Errorf("the drive requires offsets aligned to 2^%d bytes, which is not supported", b.Boundary)
+	case b.Boundary < 0 && b.Boundary != BoundaryUndefined:
+		return 0, fmt.Errorf("invalid offset boundary %d", b.Boundary)
 	}
-	align := 1 << b.Boundary
+	align := DefaultFirmwareChunk
+	if b.Boundary != BoundaryUndefined {
+		align = 1 << b.Boundary
+	}
 	if chunk <= 0 {
 		chunk = DefaultFirmwareChunk
 	}
