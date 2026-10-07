@@ -49,7 +49,7 @@ func TestGlobalLock(t *testing.T) {
 // Every command is either in commandLocks or known to need no lock, so a
 // new command cannot silently run unlocked.
 func TestEveryCommandDecidesItsLock(t *testing.T) {
-	free := map[string]bool{"archive keygen": true, "drive keygen": true, "drive list": true, "catalog tapes": true, "catalog search": true}
+	free := map[string]bool{"archive keygen": true, "drive keygen": true, "drive inspect-firmware": true, "drive list": true, "catalog tapes": true, "catalog search": true}
 	for _, m := range regexp.MustCompile(`(?m)^  tapemgr (\w+ [\w-]+)`).FindAllStringSubmatch(usage, -1) {
 		cmd := m[1]
 		if _, ok := commandLocks[cmd]; !ok && !free[cmd] {

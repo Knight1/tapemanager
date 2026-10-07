@@ -7,12 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/Knight1/tapemanager/internal/archive"
 	"github.com/Knight1/tapemanager/internal/drive"
+	"github.com/Knight1/tapemanager/internal/ibmfw"
 )
 
 // How long to wait for the drive after a firmware update; tests shorten it.
@@ -32,29 +32,30 @@ func cmdDriveFirmware(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	file := fs.String("file", "", "firmware image from the drive vendor")
 	yes := fs.Bool("yes", false, "start without asking for the drive's serial number")
 	dry := fs.Bool("dry-run", false, "check the drive and the file, but do not update")
+	skipCheck := fs.Bool("skip-image-check", false, "do not check an IBM image's checksums and signatures before sending (the drive still checks them)")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
 	if *file == "" || fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "usage: tapemgr drive firmware --file IMAGE [--dry-run] [--yes] [--device /dev/sgN]")
+		fmt.Fprintln(stderr, "usage: tapemgr drive firmware --file IMAGE [--dry-run] [--yes] [--skip-image-check] [--device /dev/sgN]")
 		return exitUsage
 	}
 
-	st, err := os.Stat(*file)
-	if err != nil {
-		return fail(stderr, err)
-	}
-	if !st.Mode().IsRegular() {
-		return fail(stderr, fmt.Errorf("%s is not a regular file", *file))
-	}
-	if st.Size() < minFirmwareSize || st.Size() > maxFirmwareSize {
-		return fail(stderr, fmt.Errorf("%s has %d bytes, which is not a plausible firmware image", *file, st.Size()))
-	}
-	image, err := os.ReadFile(*file)
+	image, err := readFirmwareFile(*file)
 	if err != nil {
 		return fail(stderr, err)
 	}
 	sum := sha256.Sum256(image)
+	// An IBM image is checked first, the same way 'drive inspect-firmware'
+	// does, so a damaged or changed file is refused before the drive is
+	// touched. Other files are left to the drive.
+	var report *ibmfw.Report
+	if !*skipCheck {
+		report, err = checkIBMFirmware(image)
+		if err != nil && !errors.Is(err, ibmfw.ErrNotImage) {
+			return fail(stderr, fmt.Errorf("%s: %w", *file, err))
+		}
+	}
 
 	d, f, err := df.open()
 	if err != nil {
@@ -116,7 +117,22 @@ func cmdDriveFirmware(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 		return fail(stderr, fmt.Errorf("%s: %w", *file, err))
 	}
 	model := "no check for this vendor; the drive checks the image itself"
+	checks := "none for this vendor; the drive checks the image itself"
 	if ibm != nil {
+		checks = "container, section and image checksums, and both IBM signatures passed"
+		if *skipCheck {
+			checks = "SKIPPED (--skip-image-check): checksums and signatures were not checked; the drive still checks them"
+			// The interface check needs no intact image, only its
+			// attributes, and still protects against the wrong file.
+			report, _ = ibmfw.Inspect(image, nil, time.Now())
+		}
+		if report != nil && report.Platform != "" {
+			platform, err := checkPlatform(d, q, report)
+			if err != nil {
+				return fail(stderr, fmt.Errorf("%s: %w", *file, err))
+			}
+			checks += "; " + platform
+		}
 		model = fmt.Sprintf("image for %s (load ID %x), matches this drive; image level %s", ibm.ModelID, ibm.LoadID, orDash(ibm.Level))
 		if ibm.Built != "" {
 			model += ", built " + ibm.Built
@@ -131,12 +147,13 @@ Firmware:  %s now
 Image:     %s
            %s, SHA-256 %s
 Model:     %s
+Checks:    %s
 Sent in:   pieces of %s
 
 Compare the SHA-256 with the one the vendor publishes for this file. Make
 sure the image is meant for this exact drive model.
 `, q.Vendor, q.Product, serial, f.SG, q.Revision, *file, archive.FormatBytes(int64(len(image))),
-		hex.EncodeToString(sum[:]), model, pieces)
+		hex.EncodeToString(sum[:]), model, checks, pieces)
 	if *dry {
 		fmt.Fprintln(stdout, "\nDry run: the drive and the file passed all checks. Nothing was sent.")
 		return exitOK

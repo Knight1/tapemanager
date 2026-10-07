@@ -11,6 +11,7 @@ import (
 
 	"github.com/Knight1/tapemanager/internal/drive"
 	"github.com/Knight1/tapemanager/internal/drive/drivetest"
+	"github.com/Knight1/tapemanager/internal/ibmfw"
 )
 
 // firmwareFile writes an image with an IBM header matching the fake drive.
@@ -99,7 +100,7 @@ func TestCLIFirmwareRefuses(t *testing.T) {
 	if code, out := runWithInput("", "drive", "firmware", "--file", big, "--yes"); code != exitFailure || !strings.Contains(out, "not a plausible firmware image") {
 		t.Fatalf("too large: %s", out)
 	}
-	small, _ := firmwareFile(t, 1000)
+	small, _ := writeImage(t, make([]byte, 1000))
 	if code, out := runWithInput("", "drive", "firmware", "--file", small, "--yes"); code != exitFailure || !strings.Contains(out, "not a plausible firmware image") {
 		t.Fatalf("small: %s", out)
 	}
@@ -221,5 +222,116 @@ func TestCLIFirmwareUndefinedBoundary(t *testing.T) {
 		if note := strings.Contains(out, "offset alignment 0x86, which the SCSI standard does not define"); note != (b == 0x86) {
 			t.Fatalf("boundary %#x: %s", b, out)
 		}
+	}
+}
+
+// The drive's own image checks run before anything is sent.
+func TestCLIFirmwareImageChecks(t *testing.T) {
+	file, img := firmwareFile(t, 600<<10)
+	f := firmwareFake(t, img)
+	code, out := runWithInput("", "drive", "firmware", "--file", file, "--dry-run")
+	if code != 0 || !strings.Contains(out, "Checks:    container, section and image checksums, and both IBM signatures passed; for sas_hh drives, matches this drive") ||
+		!strings.Contains(out, "for sas_hh drives, matches this drive") {
+		t.Fatalf("valid: %d %s", code, out)
+	}
+
+	// A changed byte inside the image: refused, nothing sent.
+	bad := bytes.Clone(img)
+	bad[len(bad)/2] ^= 1
+	badFile, _ := writeImage(t, bad)
+	code, out = runWithInput("0000000001\n", "drive", "firmware", "--file", badFile)
+	if code != exitFailure || !strings.Contains(out, "failed its checks") || !strings.Contains(out, "section vmli: word sum mismatch") || f.Downloads != 0 {
+		t.Fatalf("changed: %d %d %s", code, f.Downloads, out)
+	}
+
+	// Signed with other keys: refused.
+	old := firmwareKeys
+	t.Cleanup(func() { firmwareKeys = old })
+	firmwareKeys = ibmfw.IBMKeys
+	code, out = runWithInput("0000000001\n", "drive", "firmware", "--file", file)
+	if code != exitFailure || !strings.Contains(out, "SHA-256 signature: does not verify with TAPEFIRMWARE") || f.Downloads != 0 {
+		t.Fatalf("other keys: %d %s", code, out)
+	}
+	firmwareKeys = old
+
+	// An image for another interface: refused.
+	f.Platform = "fc_hh"
+	code, out = runWithInput("0000000001\n", "drive", "firmware", "--file", file)
+	if code != exitFailure || !strings.Contains(out, "the image is for sas_hh drives, but this drive is fc_hh") || f.Downloads != 0 {
+		t.Fatalf("platform: %d %s", code, out)
+	}
+}
+
+func TestCLIInspectFirmware(t *testing.T) {
+	file, img := firmwareFile(t, 300<<10)
+	code, out, errOut := runCmd(t, "drive", "inspect-firmware", "--file", file)
+	for _, want := range []string{
+		"level E6R4", "(matches the file)", "model TESTID01", "hardware IDs 0x00010060 to 0x00010061",
+		"    9  sas_hh", "vmli", "SHA-256 signature   covers 0x0 to", "VALID with TEST_SHA256",
+		"image CRC", "excludes no drive type", "the last 332 bytes are not covered", "Result:    all checks passed",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+	if code != 0 || t.Failed() {
+		t.Fatalf("%d %s %s", code, out, errOut)
+	}
+
+	bad := bytes.Clone(img)
+	bad[0x100] ^= 1
+	badFile, _ := writeImage(t, bad)
+	code, out, _ = runCmd(t, "drive", "inspect-firmware", "--file", badFile)
+	if code != exitFailure || !strings.Contains(out, "Result:    FAILED") || !strings.Contains(out, "INVALID") {
+		t.Fatalf("changed: %d %s", code, out)
+	}
+	plain, _ := writeImage(t, make([]byte, 100<<10))
+	if code, _, errOut := runCmd(t, "drive", "inspect-firmware", "--file", plain); code != exitFailure || !strings.Contains(errOut, "not an IBM tape drive firmware image") {
+		t.Fatalf("plain: %d %s", code, errOut)
+	}
+	if code, _, _ := runCmd(t, "drive", "inspect-firmware"); code != exitUsage {
+		t.Fatal("missing --file")
+	}
+}
+
+// The image is checked before the drive is touched: with no drive at all,
+// a changed image is still refused for what it is.
+func TestCLIFirmwareChecksImageFirst(t *testing.T) {
+	file, img := firmwareFile(t, 300<<10)
+	bad := bytes.Clone(img)
+	bad[len(bad)/2] ^= 1
+	badFile, _ := writeImage(t, bad)
+	// TestMain makes every drive open fail.
+	code, out := runWithInput("", "drive", "firmware", "--file", badFile, "--yes")
+	if code != exitFailure || !strings.Contains(out, "failed its checks") || strings.Contains(out, "no drive in tests") {
+		t.Fatalf("changed image: %d %s", code, out)
+	}
+	// An intact image gets past the check and on to the drive.
+	code, out = runWithInput("", "drive", "firmware", "--file", file, "--yes")
+	if code != exitFailure || strings.Contains(out, "failed its checks") || !strings.Contains(out, "no drive in tests") {
+		t.Fatalf("intact image: %d %s", code, out)
+	}
+}
+
+// --skip-image-check sends an image that fails the checks, says so before
+// asking, and still refuses an image for another interface.
+func TestCLIFirmwareSkipImageCheck(t *testing.T) {
+	file, img := firmwareFile(t, 600<<10)
+	f := firmwareFake(t, img)
+	bad := bytes.Clone(img)
+	bad[len(bad)/2] ^= 1
+	badFile, _ := writeImage(t, bad)
+
+	code, out := runWithInput("0000000001\n", "drive", "firmware", "--file", badFile, "--skip-image-check")
+	if code != 0 || !strings.Contains(out, "Checks:    SKIPPED (--skip-image-check)") || !strings.Contains(out, "for sas_hh drives, matches this drive") ||
+		!bytes.Equal(f.Received, bad) || strings.Index(out, "SKIPPED") > strings.Index(out, "Type the drive's serial number") {
+		t.Fatalf("skipped: %d %s", code, out)
+	}
+
+	f2 := firmwareFake(t, img)
+	f2.Platform = "fc_hh"
+	code, out = runWithInput("0000000001\n", "drive", "firmware", "--file", file, "--skip-image-check")
+	if code != exitFailure || !strings.Contains(out, "this drive is fc_hh") || f2.Downloads != 0 {
+		t.Fatalf("platform with skip: %d %s", code, out)
 	}
 }

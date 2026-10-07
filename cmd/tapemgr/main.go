@@ -42,6 +42,8 @@ Usage:
   tapemgr drive load [flags]               load the inserted cartridge
   tapemgr drive eject [flags]              rewind and eject the cartridge (refused while mounted)
   tapemgr drive firmware --file IMAGE      update the drive's firmware (asks for confirmation)
+  tapemgr drive inspect-firmware --file IMAGE
+                                           show an image's sections, checksums and signatures
   tapemgr drive keygen --out FILE          create an LTFS key file for drive encryption (--append adds to one)
   tapemgr version
 
@@ -72,23 +74,24 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	cmds := map[string]func([]string, io.Writer, io.Writer) int{
-		"archive put":     cmdPut,
-		"archive verify":  cmdVerify,
-		"archive list":    cmdList,
-		"archive recover": cmdRecover,
-		"archive restore": cmdRestore,
-		"catalog import":  cmdImport,
-		"catalog tapes":   cmdTapes,
-		"catalog search":  cmdSearch,
-		"catalog retire":  cmdRetire,
-		"archive keygen":  cmdArchiveKeygen,
-		"drive list":      cmdDriveList,
-		"drive info":      cmdDriveInfo,
-		"drive check":     cmdDriveCheck,
-		"drive log":       cmdDriveLog,
-		"drive load":      cmdDriveLoad,
-		"drive eject":     cmdDriveEject,
-		"drive keygen":    cmdDriveKeygen,
+		"archive put":            cmdPut,
+		"archive verify":         cmdVerify,
+		"archive list":           cmdList,
+		"archive recover":        cmdRecover,
+		"archive restore":        cmdRestore,
+		"catalog import":         cmdImport,
+		"catalog tapes":          cmdTapes,
+		"catalog search":         cmdSearch,
+		"catalog retire":         cmdRetire,
+		"archive keygen":         cmdArchiveKeygen,
+		"drive list":             cmdDriveList,
+		"drive info":             cmdDriveInfo,
+		"drive check":            cmdDriveCheck,
+		"drive log":              cmdDriveLog,
+		"drive load":             cmdDriveLoad,
+		"drive eject":            cmdDriveEject,
+		"drive keygen":           cmdDriveKeygen,
+		"drive inspect-firmware": cmdDriveInspectFirmware,
 	}
 	if len(args) >= 2 {
 		lock, err := takeLock(args[0] + " " + args[1])

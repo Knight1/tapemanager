@@ -33,7 +33,8 @@ const (
 // write to a tape, move the drive, change its firmware or delete files run
 // alone. Commands that only read a tape or query the drive may run
 // together, but not next to one of those. Purely local commands (key
-// generation, catalog listings, drive list) take no lock.
+// generation, catalog listings, drive list, inspecting a firmware file)
+// take no lock.
 var commandLocks = map[string]lockMode{
 	"archive put":           lockExclusive,
 	"archive recover":       lockExclusive,

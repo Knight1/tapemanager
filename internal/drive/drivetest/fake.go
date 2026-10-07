@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Knight1/tapemanager/internal/drive"
+	"github.com/Knight1/tapemanager/internal/ibmfw/ibmfwtest"
 )
 
 // Fake answers SCSI commands like a real drive.
@@ -38,6 +39,7 @@ type Fake struct {
 	NewRevision    string
 	BufferCapacity int // 5 MiB unless set
 	Boundary       byte
+	Platform       string // interface and form factor in VPD 0xC0, sas_hh unless set
 	Received       []byte
 	Downloads      int  // WRITE BUFFER commands
 	FailAt         int  // fail the WRITE BUFFER at this offset, if > 0
@@ -106,7 +108,11 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 			copy(resp[12:], "E6R3")
 			copy(resp[0x18:], f.ModelID())
 		} else if cdb[2] == 0xC0 {
-			resp = append([]byte{1, 0xC0, 0, 0x27}, "LTO6_E6R3   130808\x0020140808sas_hh      "...)
+			platform := f.Platform
+			if platform == "" {
+				platform = "sas_hh"
+			}
+			resp = append([]byte{1, 0xC0, 0, 0x27}, fmt.Sprintf("LTO6_E6R3   130808\x0020140808%-12s", platform)...)
 		} else if cdb[2] == 0x80 {
 			resp = append([]byte{1, 0x80, 0, 10}, "0000000001"...)
 		} else {
@@ -396,20 +402,11 @@ func (f *Fake) LoadID() []byte  { return FakeLoadID }
 func (f *Fake) ModelID() []byte { return FakeModelID }
 
 // IBMImage builds a firmware image with an IBM header for the given load
-// and model IDs, level and total size. The rest is random filler.
+// and model IDs, level and total size (a multiple of 4), sealed and signed
+// like a real one with the keys of ibmfwtest. The main section is filled
+// by filler, or zeros.
 func IBMImage(loadID, modelID []byte, level string, size int, filler func([]byte)) []byte {
-	b := make([]byte, size)
-	if filler != nil {
-		filler(b)
-	}
-	b[0], b[1], b[2], b[3] = 0x48, 0, 0x03, 0x91
-	binary.BigEndian.PutUint32(b[4:], uint32(size))
-	copy(b[8:12], loadID)
-	copy(b[12:16], level)
-	clear(b[16:0x18])
-	copy(b[0x18:0x20], modelID)
-	copy(b[0x20:0x28], "IBMTpDrv")
-	copy(b[0x300:], "2026/01/02")
+	b, _ := ibmfwtest.Build(ibmfwtest.Spec{Size: size, Level: level, LoadID: loadID, ModelID: modelID, Filler: filler})
 	return b
 }
 

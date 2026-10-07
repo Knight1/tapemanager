@@ -10,6 +10,8 @@ import (
 	"github.com/Knight1/tapemanager/internal/catalog"
 	"github.com/Knight1/tapemanager/internal/drive"
 	"github.com/Knight1/tapemanager/internal/drive/drivetest"
+	"github.com/Knight1/tapemanager/internal/ibmfw"
+	"github.com/Knight1/tapemanager/internal/ibmfw/ibmfwtest"
 	"github.com/Knight1/tapemanager/internal/manifest"
 )
 
@@ -19,6 +21,8 @@ func TestMain(m *testing.M) {
 	checkWriteProtect = func(string) error { return nil }
 	driveEncryption = func(string) (*drive.EncryptionStatus, error) { return nil, errors.New("no drive in tests") }
 	openDevice = func(string) (drive.Device, error) { return nil, errors.New("no drive in tests") }
+	// Test images are signed with test keys.
+	firmwareKeys = func() (ibmfw.Keys, error) { return ibmfwtest.Keys(), nil }
 	// Never touch the host's real lock.
 	dir, err := os.MkdirTemp("", "tapemgr-lock")
 	if err != nil {
