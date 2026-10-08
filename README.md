@@ -107,6 +107,7 @@ tapemgr catalog search ubuntu
 | `tapemgr drive check` | Warn if the drive needs cleaning or reports errors (good for cron) |
 | `tapemgr drive selftest` | Run the drive's built-in self-test and report whether it passed (`--extended` for the long one, `--status` to read the last result) |
 | `tapemgr drive density` | Show which LTO generations the drive can read and write, and whether hardware compression is on |
+| `tapemgr drive power` | Show the idle/standby power timers, or set them (`--idle-after`, `--standby-after`, `--off`, apply with `--yes`) |
 | `tapemgr drive load` / `eject` | Load or eject the cartridge (eject is refused while the tape is mounted) |
 | `tapemgr drive log` | Show and explain the drive's error history |
 | `tapemgr drive firmware --file <image>` | Update the drive's firmware (checks the image's checksums and IBM signatures first, `--skip-image-check` skips that, then asks for the drive's serial number) |
