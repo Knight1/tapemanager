@@ -28,8 +28,18 @@ type Fake struct {
 	Encrypting     bool     // drive encryption on, as after an LTFS mount with a key
 	KeyID          []byte   // key ID reported while encrypting
 	NoEncryption   bool     // drive without encryption support
+	Compressing    bool     // hardware data compression enabled (mode page 0x0F)
 	ErrorLog       [][]byte // tape diagnostic entries (68 bytes each), 12 slots in total
 	NoErrorLog     bool     // drive without the tape diagnostic data page
+
+	// Self-test (SEND DIAGNOSTIC and the self-test results log page). A test
+	// reports "in progress" for SelfTestRuns log-page reads, then passes,
+	// or fails if SelfTestFail is set. LastDiag is the last SEND DIAGNOSTIC
+	// code byte received.
+	SelfTestStarted bool
+	SelfTestRuns    int
+	SelfTestFail    bool
+	LastDiag        byte
 
 	// Firmware: the drive reports Revision (E6R3 unless set). A download
 	// of ImageSize bytes is activated as NewRevision; Received collects it.
@@ -163,7 +173,15 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 		if resp == nil {
 			return 0, check(op, drive.SenseIllegalRequest, 0x24, 0)
 		}
-	case 0x1A: // MODE SENSE(6), header only
+	case 0x1A: // MODE SENSE(6)
+		if cdb[2]&0x3F == 0x0F { // data compression page: a drive setting, no medium needed
+			dcp := []byte{0x0F, 0x0E, 0x40, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+			if f.Compressing {
+				dcp[2] |= 0x80 // DCE
+			}
+			resp = append([]byte{byte(3 + len(dcp)), 0x68, 0x10, 0}, dcp...)
+			break
+		}
 		if err := f.notReady(op); err != nil {
 			return 0, err
 		}
@@ -171,6 +189,15 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 		if f.WriteProtect {
 			resp[2] |= 0x80
 		}
+	case 0x1D: // SEND DIAGNOSTIC: start a background self-test
+		f.LastDiag = cdb[1]
+		if code := cdb[1] >> 5; code != 0x01 && code != 0x02 {
+			return 0, check(op, drive.SenseIllegalRequest, 0x24, 0)
+		}
+		f.SelfTestStarted = true
+		return 0, nil
+	case 0x44: // REPORT DENSITY SUPPORT
+		resp = f.densitySupport()
 	case 0x1B: // LOAD UNLOAD
 		if cdb[4]&1 == 1 {
 			f.Loaded++
@@ -285,8 +312,61 @@ func (f *Fake) logPage(code byte) []byte {
 		return page(code, param(0, u32(120)), param(1, u32(250)), param(2, u32(0)), param(3, u32(3000)),
 			param(4, u32(0)), param(5, u32(2500)), param(6, u32(0)), param(7, u32(6000)), param(8, u32(0)),
 			param(9, u32(2400)), param(0x100, []byte{1}))
+	case drive.PageSelfTest:
+		if !f.SelfTestStarted {
+			return page(code) // no self-test has run
+		}
+		result := byte(0x00)
+		if f.SelfTestRuns > 0 {
+			f.SelfTestRuns--
+			result = 0x0F // still in progress
+		} else if f.SelfTestFail {
+			result = 0x05 // failed in a known segment
+		}
+		v := make([]byte, 16)
+		v[0] = f.LastDiag&0xE0 | result // function code (as requested) and result
+		binary.BigEndian.PutUint16(v[2:], 1234)
+		if result == 0x05 {
+			v[1] = 7 // failing segment
+			v[12], v[13], v[14] = drive.SenseHardwareError, 0x44, 0x00
+		}
+		return page(code, param(1, v))
 	}
 	return nil
+}
+
+// densitySupport answers REPORT DENSITY SUPPORT like an LTO-6 drive: it
+// writes LTO-5 and LTO-6 and reads LTO-4, LTO-6 being the default.
+func (f *Fake) densitySupport() []byte {
+	descs := []struct {
+		code            byte
+		wrtok, deflt    bool
+		org, name, desc string
+		capacityMB      uint32
+	}{
+		{0x46, false, false, "LTO-CVE", "U-416", "LTO4 800G", 800000},
+		{0x58, true, false, "LTO-CVE", "U-516", "LTO5 1500G", 1500000},
+		{0x5A, true, true, "LTO-CVE", "U-616", "LTO6 2500G", 2500000},
+	}
+	var body []byte
+	for _, d := range descs {
+		e := make([]byte, 52)
+		e[0] = d.code
+		if d.wrtok {
+			e[2] |= 0x80
+		}
+		if d.deflt {
+			e[2] |= 0x20
+		}
+		binary.BigEndian.PutUint32(e[12:], d.capacityMB)
+		copy(e[16:24], pad(d.org, 8))
+		copy(e[24:32], pad(d.name, 8))
+		copy(e[32:52], pad(d.desc, 20))
+		body = append(body, e...)
+	}
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint16(b, uint16(len(body)))
+	return append(b, body...)
 }
 
 func attr(id uint16, format byte, value []byte) []byte {

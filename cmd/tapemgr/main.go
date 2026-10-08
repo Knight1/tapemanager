@@ -39,6 +39,8 @@ Usage:
   tapemgr drive info [flags]               show drive, cartridge, error counters and TapeAlert flags
   tapemgr drive log [flags]                show and analyze the drive's error history
   tapemgr drive check [flags]              exit 1 if the drive needs cleaning or reports errors
+  tapemgr drive selftest [flags]           run the drive's self-test and report the result
+  tapemgr drive density [flags]            show which recording formats the drive supports
   tapemgr drive load [flags]               load the inserted cartridge
   tapemgr drive eject [flags]              rewind and eject the cartridge (refused while mounted)
   tapemgr drive firmware --file IMAGE      update the drive's firmware (asks for confirmation)
@@ -87,6 +89,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		"drive list":             cmdDriveList,
 		"drive info":             cmdDriveInfo,
 		"drive check":            cmdDriveCheck,
+		"drive selftest":         cmdDriveSelfTest,
+		"drive density":          cmdDriveDensity,
 		"drive log":              cmdDriveLog,
 		"drive load":             cmdDriveLoad,
 		"drive eject":            cmdDriveEject,

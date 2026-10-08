@@ -45,12 +45,14 @@ var commandLocks = map[string]lockMode{
 	"drive firmware":        lockExclusive,
 	"drive load":            lockExclusive,
 	"drive eject":           lockExclusive,
+	"drive selftest":        lockExclusive,
 	"archive verify":        lockShared,
 	"archive restore":       lockShared,
 	"archive list":          lockShared,
 	"drive info":            lockShared,
 	"drive log":             lockShared,
 	"drive check":           lockShared,
+	"drive density":         lockShared,
 }
 
 // takeLock takes the global lock for command, or returns nil if it needs

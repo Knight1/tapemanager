@@ -8,10 +8,18 @@ import (
 	"math"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Knight1/tapemanager/internal/archive"
 	"github.com/Knight1/tapemanager/internal/catalog"
 	"github.com/Knight1/tapemanager/internal/drive"
+)
+
+// How long to wait for a self-test to finish; tests shorten it. The command
+// returns as soon as the test completes, so this is only a safety cap.
+var (
+	selfTestWait     = 90 * time.Minute
+	selfTestInterval = 5 * time.Second
 )
 
 // Drive access, replaceable in tests.
@@ -595,6 +603,127 @@ func cmdDriveLog(args []string, stdout, stderr io.Writer) int {
 	}
 	if len(info.ErrorLog) == 0 {
 		fmt.Fprintln(stdout, "\nNo errors recorded.")
+	}
+	return exitOK
+}
+
+func cmdDriveSelfTest(args []string, stdout, stderr io.Writer) int {
+	fs, df := newDriveFlagSet("drive selftest", stderr)
+	extended := fs.Bool("extended", false, "run the extended self-test (thorough, can take much longer)")
+	status := fs.Bool("status", false, "show the most recent self-test result without starting a new one")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	d, _, err := df.open()
+	if err != nil {
+		return fail(stderr, err)
+	}
+	defer d.Close()
+	if err := requireTape(d); err != nil {
+		return fail(stderr, err)
+	}
+	if *status {
+		r, ok, err := drive.ReadSelfTest(d)
+		if err != nil {
+			return fail(stderr, err)
+		}
+		if !ok {
+			fmt.Fprintln(stdout, "The drive reports no self-test result yet.")
+			return exitOK
+		}
+		return reportSelfTest(stdout, r)
+	}
+	kind, name := drive.SelfTestShort, "short"
+	if *extended {
+		kind, name = drive.SelfTestExtended, "extended"
+	}
+	if err := drive.StartSelfTest(d, kind); err != nil {
+		if errors.Is(err, drive.ErrUnsupported) {
+			return fail(stderr, errors.New("the drive does not support background self-tests"))
+		}
+		return fail(stderr, fmt.Errorf("starting the self-test: %w", err))
+	}
+	fmt.Fprintf(stdout, "The drive is running its %s self-test in the background. Waiting for it to finish...\n", name)
+	r, ok, err := drive.PollSelfTest(d, selfTestWait, selfTestInterval)
+	if err != nil {
+		fmt.Fprintf(stderr, "tapemgr: %v\nCheck later with 'tapemgr drive selftest --status'.\n", err)
+		return exitFailure
+	}
+	if !ok {
+		fmt.Fprintln(stdout, "The drive did not report a self-test result.")
+		return exitOK
+	}
+	return reportSelfTest(stdout, r)
+}
+
+func reportSelfTest(w io.Writer, r drive.SelfTestResult) int {
+	switch {
+	case r.InProgress():
+		fmt.Fprintln(w, "A self-test is still in progress.")
+		return exitOK
+	case r.Passed():
+		fmt.Fprintf(w, "Self-test passed (at %d drive power-on hours).\n", r.Hours)
+		return exitOK
+	}
+	fmt.Fprintf(w, "Self-test FAILED: %s.\n", r.Description())
+	if r.Key != 0 || r.ASC != 0 || r.ASCQ != 0 {
+		line(w, "Codes", "sense %x/%02x/%02x (for the vendor's service)", r.Key, r.ASC, r.ASCQ)
+	}
+	return exitFailure
+}
+
+func cmdDriveDensity(args []string, stdout, stderr io.Writer) int {
+	fs, df := newDriveFlagSet("drive density", stderr)
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	d, _, err := df.open()
+	if err != nil {
+		return fail(stderr, err)
+	}
+	defer d.Close()
+	if err := requireTape(d); err != nil {
+		return fail(stderr, err)
+	}
+	dens, err := drive.ReportDensitySupport(d)
+	if err != nil {
+		if errors.Is(err, drive.ErrUnsupported) {
+			return fail(stderr, errors.New("the drive does not report its density support"))
+		}
+		return fail(stderr, fmt.Errorf("asking the drive which densities it supports: %w", err))
+	}
+	q, _ := drive.ReadInquiry(d)
+	fmt.Fprintf(stdout, "%s %s: recording formats the drive supports\n", q.Vendor, q.Product)
+	if len(dens) == 0 {
+		fmt.Fprintln(stdout, "  (the drive reported none)")
+	}
+	for _, de := range dens {
+		name := de.Generation
+		if name == "" {
+			name = orDash(de.Name)
+		}
+		rw := "read only"
+		if de.Writable {
+			rw = "read and write"
+		}
+		detail := rw
+		if de.Default {
+			detail += ", default"
+		}
+		if de.CapacityMB > 0 {
+			detail += ", ~" + archive.FormatBytes(int64(de.CapacityMB)*1_000_000) + " native"
+		}
+		if de.Description != "" {
+			detail += "  (" + de.Description + ")"
+		}
+		line(stdout, name, "density 0x%02x, %s", de.PrimaryCode, detail)
+	}
+	if enabled, ok, err := drive.CompressionEnabled(d); err == nil && ok {
+		state := "off"
+		if enabled {
+			state = "on"
+		}
+		fmt.Fprintf(stdout, "\nHardware compression: %s\n", state)
 	}
 	return exitOK
 }
