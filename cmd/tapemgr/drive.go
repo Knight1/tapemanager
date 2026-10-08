@@ -727,3 +727,76 @@ func cmdDriveDensity(args []string, stdout, stderr io.Writer) int {
 	}
 	return exitOK
 }
+
+func cmdDrivePower(args []string, stdout, stderr io.Writer) int {
+	fs, df := newDriveFlagSet("drive power", stderr)
+	idle := fs.Duration("idle-after", 0, "drop to the idle power state after this much inactivity (e.g. 2m); 0 turns it off")
+	standby := fs.Duration("standby-after", 0, "drop to the lower standby power state after this much inactivity; 0 turns it off")
+	off := fs.Bool("off", false, "turn off both the idle and standby timers (the drive stays fully powered)")
+	yes := fs.Bool("yes", false, "apply the change; without it the change is only shown")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	d, _, err := df.open()
+	if err != nil {
+		return fail(stderr, err)
+	}
+	defer d.Close()
+	if err := requireTape(d); err != nil {
+		return fail(stderr, err)
+	}
+	pc, err := drive.ReadPowerCondition(d)
+	if err != nil {
+		if errors.Is(err, drive.ErrUnsupported) {
+			return fail(stderr, errors.New("the drive does not report a power condition page"))
+		}
+		return fail(stderr, err)
+	}
+	fmt.Fprintln(stdout, "Power condition (the drive drops to lower power after it sits idle; any command wakes it)")
+	printPowerCondition(stdout, pc)
+
+	if !*off && !set["idle-after"] && !set["standby-after"] {
+		if pc.HaveSettable && !pc.IdleSettable && !pc.StandbySettable {
+			fmt.Fprintln(stdout, "\nThis drive manages power itself; the timers cannot be set from the host.")
+		}
+		return exitOK // nothing to change
+	}
+	if *off {
+		pc.IdleEnabled, pc.StandbyEnabled = false, false
+	}
+	if set["idle-after"] {
+		pc.IdleEnabled, pc.IdleTimer = *idle > 0, *idle
+	}
+	if set["standby-after"] {
+		pc.StandbyEnabled, pc.StandbyTimer = *standby > 0, *standby
+	}
+	if !*yes {
+		fmt.Fprintln(stdout, "\nAfter the change:")
+		printPowerCondition(stdout, pc)
+		fmt.Fprintln(stdout, "\nNothing was changed. Re-run with --yes to apply.")
+		return exitOK
+	}
+	if err := drive.SetPowerCondition(d, pc); err != nil {
+		return fail(stderr, fmt.Errorf("setting the power condition: %w", err))
+	}
+	fmt.Fprintln(stdout, "\nApplied:")
+	printPowerCondition(stdout, pc)
+	return exitOK
+}
+
+func printPowerCondition(w io.Writer, pc *drive.PowerCondition) {
+	show := func(label string, enabled, settable bool, after time.Duration) {
+		state := "off"
+		if enabled {
+			state = fmt.Sprintf("after %s idle", after)
+		}
+		if pc.HaveSettable && !settable {
+			state += " (not settable on this drive)"
+		}
+		line(w, label, "%s", state)
+	}
+	show("Idle", pc.IdleEnabled, pc.IdleSettable, pc.IdleTimer)
+	show("Standby", pc.StandbyEnabled, pc.StandbySettable, pc.StandbyTimer)
+}

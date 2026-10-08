@@ -46,6 +46,7 @@ var commandLocks = map[string]lockMode{
 	"drive load":            lockExclusive,
 	"drive eject":           lockExclusive,
 	"drive selftest":        lockExclusive,
+	"drive power":           lockExclusive,
 	"archive verify":        lockShared,
 	"archive restore":       lockShared,
 	"archive list":          lockShared,

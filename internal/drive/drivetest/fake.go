@@ -41,6 +41,17 @@ type Fake struct {
 	SelfTestFail    bool
 	LastDiag        byte
 
+	// Power condition mode page (0x1A). The timers are in 100 ms units, as
+	// the page stores them; MODE SELECT updates them. The NotSettable flags
+	// make the drive report that timer as unchangeable and reject a write to
+	// it, like a drive that supports only one of the two conditions.
+	IdleEnabled        bool
+	StandbyEnabled     bool
+	IdleTimer          uint32
+	StandbyTimer       uint32
+	IdleNotSettable    bool
+	StandbyNotSettable bool
+
 	// Firmware: the drive reports Revision (E6R3 unless set). A download
 	// of ImageSize bytes is activated as NewRevision; Received collects it.
 	Vendor         string // IBM unless set
@@ -174,21 +185,61 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 			return 0, check(op, drive.SenseIllegalRequest, 0x24, 0)
 		}
 	case 0x1A: // MODE SENSE(6)
-		if cdb[2]&0x3F == 0x0F { // data compression page: a drive setting, no medium needed
+		switch cdb[2] & 0x3F {
+		case 0x0F: // data compression page: a drive setting, no medium needed
 			dcp := []byte{0x0F, 0x0E, 0x40, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 			if f.Compressing {
 				dcp[2] |= 0x80 // DCE
 			}
 			resp = append([]byte{byte(3 + len(dcp)), 0x68, 0x10, 0}, dcp...)
-			break
+		case 0x1A: // power condition page: a drive setting, no medium needed
+			pc := make([]byte, 12)
+			pc[0], pc[1] = 0x1A, 0x0A
+			if cdb[2]>>6 == 0x01 { // changeable mask: which fields the host may set
+				if !f.IdleNotSettable {
+					pc[3] |= 0x02
+					binary.BigEndian.PutUint32(pc[4:], 0xFFFFFFFF)
+				}
+				if !f.StandbyNotSettable {
+					pc[3] |= 0x01
+					binary.BigEndian.PutUint32(pc[8:], 0xFFFFFFFF)
+				}
+			} else {
+				if f.IdleEnabled {
+					pc[3] |= 0x02
+				}
+				if f.StandbyEnabled {
+					pc[3] |= 0x01
+				}
+				binary.BigEndian.PutUint32(pc[4:], f.IdleTimer)
+				binary.BigEndian.PutUint32(pc[8:], f.StandbyTimer)
+			}
+			resp = append([]byte{byte(3 + len(pc)), 0x68, 0x10, 0}, pc...)
+		default:
+			if err := f.notReady(op); err != nil {
+				return 0, err
+			}
+			resp = []byte{3, 0x68, 0x10, 0}
+			if f.WriteProtect {
+				resp[2] |= 0x80
+			}
 		}
-		if err := f.notReady(op); err != nil {
-			return 0, err
+	case 0x15: // MODE SELECT(6)
+		off := 4 + int(buf[3]) // skip the parameter header and any block descriptors
+		if off+12 > len(buf) || buf[off]&0x3F != 0x1A {
+			return 0, check(op, drive.SenseIllegalRequest, 0x26, 0)
 		}
-		resp = []byte{3, 0x68, 0x10, 0}
-		if f.WriteProtect {
-			resp[2] |= 0x80
+		idle := buf[off+3]&0x02 != 0
+		standby := buf[off+3]&0x01 != 0
+		if idle && f.IdleNotSettable || standby && f.StandbyNotSettable {
+			// Invalid field in parameter list, like a drive asked to set a
+			// timer it does not support.
+			return 0, check(op, drive.SenseIllegalRequest, 0x26, 0)
 		}
+		f.IdleEnabled, f.StandbyEnabled = idle, standby
+		f.IdleTimer = binary.BigEndian.Uint32(buf[off+4:])
+		f.StandbyTimer = binary.BigEndian.Uint32(buf[off+8:])
+		return 0, nil
 	case 0x1D: // SEND DIAGNOSTIC: start a background self-test
 		f.LastDiag = cdb[1]
 		if code := cdb[1] >> 5; code != 0x01 && code != 0x02 {

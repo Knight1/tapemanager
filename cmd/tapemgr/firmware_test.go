@@ -294,14 +294,20 @@ func TestCLIInspectFirmware(t *testing.T) {
 	}
 }
 
-// The image is checked before the drive is touched: with no drive at all,
-// a changed image is still refused for what it is.
+// The image is checked before the drive is touched: a drive is found but
+// cannot be opened (TestMain makes every open fail), so a changed image is
+// refused before the open while an intact one reaches it. resolveDrive is
+// stubbed so the test does not depend on the host actually having a drive.
 func TestCLIFirmwareChecksImageFirst(t *testing.T) {
+	oldResolve := resolveDrive
+	resolveDrive = func(string, string) (drive.Found, error) { return fakeFound, nil }
+	t.Cleanup(func() { resolveDrive = oldResolve })
+
 	file, img := firmwareFile(t, 300<<10)
 	bad := bytes.Clone(img)
 	bad[len(bad)/2] ^= 1
 	badFile, _ := writeImage(t, bad)
-	// TestMain makes every drive open fail.
+	// The changed image is refused before the drive is opened.
 	code, out := runWithInput("", "drive", "firmware", "--file", badFile, "--yes")
 	if code != exitFailure || !strings.Contains(out, "failed its checks") || strings.Contains(out, "no drive in tests") {
 		t.Fatalf("changed image: %d %s", code, out)
