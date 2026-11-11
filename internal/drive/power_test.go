@@ -68,6 +68,32 @@ func TestPowerConditionNotSettable(t *testing.T) {
 	}
 }
 
+// VerifyPowerCondition confirms the drive kept what was asked, and reports a
+// clear mismatch (timer or enable bit) when it did not.
+func TestVerifyPowerCondition(t *testing.T) {
+	f := drivetest.New()
+	f.IdleEnabled, f.IdleTimer = true, 1200 // 2 minutes, in 100 ms units
+	pc, err := drive.ReadPowerCondition(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The drive holds exactly what pc describes: verification passes.
+	if err := drive.VerifyPowerCondition(f, pc); err != nil {
+		t.Fatalf("expected a match, got %v", err)
+	}
+	// A timer the drive does not hold is a clear mismatch.
+	pc.IdleTimer = 5 * time.Minute
+	if err := drive.VerifyPowerCondition(f, pc); err == nil || !strings.Contains(err.Error(), "different idle timer") {
+		t.Fatalf("expected an idle timer mismatch, got %v", err)
+	}
+	// So is an enable bit the drive did not store.
+	pc.IdleTimer = 2 * time.Minute
+	pc.StandbyEnabled = true
+	if err := drive.VerifyPowerCondition(f, pc); err == nil || !strings.Contains(err.Error(), "store the standby") {
+		t.Fatalf("expected a standby state mismatch, got %v", err)
+	}
+}
+
 // A drive that allows neither timer (like the IBM LTO-6) reports both as not
 // settable, and any set is refused with the "manages power itself" message.
 func TestPowerConditionNoneSettable(t *testing.T) {

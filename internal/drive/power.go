@@ -3,6 +3,7 @@ package drive
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"time"
 )
@@ -135,6 +136,41 @@ func SetPowerCondition(d Device, pc *PowerCondition) error {
 	cdb := []byte{opModeSelect6, 0x10, 0, 0, byte(len(params)), 0} // PF set, SP clear (current values)
 	_, err := d.Do(cdb, DirOut, params, shortTimeout)
 	return err
+}
+
+// VerifyPowerCondition re-reads the power condition page and checks that the
+// drive stored the enable bits and timers that want describes. Timers are
+// compared in the drive's 100 ms units, the resolution it actually keeps. A
+// mismatch is returned as an error naming what was asked and what the drive
+// holds. Call it after SetPowerCondition to confirm the write took effect.
+func VerifyPowerCondition(d Device, want *PowerCondition) error {
+	got, err := ReadPowerCondition(d)
+	if err != nil {
+		return fmt.Errorf("reading the setting back: %w", err)
+	}
+	onOff := func(on bool) string {
+		if on {
+			return "on"
+		}
+		return "off"
+	}
+	dur := func(cs uint32) time.Duration { return time.Duration(cs) * centisecond }
+	for _, c := range []struct {
+		name          string
+		wantOn, gotOn bool
+		wantCs, gotCs uint32
+	}{
+		{"idle", want.IdleEnabled, got.IdleEnabled, centiCap(want.IdleTimer), centiCap(got.IdleTimer)},
+		{"standby", want.StandbyEnabled, got.StandbyEnabled, centiCap(want.StandbyTimer), centiCap(got.StandbyTimer)},
+	} {
+		switch {
+		case c.wantOn != c.gotOn:
+			return fmt.Errorf("the drive did not store the %s timer: asked to turn it %s, but it reads %s", c.name, onOff(c.wantOn), onOff(c.gotOn))
+		case c.wantOn && c.wantCs != c.gotCs:
+			return fmt.Errorf("the drive stored a different %s timer: asked for %s, but it reads %s", c.name, dur(c.wantCs), dur(c.gotCs))
+		}
+	}
+	return nil
 }
 
 // centiCap converts a duration to 100 ms units, flooring at zero and capping

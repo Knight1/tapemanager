@@ -139,6 +139,28 @@ func TestCLIDrivePowerNotSettable(t *testing.T) {
 	}
 }
 
+func TestCLIDrivePowerVerify(t *testing.T) {
+	f := drivetest.New()
+	useFake(t, f, fakeFound, nil)
+	code, out, _ := runCmd(t, "drive", "power", "--standby-after", "30s", "--yes", "--verify")
+	if code != 0 || !strings.Contains(out, "Applied") || !strings.Contains(out, "verified") || !f.StandbyEnabled || f.StandbyTimer != 300 {
+		t.Fatalf("%d %s standby=%v %d", code, out, f.StandbyEnabled, f.StandbyTimer)
+	}
+}
+
+// When the drive acknowledges the write but does not actually store it, the
+// read-back catches the mismatch: the command fails, says so on stderr, and
+// does not falsely report "Applied".
+func TestCLIDrivePowerVerifyMismatch(t *testing.T) {
+	f := drivetest.New()
+	f.PowerWriteIgnored = true
+	useFake(t, f, fakeFound, nil)
+	code, out, errOut := runCmd(t, "drive", "power", "--standby-after", "30s", "--yes", "--verify")
+	if code != exitFailure || !strings.Contains(errOut, "verifying the change") || strings.Contains(out, "Applied") {
+		t.Fatalf("%d out=%q err=%q", code, out, errOut)
+	}
+}
+
 // The IBM LTO-6 allows neither timer: both read as not settable (with a
 // plain-language note), and any set is refused.
 func TestCLIDrivePowerNoneSettable(t *testing.T) {

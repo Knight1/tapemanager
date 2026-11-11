@@ -21,7 +21,7 @@ var version = "dev"
 const usage = `tapemgr: LTFS tape archive manager
 
 Usage:
-  tapemgr archive put [flags] <source>     stream files onto the tape with SHA-256
+  tapemgr archive put [flags] <source>     stream files onto the tape with SHA-256 (--verify reads them back)
   tapemgr archive verify [flags] [path]    read files back and check SHA-256
   tapemgr archive list [flags] [path]      list archived files from the tape manifest
   tapemgr archive purge-source [flags] <source>
@@ -207,6 +207,7 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 	parityPct := fs.Int("parity", 10, "Reed-Solomon parity overhead in percent (0 to 25, 0 disables)")
 	copies := fs.Int("copies", 1, "number of different tapes each file should be on; 2 makes a second copy on this tape")
 	again := fs.Bool("again", false, "archive files even if they already have enough copies on other tapes")
+	verifyAfter := fs.Bool("verify", false, "after writing, read the archived files back from tape and check their SHA-256")
 	requireEnc := fs.Bool("require-encryption", envBool("TAPEMGR_REQUIRE_ENCRYPTION"), "refuse to write unless the drive is encrypting (default $TAPEMGR_REQUIRE_ENCRYPTION)")
 	var encryptTo, encryptToFile stringList
 	fs.Var(&encryptTo, "encrypt-to", "encrypt each file with age to this public key (age1...); repeatable")
@@ -275,6 +276,50 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "Archive complete.\nTape:        %s\nFiles:       %d\nSkipped:     %d already on this tape, %d on other tapes\nDuplicates:  %d\nBytes:       %s\nDuration:    %s\n",
 		tapeName(sum.Tape), sum.Files, sum.Skipped, sum.Elsewhere, sum.Deduped, archive.FormatBytes(sum.Bytes), archive.FormatDuration(sum.Duration))
+	if *verifyAfter && len(sum.Written) > 0 {
+		only := make(map[string]bool, len(sum.Written))
+		for _, p := range sum.Written {
+			only[p] = true
+		}
+		fmt.Fprintf(stdout, "\nReading %d written files back from the tape to verify them...\n", len(only))
+		res, verr := archive.Verify(archive.VerifyOptions{
+			TapeRoot: cf.tape,
+			Only:     only,
+			Log:      stdout,
+			Progress: progressOut(stderr),
+		})
+		printDriveWarnings(cf.tape, stderr)
+		if verr != nil && res.Files == 0 {
+			return fail(stderr, verr)
+		}
+		return reportVerify(stdout, stderr, res, verr)
+	}
+	return exitOK
+}
+
+// reportVerify prints a verification result and returns the exit code: a
+// failure for damage the tape should not be trusted with, success otherwise.
+func reportVerify(stdout, stderr io.Writer, res archive.VerifyResult, err error) int {
+	fmt.Fprintf(stdout, "\nFiles:       %d\nVerified:    %d\nRepairable:  %d\nFailed:      %d\nProblems:    %d\nReferences:  %d\nBytes:       %s\nDuration:    %s\n\n",
+		res.Files, res.Verified, res.Repairable, res.Failed, res.Problems, res.Refs, archive.FormatBytes(res.Bytes), archive.FormatDuration(res.Duration))
+	if err != nil {
+		fmt.Fprintln(stderr, "tapemgr:", err)
+	}
+	switch {
+	case res.Failed > 0:
+		fmt.Fprintln(stdout, "SHA-256 verification FAILED.")
+		return exitFailure
+	case res.Repairable > 0:
+		fmt.Fprintln(stdout, "The tape is damaged, but parity can rebuild every affected file. Restore them and copy them to another tape.")
+		return exitFailure
+	case res.Problems > 0:
+		fmt.Fprintln(stdout, "Tape metadata or parity data is damaged. The files are intact, but their protection is not. Copy them to another tape.")
+		return exitFailure
+	}
+	fmt.Fprintln(stdout, "SHA-256 verification successful.")
+	if err != nil {
+		return exitFailure
+	}
 	return exitOK
 }
 
@@ -316,28 +361,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	if err != nil && res.Files == 0 {
 		return fail(stderr, err)
 	}
-	fmt.Fprintf(stdout, "\nFiles:       %d\nVerified:    %d\nRepairable:  %d\nFailed:      %d\nProblems:    %d\nReferences:  %d\nBytes:       %s\nDuration:    %s\n\n",
-		res.Files, res.Verified, res.Repairable, res.Failed, res.Problems, res.Refs, archive.FormatBytes(res.Bytes), archive.FormatDuration(res.Duration))
-	if err != nil {
-		fmt.Fprintln(stderr, "tapemgr:", err)
-	}
-	if res.Failed > 0 {
-		fmt.Fprintln(stdout, "SHA-256 verification FAILED.")
-		return exitFailure
-	}
-	if res.Repairable > 0 {
-		fmt.Fprintln(stdout, "The tape is damaged, but parity can rebuild every affected file. Restore them and copy them to another tape.")
-		return exitFailure
-	}
-	if res.Problems > 0 {
-		fmt.Fprintln(stdout, "Tape metadata or parity data is damaged. The files are intact, but their protection is not. Copy them to another tape.")
-		return exitFailure
-	}
-	fmt.Fprintln(stdout, "SHA-256 verification successful.")
-	if err != nil {
-		return exitFailure
-	}
-	return exitOK
+	return reportVerify(stdout, stderr, res, err)
 }
 
 func cmdList(args []string, stdout, stderr io.Writer) int {

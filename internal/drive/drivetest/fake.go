@@ -51,6 +51,7 @@ type Fake struct {
 	StandbyTimer       uint32
 	IdleNotSettable    bool
 	StandbyNotSettable bool
+	PowerWriteIgnored  bool // accept a MODE SELECT of the power page but keep the old values, like a drive that silently drops the write
 
 	// Firmware: the drive reports Revision (E6R3 unless set). A download
 	// of ImageSize bytes is activated as NewRevision; Received collects it.
@@ -235,6 +236,9 @@ func (f *Fake) Do(cdb []byte, dir drive.Direction, buf []byte, timeout time.Dura
 			// Invalid field in parameter list, like a drive asked to set a
 			// timer it does not support.
 			return 0, check(op, drive.SenseIllegalRequest, 0x26, 0)
+		}
+		if f.PowerWriteIgnored {
+			return 0, nil // acknowledged, but nothing changes
 		}
 		f.IdleEnabled, f.StandbyEnabled = idle, standby
 		f.IdleTimer = binary.BigEndian.Uint32(buf[off+4:])

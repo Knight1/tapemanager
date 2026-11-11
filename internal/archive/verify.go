@@ -22,6 +22,7 @@ import (
 type VerifyOptions struct {
 	TapeRoot string
 	Prefix   string           // only verify entries at or below this path; empty means all
+	Only     map[string]bool  // if non-nil, verify only these manifest paths (used by 'archive put --verify')
 	Catalog  *catalog.Catalog // if set, the result is recorded in the catalog
 	Log      io.Writer        // per-file output
 	Progress io.Writer        // progress bar output, nil to disable
@@ -53,10 +54,14 @@ var ErrNoEntries = errors.New("no manifest entries to verify")
 // metadata is skipped and reported, so one bad spot does not hide the rest
 // of the tape. A full verify that cannot finish is recorded as failed, so
 // an older passing verification cannot keep allowing purges.
+//
+// A prefix or an Only set makes it a partial verify: only matching entries
+// are read, the segment parity sweep is skipped, and the result is not
+// recorded in the catalog, so a partial pass cannot stand in for a full one.
 func Verify(opts VerifyOptions) (res VerifyResult, err error) {
 	start := time.Now()
 	prefix := strings.Trim(filepath.ToSlash(opts.Prefix), "/")
-	full := prefix == ""
+	full := prefix == "" && opts.Only == nil
 
 	// Manifest paths come from the tape. Its root refuses any path or
 	// symlink that would lead outside it.
@@ -150,6 +155,9 @@ func Verify(opts VerifyOptions) (res VerifyResult, err error) {
 	seg := 0
 	for _, e := range entries {
 		if prefix != "" && e.Path != prefix && !strings.HasPrefix(e.Path, prefix+"/") {
+			continue
+		}
+		if opts.Only != nil && !opts.Only[e.Path] {
 			continue
 		}
 		if e.Segment != seg {

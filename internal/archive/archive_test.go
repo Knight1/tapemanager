@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -248,6 +249,63 @@ func TestVerifyEmptyTape(t *testing.T) {
 	_, err := Verify(VerifyOptions{TapeRoot: t.TempDir(), Log: io.Discard})
 	if !errors.Is(err, ErrNoEntries) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// Put reports the files whose content it wrote, in write order, so a verify
+// pass can read back exactly those. A rerun that writes nothing reports none.
+func TestPutReportsWritten(t *testing.T) {
+	src, tape := setup(t)
+	sum := put(t, src, tape)
+	want := []string{"downloads/a.iso", "downloads/empty", "downloads/sub/b.tar"}
+	if !slices.Equal(sum.Written, want) {
+		t.Fatalf("written = %v, want %v", sum.Written, want)
+	}
+	if sum := put(t, src, tape); len(sum.Written) != 0 {
+		t.Fatalf("rerun wrote nothing new but reported %v", sum.Written)
+	}
+}
+
+// A deduplicated file stores a reference, not content, so it is not reported
+// as written: there is nothing on this tape to read back for it.
+func TestPutDedupNotReportedAsWritten(t *testing.T) {
+	src, tape := setup(t)
+	put(t, src, tape)
+	dup := filepath.Join(t.TempDir(), "dup")
+	writeFile(t, filepath.Join(dup, "copy.iso"), "alpha") // same content as downloads/a.iso
+	o := opts(t, dup, tape)
+	o.Dedup, o.DedupMinSize = true, 1
+	sum, err := Put(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Deduped != 1 || len(sum.Written) != 0 {
+		t.Fatalf("deduped=%d written=%v", sum.Deduped, sum.Written)
+	}
+}
+
+// Verify with an Only set reads just those paths, and scoping is honored:
+// corruption outside the set is ignored, corruption inside it is caught.
+func TestVerifyOnly(t *testing.T) {
+	src, tape := setup(t)
+	put(t, src, tape)
+	only := map[string]bool{"downloads/a.iso": true, "downloads/empty": true}
+
+	res, err := Verify(VerifyOptions{TapeRoot: tape, Only: only, Log: io.Discard})
+	if err != nil || res.Files != 2 || res.Verified != 2 {
+		t.Fatalf("scoped verify = %+v, %v", res, err)
+	}
+	// A file outside the set is corrupted: the scoped verify still passes.
+	writeFile(t, filepath.Join(tape, "downloads", "sub", "b.tar"), "BRAVO")
+	res, err = Verify(VerifyOptions{TapeRoot: tape, Only: only, Log: io.Discard})
+	if err != nil || res.Failed != 0 || res.Verified != 2 {
+		t.Fatalf("out-of-scope corruption affected the scoped verify: %+v, %v", res, err)
+	}
+	// A file inside the set is corrupted: the scoped verify fails.
+	writeFile(t, filepath.Join(tape, "downloads", "a.iso"), "alphA")
+	res, err = Verify(VerifyOptions{TapeRoot: tape, Only: only, Log: io.Discard})
+	if err != nil || res.Failed != 1 {
+		t.Fatalf("in-scope corruption missed: %+v, %v", res, err)
 	}
 }
 

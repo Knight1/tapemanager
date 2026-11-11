@@ -138,6 +138,11 @@ type PutSummary struct {
 	Bytes     int64
 	Resumed   int64 // bytes not rewritten thanks to a resume checkpoint
 	Duration  time.Duration
+	// Written holds the tape manifest paths of files whose content this run
+	// wrote to the tape, in write order. 'archive put --verify' reads just
+	// these back. Deduplicated references are not listed: no content was
+	// written for them.
+	Written []string
 }
 
 type job struct {
@@ -466,6 +471,10 @@ func Put(opts PutOptions) (sum PutSummary, err error) {
 			return fmt.Errorf("writing pending log: %w", err)
 		}
 		done[r.Entry.Path] = r.Entry
+		if r.Entry.Ref == nil {
+			// Content written to this tape; a reference stored nothing to read back.
+			sum.Written = append(sum.Written, r.Entry.Path)
+		}
 		if pend.bytes >= opts.FlushEvery {
 			return flush()
 		}

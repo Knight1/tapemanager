@@ -53,6 +53,31 @@ func TestCLIWorkflow(t *testing.T) {
 	}
 }
 
+func TestCLIPutVerify(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "dl")
+	tape := filepath.Join(base, "tape")
+	cat := filepath.Join(base, "cat")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(tape, 0o755)
+	os.WriteFile(filepath.Join(src, "a.iso"), []byte("alpha"), 0o644)
+	os.WriteFile(filepath.Join(src, "b.iso"), []byte("bravo"), 0o644)
+	common := []string{"--tape", tape, "--catalog", cat, "--no-mount-check"}
+
+	// put --verify writes the files, then reads both back and confirms them.
+	code, out, errOut := runCmd(t, append([]string{"archive", "put", "--verify", "--label", "T1"}, append(common, src)...)...)
+	if code != 0 || !strings.Contains(out, "Reading 2 written files back") ||
+		!strings.Contains(out, "Verified:    2") || !strings.Contains(out, "verification successful") {
+		t.Fatalf("put --verify: %d\nout=%s\nerr=%s", code, out, errOut)
+	}
+
+	// A rerun writes nothing new, so there is nothing to read back.
+	code, out, _ = runCmd(t, append([]string{"archive", "put", "--verify"}, append(common, src)...)...)
+	if code != 0 || strings.Contains(out, "Reading") {
+		t.Fatalf("rerun put --verify: %d\n%s", code, out)
+	}
+}
+
 func TestCLIMountCheck(t *testing.T) {
 	code, _, errOut := runCmd(t, "archive", "verify", "--tape", t.TempDir(), "--catalog", t.TempDir())
 	if code != exitFailure || !strings.Contains(errOut, "not an LTFS") {

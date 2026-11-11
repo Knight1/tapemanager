@@ -734,6 +734,7 @@ func cmdDrivePower(args []string, stdout, stderr io.Writer) int {
 	standby := fs.Duration("standby-after", 0, "drop to the lower standby power state after this much inactivity; 0 turns it off")
 	off := fs.Bool("off", false, "turn off both the idle and standby timers (the drive stays fully powered)")
 	yes := fs.Bool("yes", false, "apply the change; without it the change is only shown")
+	verify := fs.Bool("verify", false, "after applying, read the setting back and confirm the drive stored it")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -781,8 +782,18 @@ func cmdDrivePower(args []string, stdout, stderr io.Writer) int {
 	if err := drive.SetPowerCondition(d, pc); err != nil {
 		return fail(stderr, fmt.Errorf("setting the power condition: %w", err))
 	}
+	// Confirm the drive kept what was written before reporting success, so a
+	// silently dropped or altered write is caught instead of assumed.
+	if *verify {
+		if err := drive.VerifyPowerCondition(d, pc); err != nil {
+			return fail(stderr, fmt.Errorf("verifying the change: %w", err))
+		}
+	}
 	fmt.Fprintln(stdout, "\nApplied:")
 	printPowerCondition(stdout, pc)
+	if *verify {
+		fmt.Fprintln(stdout, "(verified: the drive read the new setting back)")
+	}
 	return exitOK
 }
 
