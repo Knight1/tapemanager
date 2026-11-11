@@ -1,0 +1,16 @@
+# Local notes, not published
+design.md
+FIRMWARE_VALIDATION.md
+CLAUDE.md
+.claude/
+
+# Build output
+/cmd/tapemgr/tapemgr
+/dist/
+
+# Vendor firmware images: proprietary, never commit
+*.fmrz
+*.fmr
+*.ro
+*.fcp
+*.frm
