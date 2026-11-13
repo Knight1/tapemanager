@@ -182,6 +182,7 @@ const (
 	PageReadErrors   = 0x03
 	PageDeviceStatus = 0x11 // DT device status, holds the VHF data
 	PageVolumeStats  = 0x17
+	PageProtocolPort = 0x18 // protocol specific port, holds SAS phy link rates
 	PageTapeAlert    = 0x2E
 )
 
@@ -274,6 +275,81 @@ func (v VHF) CleaningWarning() string {
 		return "drive requests cleaning (VHF clean requested); load a cleaning cartridge soon"
 	}
 	return ""
+}
+
+// LinkRate is the negotiated link rate of one SAS phy, read from the protocol
+// specific port log page. It identifies the phy by its relative target port
+// and phy number, so a drive with several phys or ports is reported fully.
+type LinkRate struct {
+	Port uint16 // relative target port, the log parameter code
+	Phy  byte
+	Rate string // for example "6 Gbps", or a phy state such as "disabled"
+}
+
+// Where returns a stable label for one phy, used to spot a rate change.
+func (l LinkRate) Where() string {
+	return fmt.Sprintf("port %d phy %d", l.Port, l.Phy)
+}
+
+// linkRateNames decodes the negotiated logical link rate nibble (SPL). The
+// speed values are what change under a cable or backplane fault; the rest are
+// phy states reported in the same field.
+var linkRateNames = map[byte]string{
+	0x0: "unknown rate",
+	0x1: "disabled",
+	0x2: "reset problem",
+	0x3: "spinup hold",
+	0x4: "port selector",
+	0x5: "reset in progress",
+	0x6: "unsupported phy attached",
+	0x8: "1.5 Gbps",
+	0x9: "3 Gbps",
+	0xA: "6 Gbps",
+	0xB: "12 Gbps",
+	0xC: "22.5 Gbps",
+}
+
+func linkRateName(code byte) string {
+	if s, ok := linkRateNames[code]; ok {
+		return s
+	}
+	return fmt.Sprintf("rate 0x%x", code)
+}
+
+// parseProtocolPort reads the negotiated link rate of each SAS phy from the
+// protocol specific port log page. Non-SAS ports (a Fibre Channel attachment
+// uses the same page differently) are skipped. A descriptor whose length does
+// not fit stops that port, so a short or damaged page yields what was read.
+func parseProtocolPort(lp LogPage) []LinkRate {
+	var out []LinkRate
+	for _, p := range lp {
+		v := p.Value
+		// SAS protocol specific port parameter: protocol identifier (SAS is
+		// 6), reserved, generation code, number of phys, then phy descriptors.
+		if len(v) < 4 || v[0]&0x0F != 6 {
+			continue
+		}
+		nphys := int(v[3])
+		off := 4
+		for i := 0; i < nphys; i++ {
+			if off+6 > len(v) {
+				break
+			}
+			descLen := int(v[off+3]) + 4
+			if descLen < 6 || off+descLen > len(v) {
+				break
+			}
+			out = append(out, LinkRate{
+				Port: p.Code,
+				Phy:  v[off+1],
+				// Byte 5 of the descriptor: high nibble reason, low nibble
+				// negotiated logical link rate.
+				Rate: linkRateName(v[off+5] & 0x0F),
+			})
+			off += descLen
+		}
+	}
+	return out
 }
 
 // Alert is an active TapeAlert flag.

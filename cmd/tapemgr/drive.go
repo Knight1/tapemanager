@@ -51,66 +51,124 @@ var (
 	}
 )
 
-// pollCleaning reads just the cleaning state of the drive holding the tape
-// mounted at tapeRoot: a message if it is asking to be cleaned, "" if not,
-// and ok=false if the drive cannot be found or asked. Replaceable in tests.
-var pollCleaning = drivePollCleaning
+// driveSnapshot is what the watch reads from the drive each time: the current
+// cleaning request (empty if none), the negotiated link rate of each phy, and
+// the drive's error counters.
+type driveSnapshot struct {
+	cleaning string
+	links    []drive.LinkRate
+	errors   drive.ErrorStats
+}
 
-// drivePollCleaning reads the drive's VHF cleaning flags with a single log
-// page, so it is cheap enough to call repeatedly during an operation.
-func drivePollCleaning(tapeRoot string) (msg string, ok bool) {
+// pollDrive reads a snapshot of the drive holding the tape mounted at
+// tapeRoot. ok is false if the drive cannot be found or asked. Replaceable in
+// tests.
+var pollDrive = drivePollSnapshot
+
+// drivePollSnapshot opens the drive and reads the cleaning flags, link rates
+// and error counters, a handful of log-page reads with no media motion, so it
+// is cheap enough to call repeatedly during an operation.
+func drivePollSnapshot(tapeRoot string) (driveSnapshot, bool) {
 	f, err := forMount(tapeRoot)
 	if err != nil {
-		return "", false
+		return driveSnapshot{}, false
 	}
 	d, err := openDevice(f.SG)
 	if err != nil {
-		return "", false
+		return driveSnapshot{}, false
 	}
 	defer d.Close()
-	v, err := drive.ReadVHF(d)
-	if err != nil {
-		return "", false
+	var snap driveSnapshot
+	if v, err := drive.ReadVHF(d); err == nil {
+		snap.cleaning = v.CleaningWarning()
 	}
-	return v.CleaningWarning(), true
+	if lr, err := drive.ReadLinkRates(d); err == nil {
+		snap.links = lr
+	}
+	snap.errors = drive.ReadErrorStats(d)
+	return snap, true
 }
 
-// How often the cleaning watch polls the drive during a read or write.
-// Tests shorten it.
-var cleaningPollInterval = 30 * time.Second
+// How often the drive watch polls during a read or write. Tests shorten it.
+var driveWatchInterval = 30 * time.Second
 
-// watchCleaning runs op while watching the drive that holds the tape mounted
-// at tapeRoot for a cleaning request. It reports a request that is already
-// set before op starts, and the first time one appears while op runs, so a
-// long read or write cannot hide a drive that begins asking to be cleaned
-// partway through. The request is also reported after op finishes by
+// rateMap keys each phy's label to its negotiated rate, to spot a change.
+func rateMap(links []drive.LinkRate) map[string]string {
+	m := make(map[string]string, len(links))
+	for _, l := range links {
+		m[l.Where()] = l.Rate
+	}
+	return m
+}
+
+// watchDrive runs op while watching the drive that holds the tape mounted at
+// tapeRoot. It reports a cleaning request that is already set before op starts
+// and the first time one appears while op runs, any change in a phy's
+// negotiated link rate while op runs, and any uncorrected read or write error
+// that accrues while op runs, so a long read or write cannot hide a drive that
+// starts asking to be cleaned, a link that slows or drops, or data that fails
+// to read or write correctly. After op it cross-checks the error counters
+// against the baseline and reports every error that the drive logged during
+// the operation. The cleaning request is also reported afterwards by
 // printDriveWarnings. If the drive cannot be asked, op simply runs unwatched.
-func watchCleaning(tapeRoot string, stderr io.Writer, op func()) {
-	before, ok := pollCleaning(tapeRoot)
+func watchDrive(tapeRoot string, stderr io.Writer, op func()) {
+	base, ok := pollDrive(tapeRoot)
 	if !ok {
 		op()
 		return
 	}
-	if before != "" {
-		fmt.Fprintln(stderr, "DRIVE WARNING:", before, "(noticed before starting)")
+	if base.cleaning != "" {
+		fmt.Fprintln(stderr, "DRIVE WARNING:", base.cleaning, "(noticed before starting)")
 	}
+	cleanReported := base.cleaning != ""
+	rates := rateMap(base.links)       // last known rate per phy
+	var warnedWrite, warnedRead uint64 // uncorrected errors already reported live
+
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		t := time.NewTicker(cleaningPollInterval)
+		t := time.NewTicker(driveWatchInterval)
 		defer t.Stop()
 		for {
 			select {
 			case <-done:
 				return
 			case <-t.C:
-				// Report a request that newly appears during the operation,
-				// once, and leave the steady state to the check afterwards.
-				if msg, ok := pollCleaning(tapeRoot); ok && msg != "" && msg != before {
-					fmt.Fprintln(stderr, "DRIVE WARNING:", msg, "(noticed while running)")
-					return
+				snap, ok := pollDrive(tapeRoot)
+				if !ok {
+					continue
+				}
+				// A cleaning request that newly appears, reported once; the
+				// steady state is left to the check after op.
+				if !cleanReported && snap.cleaning != "" {
+					fmt.Fprintln(stderr, "DRIVE WARNING:", snap.cleaning, "(noticed while running)")
+					cleanReported = true
+				}
+				// Each link-rate change, reported once per transition.
+				now := rateMap(snap.links)
+				for where, was := range rates {
+					switch cur, present := now[where]; {
+					case !present:
+						fmt.Fprintf(stderr, "DRIVE WARNING: SAS link %s is no longer reported (was %s) (noticed while running)\n", where, was)
+						delete(rates, where)
+					case cur != was:
+						fmt.Fprintf(stderr, "DRIVE WARNING: SAS link rate changed on %s: %s to %s (noticed while running)\n", where, was, cur)
+						rates[where] = cur
+					}
+				}
+				// Uncorrected errors that climb while running, each reported
+				// once as it grows. The full count is summarized after op.
+				if w, r := snap.errors.UncorrectedSince(base.errors); w > warnedWrite || r > warnedRead {
+					if w > warnedWrite {
+						fmt.Fprintf(stderr, "DRIVE WARNING: %d uncorrected write errors so far during this operation (noticed while running)\n", w)
+						warnedWrite = w
+					}
+					if r > warnedRead {
+						fmt.Fprintf(stderr, "DRIVE WARNING: %d uncorrected read errors so far during this operation (noticed while running)\n", r)
+						warnedRead = r
+					}
 				}
 			}
 		}
@@ -118,6 +176,15 @@ func watchCleaning(tapeRoot string, stderr io.Writer, op func()) {
 	op()
 	close(done)
 	wg.Wait()
+
+	// Cross-check the error counters against the baseline: report every error
+	// the drive logged while it was working, not just the lifetime totals that
+	// printDriveWarnings shows.
+	if after, ok := pollDrive(tapeRoot); ok {
+		for _, w := range after.errors.ErrorsSince(base.errors) {
+			fmt.Fprintln(stderr, "DRIVE WARNING:", w)
+		}
+	}
 }
 
 // checkWriteProtect refuses to write when the drive holding the tape

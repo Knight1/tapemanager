@@ -20,8 +20,8 @@ import (
 func TestMain(m *testing.M) {
 	// Tests never talk to a real drive.
 	driveWarnings = func(string) []string { return nil }
-	pollCleaning = func(string) (string, bool) { return "", false }
-	cleaningPollInterval = time.Millisecond
+	pollDrive = func(string) (driveSnapshot, bool) { return driveSnapshot{}, false }
+	driveWatchInterval = time.Millisecond
 	checkWriteProtect = func(string) error { return nil }
 	driveEncryption = func(string) (*drive.EncryptionStatus, error) { return nil, errors.New("no drive in tests") }
 	openDevice = func(string) (drive.Device, error) { return nil, errors.New("no drive in tests") }
@@ -303,85 +303,157 @@ func TestDriveWriteProtect(t *testing.T) {
 	}
 }
 
-func TestDrivePollCleaning(t *testing.T) {
+func TestDrivePollSnapshot(t *testing.T) {
 	f := drivetest.New()
 	useFake(t, f, fakeFound, nil)
 	oldFor := forMount
 	t.Cleanup(func() { forMount = oldFor })
 	forMount = func(string) (drive.Found, error) { return fakeFound, nil }
 
-	if msg, ok := drivePollCleaning("/mnt/ltfs"); !ok || msg != "" {
-		t.Fatalf("clean drive: %q %v", msg, ok)
+	// A healthy drive: no cleaning request, one phy at 6 Gbps.
+	snap, ok := drivePollSnapshot("/mnt/ltfs")
+	if !ok || snap.cleaning != "" || len(snap.links) != 1 || snap.links[0].Rate != "6 Gbps" {
+		t.Fatalf("healthy: %+v %v", snap, ok)
 	}
 	f.CleanRequested = true
-	if msg, ok := drivePollCleaning("/mnt/ltfs"); !ok || !strings.Contains(msg, "requests cleaning") {
-		t.Fatalf("requested: %q %v", msg, ok)
+	f.LinkRate = 0x09 // dropped to 3 Gbps
+	if snap, ok = drivePollSnapshot("/mnt/ltfs"); !ok ||
+		!strings.Contains(snap.cleaning, "requests cleaning") || snap.links[0].Rate != "3 Gbps" {
+		t.Fatalf("degraded: %+v %v", snap, ok)
 	}
 	// No drive to ask: ok is false, so the watch simply does nothing.
 	forMount = func(string) (drive.Found, error) { return drive.Found{}, errors.New("not a mount point") }
-	if msg, ok := drivePollCleaning("/mnt/ltfs"); ok || msg != "" {
-		t.Fatalf("no drive: %q %v", msg, ok)
+	if snap, ok = drivePollSnapshot("/mnt/ltfs"); ok {
+		t.Fatalf("no drive: %+v %v", snap, ok)
 	}
 }
 
-// watchCleaning reports a request that is already set before the operation,
-// one that appears while it runs, and runs the operation either way.
-func TestWatchCleaning(t *testing.T) {
-	old := pollCleaning
-	t.Cleanup(func() { pollCleaning = old })
+// watchDrive reports a cleaning request set before the operation, one that
+// appears while it runs, a link-rate change while it runs, and runs the
+// operation either way.
+func TestWatchDrive(t *testing.T) {
+	old := pollDrive
+	t.Cleanup(func() { pollDrive = old })
 	const requested = "drive requests cleaning (VHF clean requested); load a cleaning cartridge soon"
+	link := func(rate string) []drive.LinkRate { return []drive.LinkRate{{Port: 1, Phy: 0, Rate: rate}} }
 
-	t.Run("before", func(t *testing.T) {
-		pollCleaning = func(string) (string, bool) { return requested, true }
+	t.Run("cleaning before", func(t *testing.T) {
+		pollDrive = func(string) (driveSnapshot, bool) {
+			return driveSnapshot{cleaning: requested, links: link("6 Gbps")}, true
+		}
 		var out strings.Builder
 		ran := false
-		watchCleaning("tape", &out, func() { ran = true })
+		watchDrive("tape", &out, func() { ran = true })
 		if !ran || !strings.Contains(out.String(), "noticed before starting") {
 			t.Fatalf("ran=%v out=%q", ran, out.String())
 		}
 	})
 
-	t.Run("while", func(t *testing.T) {
+	t.Run("cleaning while", func(t *testing.T) {
 		var calls int32
-		pollCleaning = func(string) (string, bool) {
+		pollDrive = func(string) (driveSnapshot, bool) {
 			if atomic.AddInt32(&calls, 1) == 1 {
-				return "", true // clean before the operation starts
+				return driveSnapshot{links: link("6 Gbps")}, true // clean at start
 			}
-			return requested, true // appears once it is running
+			return driveSnapshot{cleaning: requested, links: link("6 Gbps")}, true
+		}
+		out := runWatched(&calls)
+		if strings.Contains(out, "noticed before starting") || !strings.Contains(out, "requests cleaning") ||
+			!strings.Contains(out, "noticed while running") {
+			t.Fatalf("out=%q", out)
+		}
+	})
+
+	t.Run("link rate change", func(t *testing.T) {
+		var calls int32
+		pollDrive = func(string) (driveSnapshot, bool) {
+			if atomic.AddInt32(&calls, 1) == 1 {
+				return driveSnapshot{links: link("6 Gbps")}, true // baseline
+			}
+			return driveSnapshot{links: link("3 Gbps")}, true // link slowed
+		}
+		out := runWatched(&calls)
+		if !strings.Contains(out, "SAS link rate changed on port 1 phy 0: 6 Gbps to 3 Gbps") ||
+			!strings.Contains(out, "noticed while running") {
+			t.Fatalf("out=%q", out)
+		}
+	})
+
+	t.Run("uncorrected errors while running and after", func(t *testing.T) {
+		stats := func(wu uint64) drive.ErrorStats {
+			return driveSnapshotErrors(wu)
+		}
+		var calls int32
+		pollDrive = func(string) (driveSnapshot, bool) {
+			if atomic.AddInt32(&calls, 1) == 1 {
+				return driveSnapshot{errors: stats(0)}, true // no errors at the start
+			}
+			return driveSnapshot{errors: stats(2)}, true // two uncorrected writes appear
+		}
+		out := runWatched(&calls)
+		if !strings.Contains(out, "2 uncorrected write errors so far during this operation (noticed while running)") {
+			t.Fatalf("live warning missing: %q", out)
+		}
+		if !strings.Contains(out, "uncorrected write errors during this operation: 2") {
+			t.Fatalf("after cross-check missing: %q", out)
+		}
+	})
+
+	t.Run("no errors stays quiet", func(t *testing.T) {
+		pollDrive = func(string) (driveSnapshot, bool) {
+			return driveSnapshot{errors: driveSnapshotErrors(0), links: link("6 Gbps")}, true
 		}
 		var out strings.Builder
-		watchCleaning("tape", &out, func() {
-			// Wait for the poll that happens while running, so the report is
-			// printed before the operation returns.
-			deadline := time.Now().Add(5 * time.Second)
-			for atomic.LoadInt32(&calls) < 2 && time.Now().Before(deadline) {
-				time.Sleep(time.Millisecond)
-			}
-		})
-		// The goroutine has been joined, so reading out here is race-free.
-		s := out.String()
-		if strings.Contains(s, "noticed before starting") || !strings.Contains(s, "noticed while running") {
-			t.Fatalf("out=%q", s)
+		watchDrive("tape", &out, func() {})
+		if out.Len() != 0 {
+			t.Fatalf("unexpected output: %q", out.String())
 		}
 	})
 
 	t.Run("no drive", func(t *testing.T) {
-		pollCleaning = func(string) (string, bool) { return "", false }
+		pollDrive = func(string) (driveSnapshot, bool) { return driveSnapshot{}, false }
 		var out strings.Builder
 		ran := false
-		watchCleaning("tape", &out, func() { ran = true })
+		watchDrive("tape", &out, func() { ran = true })
 		if !ran || out.Len() != 0 {
 			t.Fatalf("ran=%v out=%q", ran, out.String())
 		}
 	})
 }
 
+// driveSnapshotErrors builds an error-stats snapshot with wu uncorrected write
+// errors and all counters reported, for the watch tests.
+func driveSnapshotErrors(wu uint64) drive.ErrorStats {
+	return drive.ErrorStats{
+		WriteUncorrected: drive.Count{N: wu, OK: true},
+		ReadUncorrected:  drive.Count{OK: true},
+		WriteCorrected:   drive.Count{OK: true},
+		ReadCorrected:    drive.Count{OK: true},
+		NonMedium:        drive.Count{OK: true},
+	}
+}
+
+// runWatched runs watchDrive with an operation that waits for the second poll
+// (the first one while running), so the watch's report is printed before the
+// operation returns. The goroutine is joined by the time watchDrive returns,
+// so reading its output afterwards is race-free.
+func runWatched(calls *int32) string {
+	var out strings.Builder
+	watchDrive("tape", &out, func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for atomic.LoadInt32(calls) < 2 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+	})
+	return out.String()
+}
+
 // A put notices a cleaning request that is already set before it starts.
 func TestCLIPutWatchesCleaning(t *testing.T) {
-	old := pollCleaning
-	t.Cleanup(func() { pollCleaning = old })
-	pollCleaning = func(string) (string, bool) {
-		return "drive requests cleaning (VHF clean requested); load a cleaning cartridge soon", true
+	old := pollDrive
+	t.Cleanup(func() { pollDrive = old })
+	pollDrive = func(string) (driveSnapshot, bool) {
+		return driveSnapshot{cleaning: "drive requests cleaning (VHF clean requested); load a cleaning cartridge soon"}, true
 	}
 	base := t.TempDir()
 	src, tape := filepath.Join(base, "src"), filepath.Join(base, "tape")

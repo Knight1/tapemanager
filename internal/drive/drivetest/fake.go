@@ -19,6 +19,8 @@ type Fake struct {
 	InSlot         bool // an ejected cartridge still in the slot: not ready, load needed
 	CleanRequested bool
 	CleanRequired  bool
+	LinkRate       byte   // negotiated SAS link rate nibble (0 means 6 Gbps)
+	NoProtocolPage bool   // drive without the protocol specific port log page
 	Alerts         []int  // active TapeAlert flags
 	WriteUncorr    uint64 // uncorrected write errors (log page 0x02)
 	ReadUncorr     uint64
@@ -318,6 +320,20 @@ func (f *Fake) logPage(code byte) []byte {
 			vhf[0] |= 0x08
 		}
 		return page(code, param(0, vhf))
+	case drive.PageProtocolPort:
+		if f.NoProtocolPage {
+			return nil
+		}
+		rate := f.LinkRate
+		if rate == 0 {
+			rate = 0x0A // 6 Gbps, as an LTO-6 SAS drive negotiates
+		}
+		desc := make([]byte, 48)
+		desc[3] = 44          // SAS phy log descriptor length
+		desc[5] = rate & 0x0F // negotiated logical link rate, reason nibble 0
+		// SAS protocol identifier, reserved, generation code, one phy.
+		value := append([]byte{0x06, 0x00, 0x00, 0x01}, desc...)
+		return page(code, param(1, value)) // relative target port 1
 	case drive.PageTapeAlert:
 		var params [][]byte
 		for i := 1; i <= 64; i++ {

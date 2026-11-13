@@ -331,6 +331,89 @@ func ReadVHF(d Device) (VHF, error) {
 	return parseVHF(lp)
 }
 
+// ReadLinkRates reads the negotiated link rate of each SAS phy from the
+// protocol specific port log page, a single log-page read with no media
+// motion. It returns ErrUnsupported if the drive does not report the page.
+func ReadLinkRates(d Device) ([]LinkRate, error) {
+	lp, err := ReadLogPage(d, PageProtocolPort)
+	if err != nil {
+		return nil, err
+	}
+	return parseProtocolPort(lp), nil
+}
+
+// ErrorStats are the drive's error counters at one moment: the write and read
+// error counter log pages and the non-medium error count. These counters
+// reset when the cartridge is loaded or the drive is powered on, so their
+// increase across a single operation is the errors that happened during it.
+type ErrorStats struct {
+	WriteCorrected, WriteUncorrected Count
+	ReadCorrected, ReadUncorrected   Count
+	NonMedium                        Count // drive or interface errors, not the tape
+}
+
+// ReadErrorStats reads the error counters, three log-page reads with no media
+// motion, so they can be compared before and after an operation. A counter
+// the drive does not report is left not-OK rather than failing the read.
+func ReadErrorStats(d Device) ErrorStats {
+	var s ErrorStats
+	if lp, err := ReadLogPage(d, PageWriteErrors); err == nil {
+		ec := parseErrorCounters(lp)
+		s.WriteCorrected = Count{ec.Corrected, ec.HaveCorrected}
+		s.WriteUncorrected = Count{ec.Uncorrected, ec.HaveUncorr}
+	}
+	if lp, err := ReadLogPage(d, PageReadErrors); err == nil {
+		ec := parseErrorCounters(lp)
+		s.ReadCorrected = Count{ec.Corrected, ec.HaveCorrected}
+		s.ReadUncorrected = Count{ec.Uncorrected, ec.HaveUncorr}
+	}
+	if lp, err := ReadLogPage(d, PageNonMediumErrors); err == nil {
+		s.NonMedium = count(lp, 0x0000)
+	}
+	return s
+}
+
+// countSince returns the increase of now over base, and whether both were
+// reported and now is not below base. A drop means the counter was reset (a
+// reload or power cycle), so the two snapshots are not comparable.
+func countSince(base, now Count) (uint64, bool) {
+	if !base.OK || !now.OK || now.N < base.N {
+		return 0, false
+	}
+	return now.N - base.N, true
+}
+
+// UncorrectedSince returns the uncorrected write and read errors that accrued
+// from base to s: the serious ones, where data could not be written or read
+// correctly. It is used to warn while an operation is still running.
+func (s ErrorStats) UncorrectedSince(base ErrorStats) (write, read uint64) {
+	write, _ = countSince(base.WriteUncorrected, s.WriteUncorrected)
+	read, _ = countSince(base.ReadUncorrected, s.ReadUncorrected)
+	return write, read
+}
+
+// ErrorsSince describes every error counter that rose from base to s, most
+// serious first. An empty result means the drive logged no new errors during
+// the operation.
+func (s ErrorStats) ErrorsSince(base ErrorStats) []string {
+	var w []string
+	for _, c := range []struct {
+		base, now Count
+		msg       string
+	}{
+		{base.WriteUncorrected, s.WriteUncorrected, "uncorrected write errors during this operation: %d (data may not have reached the tape correctly)"},
+		{base.ReadUncorrected, s.ReadUncorrected, "uncorrected read errors during this operation: %d (the tape could not be read correctly)"},
+		{base.NonMedium, s.NonMedium, "non-medium errors during this operation: %d (a drive or connection problem, not the tape)"},
+		{base.WriteCorrected, s.WriteCorrected, "corrected write errors during this operation: %d"},
+		{base.ReadCorrected, s.ReadCorrected, "corrected read errors during this operation: %d"},
+	} {
+		if n, ok := countSince(c.base, c.now); ok && n > 0 {
+			w = append(w, fmt.Sprintf(c.msg, n))
+		}
+	}
+	return w
+}
+
 // Load loads the cartridge in the drive.
 func Load(d Device) error {
 	_, err := d.Do(loadUnloadCDB(true), DirNone, nil, moveTimeout)

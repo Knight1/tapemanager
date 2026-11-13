@@ -246,7 +246,7 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 	}
 
 	var sum archive.PutSummary
-	watchCleaning(cf.tape, stderr, func() {
+	watchDrive(cf.tape, stderr, func() {
 		sum, err = archive.Put(archive.PutOptions{
 			TapeRoot:   cf.tape,
 			Source:     fs.Arg(0),
@@ -287,7 +287,7 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "\nReading %d written files back from the tape to verify them...\n", len(only))
 		var res archive.VerifyResult
 		var verr error
-		watchCleaning(cf.tape, stderr, func() {
+		watchDrive(cf.tape, stderr, func() {
 			res, verr = archive.Verify(archive.VerifyOptions{
 				TapeRoot: cf.tape,
 				Only:     only,
@@ -358,7 +358,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	}
 
 	var res archive.VerifyResult
-	watchCleaning(cf.tape, stderr, func() {
+	watchDrive(cf.tape, stderr, func() {
 		res, err = archive.Verify(archive.VerifyOptions{
 			TapeRoot: cf.tape,
 			Prefix:   fs.Arg(0),

@@ -139,6 +139,64 @@ func TestReadVHFCleaning(t *testing.T) {
 	}
 }
 
+// ReadLinkRates reports each SAS phy's negotiated rate, and returns
+// ErrUnsupported for a drive without the protocol specific port log page.
+func TestReadLinkRates(t *testing.T) {
+	f := drivetest.New()
+	rates, err := drive.ReadLinkRates(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rates) != 1 || rates[0].Rate != "6 Gbps" || rates[0].Where() != "port 1 phy 0" {
+		t.Fatalf("default: %+v", rates)
+	}
+	f.LinkRate = 0x0B
+	if rates, _ = drive.ReadLinkRates(f); rates[0].Rate != "12 Gbps" {
+		t.Fatalf("12 Gbps: %+v", rates)
+	}
+	f.NoProtocolPage = true
+	if _, err := drive.ReadLinkRates(f); !errors.Is(err, drive.ErrUnsupported) {
+		t.Fatalf("unsupported: %v", err)
+	}
+	// Reading link rates moves no media.
+	if slices.Contains(f.Commands, 0x1B) {
+		t.Fatal("load/unload sent while reading link rates")
+	}
+}
+
+// ReadErrorStats reads the error counters, and the Since helpers report only
+// what rose between two snapshots.
+func TestErrorStats(t *testing.T) {
+	f := drivetest.New()
+	base := drive.ReadErrorStats(f)
+	if !base.WriteUncorrected.OK || base.WriteUncorrected.N != 0 || base.WriteCorrected.N != 1 {
+		t.Fatalf("baseline: %+v", base)
+	}
+	f.WriteUncorr, f.ReadUncorr = 3, 2
+	now := drive.ReadErrorStats(f)
+	if w, r := now.UncorrectedSince(base); w != 3 || r != 2 {
+		t.Fatalf("uncorrected since: write=%d read=%d", w, r)
+	}
+	got := strings.Join(now.ErrorsSince(base), "\n")
+	for _, want := range []string{"uncorrected write errors during this operation: 3", "uncorrected read errors during this operation: 2"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in\n%s", want, got)
+		}
+	}
+	// Reading the counters never moves media.
+	if slices.Contains(f.Commands, 0x1B) {
+		t.Fatal("load/unload sent while reading error stats")
+	}
+
+	// A counter that dropped means it was reset (a reload): not comparable,
+	// so nothing is reported rather than a bogus negative.
+	reset := drive.ErrorStats{WriteUncorrected: drive.Count{N: 1, OK: true}}
+	later := drive.ErrorStats{WriteUncorrected: drive.Count{N: 0, OK: true}}
+	if len(later.ErrorsSince(reset)) != 0 {
+		t.Fatalf("decrease reported: %v", later.ErrorsSince(reset))
+	}
+}
+
 func TestGatherDegrades(t *testing.T) {
 	f := drivetest.New()
 	f.Fail = map[byte]*drive.CommandError{

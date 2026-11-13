@@ -28,8 +28,10 @@ It works with any LTO drive through [LTFS](https://github.com/LinearTapeFileSyst
   scratched or creased part of the tape becomes unreadable, the file can still be
   restored exactly.
 - **Watches the drive.** It reads the drive's own health reports and warns you when it
-  asks for a cleaning cartridge or reports read or write errors, and keeps watching for
-  a cleaning request before, during and after a long write or verify.
+  asks for a cleaning cartridge or reports read or write errors. During a long write or
+  verify it keeps watching for a cleaning request and for the SAS link rate dropping, and
+  afterwards it cross-checks the drive's error counters to report any read, write or
+  interface error that happened while it was working, not just the lifetime totals.
 - **Works with drive encryption.** LTO drives can encrypt everything with AES-256 at
   full speed. tapemgr creates keys for LTFS, shows whether the drive is encrypting, and
   can refuse to write unless it is (`--require-encryption`). A tape that was written
