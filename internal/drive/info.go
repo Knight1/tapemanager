@@ -274,10 +274,8 @@ func parseCoherencyUUID(b []byte) string {
 func (in *Info) Warnings() []string {
 	var w []string
 	if in.VHF != nil {
-		if in.VHF.CleanRequired {
-			w = append(w, "drive needs cleaning now (VHF clean required); load a cleaning cartridge")
-		} else if in.VHF.CleanRequested {
-			w = append(w, "drive requests cleaning (VHF clean requested); load a cleaning cartridge soon")
+		if msg := in.VHF.CleaningWarning(); msg != "" {
+			w = append(w, msg)
 		}
 	}
 	for _, a := range in.Alerts {

@@ -245,19 +245,22 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 		return fail(stderr, err)
 	}
 
-	sum, err := archive.Put(archive.PutOptions{
-		TapeRoot:   cf.tape,
-		Source:     fs.Arg(0),
-		Prefix:     *prefix,
-		Label:      *label,
-		Catalog:    cat,
-		Dedup:      !*noDedup,
-		Parity:     *parityPct,
-		Copies:     *copies,
-		Again:      *again,
-		Recipients: recipients,
-		Log:        stdout,
-		Progress:   progressOut(stderr),
+	var sum archive.PutSummary
+	watchCleaning(cf.tape, stderr, func() {
+		sum, err = archive.Put(archive.PutOptions{
+			TapeRoot:   cf.tape,
+			Source:     fs.Arg(0),
+			Prefix:     *prefix,
+			Label:      *label,
+			Catalog:    cat,
+			Dedup:      !*noDedup,
+			Parity:     *parityPct,
+			Copies:     *copies,
+			Again:      *again,
+			Recipients: recipients,
+			Log:        stdout,
+			Progress:   progressOut(stderr),
+		})
 	})
 	if sum.Tape != nil {
 		recordEncryption(cat, sum.Tape.ID, enc, stderr)
@@ -282,11 +285,15 @@ func cmdPut(args []string, stdout, stderr io.Writer) int {
 			only[p] = true
 		}
 		fmt.Fprintf(stdout, "\nReading %d written files back from the tape to verify them...\n", len(only))
-		res, verr := archive.Verify(archive.VerifyOptions{
-			TapeRoot: cf.tape,
-			Only:     only,
-			Log:      stdout,
-			Progress: progressOut(stderr),
+		var res archive.VerifyResult
+		var verr error
+		watchCleaning(cf.tape, stderr, func() {
+			res, verr = archive.Verify(archive.VerifyOptions{
+				TapeRoot: cf.tape,
+				Only:     only,
+				Log:      stdout,
+				Progress: progressOut(stderr),
+			})
 		})
 		printDriveWarnings(cf.tape, stderr)
 		if verr != nil && res.Files == 0 {
@@ -350,12 +357,15 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 		return fail(stderr, err)
 	}
 
-	res, err := archive.Verify(archive.VerifyOptions{
-		TapeRoot: cf.tape,
-		Prefix:   fs.Arg(0),
-		Catalog:  cat,
-		Log:      stdout,
-		Progress: progressOut(stderr),
+	var res archive.VerifyResult
+	watchCleaning(cf.tape, stderr, func() {
+		res, err = archive.Verify(archive.VerifyOptions{
+			TapeRoot: cf.tape,
+			Prefix:   fs.Arg(0),
+			Catalog:  cat,
+			Log:      stdout,
+			Progress: progressOut(stderr),
+		})
 	})
 	printDriveWarnings(cf.tape, stderr)
 	if err != nil && res.Files == 0 {

@@ -263,6 +263,19 @@ func (v VHF) ActivityName() string {
 	return fmt.Sprintf("activity 0x%02x", v.Activity)
 }
 
+// CleaningWarning returns a message when the drive is asking to be cleaned,
+// or "" when it is not. The clean-required state is reported ahead of a
+// clean-requested one, as it is the more urgent of the two.
+func (v VHF) CleaningWarning() string {
+	switch {
+	case v.CleanRequired:
+		return "drive needs cleaning now (VHF clean required); load a cleaning cartridge"
+	case v.CleanRequested:
+		return "drive requests cleaning (VHF clean requested); load a cleaning cartridge soon"
+	}
+	return ""
+}
+
 // Alert is an active TapeAlert flag.
 type Alert struct {
 	Flag     int

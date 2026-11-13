@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Knight1/tapemanager/internal/archive"
@@ -49,6 +50,75 @@ var (
 		return info.Warnings()
 	}
 )
+
+// pollCleaning reads just the cleaning state of the drive holding the tape
+// mounted at tapeRoot: a message if it is asking to be cleaned, "" if not,
+// and ok=false if the drive cannot be found or asked. Replaceable in tests.
+var pollCleaning = drivePollCleaning
+
+// drivePollCleaning reads the drive's VHF cleaning flags with a single log
+// page, so it is cheap enough to call repeatedly during an operation.
+func drivePollCleaning(tapeRoot string) (msg string, ok bool) {
+	f, err := forMount(tapeRoot)
+	if err != nil {
+		return "", false
+	}
+	d, err := openDevice(f.SG)
+	if err != nil {
+		return "", false
+	}
+	defer d.Close()
+	v, err := drive.ReadVHF(d)
+	if err != nil {
+		return "", false
+	}
+	return v.CleaningWarning(), true
+}
+
+// How often the cleaning watch polls the drive during a read or write.
+// Tests shorten it.
+var cleaningPollInterval = 30 * time.Second
+
+// watchCleaning runs op while watching the drive that holds the tape mounted
+// at tapeRoot for a cleaning request. It reports a request that is already
+// set before op starts, and the first time one appears while op runs, so a
+// long read or write cannot hide a drive that begins asking to be cleaned
+// partway through. The request is also reported after op finishes by
+// printDriveWarnings. If the drive cannot be asked, op simply runs unwatched.
+func watchCleaning(tapeRoot string, stderr io.Writer, op func()) {
+	before, ok := pollCleaning(tapeRoot)
+	if !ok {
+		op()
+		return
+	}
+	if before != "" {
+		fmt.Fprintln(stderr, "DRIVE WARNING:", before, "(noticed before starting)")
+	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(cleaningPollInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				// Report a request that newly appears during the operation,
+				// once, and leave the steady state to the check afterwards.
+				if msg, ok := pollCleaning(tapeRoot); ok && msg != "" && msg != before {
+					fmt.Fprintln(stderr, "DRIVE WARNING:", msg, "(noticed while running)")
+					return
+				}
+			}
+		}
+	}()
+	op()
+	close(done)
+	wg.Wait()
+}
 
 // checkWriteProtect refuses to write when the drive holding the tape
 // mounted at tapeRoot reports the cartridge write protected. If the drive

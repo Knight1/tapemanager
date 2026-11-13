@@ -114,6 +114,31 @@ func TestWarnings(t *testing.T) {
 	}
 }
 
+// ReadVHF reads only the cleaning state, and CleaningWarning turns it into a
+// message, with clean-required ranked ahead of clean-requested.
+func TestReadVHFCleaning(t *testing.T) {
+	f := drivetest.New()
+	v, err := drive.ReadVHF(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.CleanRequested || v.CleanRequired || v.CleaningWarning() != "" {
+		t.Fatalf("clean drive reports %+v / %q", v, v.CleaningWarning())
+	}
+	f.CleanRequested = true
+	if v, _ = drive.ReadVHF(f); !v.CleanRequested || !strings.Contains(v.CleaningWarning(), "requests cleaning") {
+		t.Fatalf("requested: %+v %q", v, v.CleaningWarning())
+	}
+	f.CleanRequired = true
+	if v, _ = drive.ReadVHF(f); !strings.Contains(v.CleaningWarning(), "needs cleaning now") {
+		t.Fatalf("required: %q", v.CleaningWarning())
+	}
+	// ReadVHF reads a log page only; it never moves media.
+	if slices.Contains(f.Commands, 0x1B) {
+		t.Fatal("load/unload sent while reading VHF")
+	}
+}
+
 func TestGatherDegrades(t *testing.T) {
 	f := drivetest.New()
 	f.Fail = map[byte]*drive.CommandError{

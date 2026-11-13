@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Knight1/tapemanager/internal/catalog"
 	"github.com/Knight1/tapemanager/internal/drive"
@@ -18,6 +20,8 @@ import (
 func TestMain(m *testing.M) {
 	// Tests never talk to a real drive.
 	driveWarnings = func(string) []string { return nil }
+	pollCleaning = func(string) (string, bool) { return "", false }
+	cleaningPollInterval = time.Millisecond
 	checkWriteProtect = func(string) error { return nil }
 	driveEncryption = func(string) (*drive.EncryptionStatus, error) { return nil, errors.New("no drive in tests") }
 	openDevice = func(string) (drive.Device, error) { return nil, errors.New("no drive in tests") }
@@ -296,6 +300,98 @@ func TestDriveWriteProtect(t *testing.T) {
 	forMount = func(string) (drive.Found, error) { return drive.Found{SG: "/dev/other"}, nil }
 	if err := driveWriteProtect("/mnt/ltfs"); err != nil {
 		t.Fatalf("open error: %v", err)
+	}
+}
+
+func TestDrivePollCleaning(t *testing.T) {
+	f := drivetest.New()
+	useFake(t, f, fakeFound, nil)
+	oldFor := forMount
+	t.Cleanup(func() { forMount = oldFor })
+	forMount = func(string) (drive.Found, error) { return fakeFound, nil }
+
+	if msg, ok := drivePollCleaning("/mnt/ltfs"); !ok || msg != "" {
+		t.Fatalf("clean drive: %q %v", msg, ok)
+	}
+	f.CleanRequested = true
+	if msg, ok := drivePollCleaning("/mnt/ltfs"); !ok || !strings.Contains(msg, "requests cleaning") {
+		t.Fatalf("requested: %q %v", msg, ok)
+	}
+	// No drive to ask: ok is false, so the watch simply does nothing.
+	forMount = func(string) (drive.Found, error) { return drive.Found{}, errors.New("not a mount point") }
+	if msg, ok := drivePollCleaning("/mnt/ltfs"); ok || msg != "" {
+		t.Fatalf("no drive: %q %v", msg, ok)
+	}
+}
+
+// watchCleaning reports a request that is already set before the operation,
+// one that appears while it runs, and runs the operation either way.
+func TestWatchCleaning(t *testing.T) {
+	old := pollCleaning
+	t.Cleanup(func() { pollCleaning = old })
+	const requested = "drive requests cleaning (VHF clean requested); load a cleaning cartridge soon"
+
+	t.Run("before", func(t *testing.T) {
+		pollCleaning = func(string) (string, bool) { return requested, true }
+		var out strings.Builder
+		ran := false
+		watchCleaning("tape", &out, func() { ran = true })
+		if !ran || !strings.Contains(out.String(), "noticed before starting") {
+			t.Fatalf("ran=%v out=%q", ran, out.String())
+		}
+	})
+
+	t.Run("while", func(t *testing.T) {
+		var calls int32
+		pollCleaning = func(string) (string, bool) {
+			if atomic.AddInt32(&calls, 1) == 1 {
+				return "", true // clean before the operation starts
+			}
+			return requested, true // appears once it is running
+		}
+		var out strings.Builder
+		watchCleaning("tape", &out, func() {
+			// Wait for the poll that happens while running, so the report is
+			// printed before the operation returns.
+			deadline := time.Now().Add(5 * time.Second)
+			for atomic.LoadInt32(&calls) < 2 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+		})
+		// The goroutine has been joined, so reading out here is race-free.
+		s := out.String()
+		if strings.Contains(s, "noticed before starting") || !strings.Contains(s, "noticed while running") {
+			t.Fatalf("out=%q", s)
+		}
+	})
+
+	t.Run("no drive", func(t *testing.T) {
+		pollCleaning = func(string) (string, bool) { return "", false }
+		var out strings.Builder
+		ran := false
+		watchCleaning("tape", &out, func() { ran = true })
+		if !ran || out.Len() != 0 {
+			t.Fatalf("ran=%v out=%q", ran, out.String())
+		}
+	})
+}
+
+// A put notices a cleaning request that is already set before it starts.
+func TestCLIPutWatchesCleaning(t *testing.T) {
+	old := pollCleaning
+	t.Cleanup(func() { pollCleaning = old })
+	pollCleaning = func(string) (string, bool) {
+		return "drive requests cleaning (VHF clean requested); load a cleaning cartridge soon", true
+	}
+	base := t.TempDir()
+	src, tape := filepath.Join(base, "src"), filepath.Join(base, "tape")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(tape, 0o755)
+	os.WriteFile(filepath.Join(src, "f"), []byte("x"), 0o644)
+	common := []string{"--tape", tape, "--catalog", filepath.Join(base, "cat"), "--no-mount-check"}
+	code, _, errOut := runCmd(t, append(append([]string{"archive", "put"}, common...), src)...)
+	if code != 0 || !strings.Contains(errOut, "DRIVE WARNING:") || !strings.Contains(errOut, "noticed before starting") {
+		t.Fatalf("put: %d %s", code, errOut)
 	}
 }
 

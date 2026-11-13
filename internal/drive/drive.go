@@ -320,6 +320,17 @@ func WriteProtected(d Device) (bool, error) {
 	return v.WriteProtect, nil
 }
 
+// ReadVHF reads just the drive's VHF data (the device status log page), a
+// single log-page read with no media motion. It is cheap enough to poll
+// during a long read or write to notice a cleaning request as it appears.
+func ReadVHF(d Device) (VHF, error) {
+	lp, err := ReadLogPage(d, PageDeviceStatus)
+	if err != nil {
+		return VHF{}, err
+	}
+	return parseVHF(lp)
+}
+
 // Load loads the cartridge in the drive.
 func Load(d Device) error {
 	_, err := d.Do(loadUnloadCDB(true), DirNone, nil, moveTimeout)
