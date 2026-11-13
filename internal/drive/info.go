@@ -289,6 +289,9 @@ func (in *Info) Warnings() []string {
 	if in.ReadErrors != nil && in.ReadErrors.Uncorrected > 0 {
 		w = append(w, fmt.Sprintf("drive reports %d uncorrected read errors", in.ReadErrors.Uncorrected))
 	}
+	if in.NonMediumErrors.OK && in.NonMediumErrors.N > 0 {
+		w = append(w, fmt.Sprintf("drive reports %d non-medium errors (an interface or drive problem, not the tape); check the cabling and connection", in.NonMediumErrors.N))
+	}
 	if in.CleaningRequired && (in.VHF == nil || !in.VHF.CleanRequired) {
 		w = append(w, "drive reports that cleaning is required; load a cleaning cartridge")
 	}

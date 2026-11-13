@@ -24,6 +24,7 @@ type Fake struct {
 	Alerts         []int  // active TapeAlert flags
 	WriteUncorr    uint64 // uncorrected write errors (log page 0x02)
 	ReadUncorr     uint64
+	NonMediumErrs  uint64   // non-medium errors (log page 0x06)
 	VolumeReadErrs uint64   // unrecovered read errors over the cartridge's life
 	PreventRemoval bool     // unload fails like a drive locked by LTFS
 	WriteProtect   bool     // cartridge write protected
@@ -367,7 +368,7 @@ func (f *Fake) logPage(code byte) []byte {
 		}
 		return page(code, params...)
 	case drive.PageNonMediumErrors:
-		return page(code, param(0, u32(0)))
+		return page(code, param(0, u32(f.NonMediumErrs)))
 	case drive.PageSequential:
 		v := uint64(0)
 		if f.CleanRequired {

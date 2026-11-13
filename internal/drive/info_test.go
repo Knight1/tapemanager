@@ -197,6 +197,29 @@ func TestErrorStats(t *testing.T) {
 	}
 }
 
+// Non-medium errors are errors on the drive or its connection, not the tape,
+// so they are a warning on their own.
+func TestWarnsNonMediumErrors(t *testing.T) {
+	f := drivetest.New()
+	if w := gather(t, f).Warnings(); len(w) != 0 {
+		t.Fatalf("healthy drive warns: %v", w)
+	}
+	f.NonMediumErrs = 4
+	w := strings.Join(gather(t, f).Warnings(), "\n")
+	if !strings.Contains(w, "4 non-medium errors") || !strings.Contains(w, "check the cabling") {
+		t.Fatalf("non-medium warning missing: %q", w)
+	}
+}
+
+func gather(t *testing.T, f *drivetest.Fake) *drive.Info {
+	t.Helper()
+	info, err := drive.Gather(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info
+}
+
 func TestGatherDegrades(t *testing.T) {
 	f := drivetest.New()
 	f.Fail = map[byte]*drive.CommandError{
