@@ -108,6 +108,7 @@ tapemgr catalog search ubuntu
 | `tapemgr archive repair-volume` | Rebuild a tape's damaged or missing identity record from the catalog (asks first) |
 | `tapemgr drive info` | Show the drive, the loaded cartridge, its free space and error counts |
 | `tapemgr drive check` | Warn if the drive needs cleaning or reports errors (good for cron) |
+| `tapemgr drive writetest` | Write random data to the mounted tape, read it back and check its SHA-256, reporting the drive and tape error counters that moved during the test (`--size` MiB, default 256) |
 | `tapemgr drive selftest` | Run the drive's built-in self-test and report whether it passed (`--extended` for the long one, `--status` to read the last result) |
 | `tapemgr drive density` | Show which LTO generations the drive can read and write, and whether hardware compression is on |
 | `tapemgr drive power` | Show the idle/standby power timers, or set them (`--idle-after`, `--standby-after`, `--off`, apply with `--yes`, confirm with `--verify`) |

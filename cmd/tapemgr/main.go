@@ -39,6 +39,7 @@ Usage:
   tapemgr drive info [flags]               show drive, cartridge, error counters and TapeAlert flags
   tapemgr drive log [flags]                show and analyze the drive's error history
   tapemgr drive check [flags]              exit 1 if the drive needs cleaning or reports errors
+  tapemgr drive writetest [--size MiB]     write random data to the tape, read it back and check it
   tapemgr drive selftest [flags]           run the drive's self-test and report the result
   tapemgr drive density [flags]            show which recording formats the drive supports
   tapemgr drive power [flags]              show or set the idle/standby power timers
@@ -90,6 +91,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		"drive list":             cmdDriveList,
 		"drive info":             cmdDriveInfo,
 		"drive check":            cmdDriveCheck,
+		"drive writetest":        cmdDriveWriteTest,
 		"drive selftest":         cmdDriveSelfTest,
 		"drive density":          cmdDriveDensity,
 		"drive power":            cmdDrivePower,

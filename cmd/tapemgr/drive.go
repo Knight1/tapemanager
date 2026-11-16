@@ -1,6 +1,9 @@
 package main
 
 import (
+	crand "crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -101,6 +104,12 @@ func rateMap(links []drive.LinkRate) map[string]string {
 	return m
 }
 
+// driveWatchResult reports what the watch found, for a caller that wants to
+// act on it (the write test fails when the drive logged uncorrected errors).
+type driveWatchResult struct {
+	uncorrectedWrite, uncorrectedRead uint64 // during the operation
+}
+
 // watchDrive runs op while watching the drive that holds the tape mounted at
 // tapeRoot. It reports a cleaning request that is already set before op starts
 // and the first time one appears while op runs, any change in a phy's
@@ -109,13 +118,14 @@ func rateMap(links []drive.LinkRate) map[string]string {
 // starts asking to be cleaned, a link that slows or drops, or data that fails
 // to read or write correctly. After op it cross-checks the error counters
 // against the baseline and reports every error that the drive logged during
-// the operation. The cleaning request is also reported afterwards by
-// printDriveWarnings. If the drive cannot be asked, op simply runs unwatched.
-func watchDrive(tapeRoot string, stderr io.Writer, op func()) {
+// the operation, returning the uncorrected counts. The cleaning request is
+// also reported afterwards by printDriveWarnings. If the drive cannot be
+// asked, op simply runs unwatched.
+func watchDrive(tapeRoot string, stderr io.Writer, op func()) driveWatchResult {
 	base, ok := pollDrive(tapeRoot)
 	if !ok {
 		op()
-		return
+		return driveWatchResult{}
 	}
 	if base.cleaning != "" {
 		fmt.Fprintln(stderr, "DRIVE WARNING:", base.cleaning, "(noticed before starting)")
@@ -180,11 +190,14 @@ func watchDrive(tapeRoot string, stderr io.Writer, op func()) {
 	// Cross-check the error counters against the baseline: report every error
 	// the drive logged while it was working, not just the lifetime totals that
 	// printDriveWarnings shows.
+	var res driveWatchResult
 	if after, ok := pollDrive(tapeRoot); ok {
 		for _, w := range after.errors.ErrorsSince(base.errors) {
 			fmt.Fprintln(stderr, "DRIVE WARNING:", w)
 		}
+		res.uncorrectedWrite, res.uncorrectedRead = after.errors.UncorrectedSince(base.errors)
 	}
+	return res
 }
 
 // checkWriteProtect refuses to write when the drive holding the tape
@@ -596,6 +609,166 @@ func cmdDriveCheck(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "OK: %s %s (%s)\n", info.Inquiry.Vendor, info.Inquiry.Product, info.Path)
 	return exitOK
+}
+
+// cmdDriveWriteTest writes random data as a file to the mounted LTFS tape,
+// reads it back and checks the SHA-256, and reports the drive and tape error
+// counters that moved during the test. It is an end-to-end check that the
+// drive and the loaded cartridge can store and return data correctly.
+func cmdDriveWriteTest(args []string, stdout, stderr io.Writer) int {
+	fs, df := newDriveFlagSet("drive writetest", stderr)
+	sizeMiB := fs.Int("size", 256, "megabytes (MiB) of random data to write and read back")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *sizeMiB < 1 {
+		fmt.Fprintln(stderr, "tapemgr: --size must be at least 1")
+		return exitUsage
+	}
+	if err := df.checkTape(); err != nil {
+		return fail(stderr, err)
+	}
+	if err := checkWriteProtect(df.tape); err != nil {
+		return fail(stderr, err)
+	}
+	d, _, err := df.open()
+	if err != nil {
+		return fail(stderr, err)
+	}
+	defer d.Close()
+
+	size := int64(*sizeMiB) << 20
+	baseVol, _ := drive.ReadVolumeStats(d) // nil if unsupported; delta is skipped
+
+	var path, writeSHA, readSHA string
+	var written, readBack int64
+	var opErr error
+	fmt.Fprintf(stdout, "Writing %s of random data to %s and reading it back...\n", archive.FormatBytes(size), df.tape)
+	res := watchDrive(df.tape, stderr, func() {
+		path, writeSHA, written, opErr = writeRandomFile(df.tape, size)
+		if opErr == nil {
+			readSHA, readBack, opErr = fileSHA(path)
+		}
+	})
+	if path != "" {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(stderr, "warning: could not remove the test file %s: %v\n", path, err)
+		}
+	}
+
+	ok := true
+	if opErr != nil {
+		fmt.Fprintln(stderr, "tapemgr:", opErr)
+		ok = false
+	} else {
+		fmt.Fprintf(stdout, "Wrote and read back %s.\n", archive.FormatBytes(written))
+		if writeSHA == readSHA && written == readBack {
+			fmt.Fprintln(stdout, "Checksum:     OK, the data read back matches what was written.")
+		} else {
+			fmt.Fprintf(stdout, "Checksum:     MISMATCH (wrote %d bytes %s, read %d bytes %s).\n", written, writeSHA, readBack, readSHA)
+			ok = false
+		}
+	}
+
+	if after, _ := drive.ReadVolumeStats(d); baseVol != nil && after != nil {
+		msg, unrecovered := tapeStatDelta(baseVol, after)
+		fmt.Fprintln(stdout, "Tape errors:  "+msg)
+		if unrecovered {
+			ok = false
+		}
+	}
+	if res.uncorrectedWrite > 0 || res.uncorrectedRead > 0 {
+		ok = false // the drive logged uncorrected errors; watchDrive detailed them
+	}
+
+	if !ok {
+		fmt.Fprintln(stdout, "FAILED: the drive or the cartridge reported errors during the test.")
+		return exitFailure
+	}
+	fmt.Fprintf(stdout, "OK: wrote and read %s with no errors.\n", archive.FormatBytes(written))
+	return exitOK
+}
+
+// writeRandomFile writes size bytes of incompressible random data to a unique
+// scratch file in dir, flushing it to the tape, and returns the file's path
+// and the SHA-256 of what was written. Random data defeats the drive's
+// hardware compression, so the test exercises the full amount of tape.
+func writeRandomFile(dir string, size int64) (path, sha string, n int64, err error) {
+	f, err := os.CreateTemp(dir, "tapemgr-writetest-*.tmp")
+	if err != nil {
+		return "", "", 0, err
+	}
+	path = f.Name()
+	h := sha256.New()
+	buf := make([]byte, 1<<20)
+	for n < size {
+		b := buf
+		if r := size - n; r < int64(len(b)) {
+			b = buf[:r]
+		}
+		if _, err = crand.Read(b); err != nil {
+			f.Close()
+			return path, "", n, fmt.Errorf("generating random data: %w", err)
+		}
+		w, werr := f.Write(b)
+		if w > 0 {
+			h.Write(b[:w])
+			n += int64(w)
+		}
+		if werr != nil {
+			f.Close()
+			return path, "", n, fmt.Errorf("writing to the tape: %w", werr)
+		}
+	}
+	if err = f.Sync(); err != nil {
+		f.Close()
+		return path, "", n, fmt.Errorf("flushing to the tape: %w", err)
+	}
+	if err = f.Close(); err != nil {
+		return path, "", n, fmt.Errorf("closing the test file: %w", err)
+	}
+	return path, hex.EncodeToString(h.Sum(nil)), n, nil
+}
+
+// fileSHA reads path to the end and returns the SHA-256 and the byte count.
+func fileSHA(path string) (sha string, n int64, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	buf := make([]byte, 1<<20)
+	for {
+		m, rerr := f.Read(buf)
+		if m > 0 {
+			h.Write(buf[:m])
+			n += int64(m)
+		}
+		if rerr == io.EOF {
+			return hex.EncodeToString(h.Sum(nil)), n, nil
+		}
+		if rerr != nil {
+			return "", n, fmt.Errorf("reading back from the tape: %w", rerr)
+		}
+	}
+}
+
+// tapeStatDelta describes the retries and unrecovered errors the cartridge
+// logged between the two volume-statistics snapshots. A counter that went
+// backwards (the drive reset it) contributes nothing.
+func tapeStatDelta(base, after *drive.VolumeStats) (msg string, unrecovered bool) {
+	delta := func(a, b drive.Count) uint64 {
+		if a.OK && b.OK && b.N >= a.N {
+			return b.N - a.N
+		}
+		return 0
+	}
+	wr := delta(base.WriteRetries, after.WriteRetries)
+	wu := delta(base.WriteUnrecovered, after.WriteUnrecovered)
+	rr := delta(base.ReadRetries, after.ReadRetries)
+	ru := delta(base.ReadUnrecovered, after.ReadUnrecovered)
+	return fmt.Sprintf("write %d retries, %d unrecovered; read %d retries, %d unrecovered (during the test)", wr, wu, rr, ru), wu > 0 || ru > 0
 }
 
 func cmdDriveLoad(args []string, stdout, stderr io.Writer) int {

@@ -467,6 +467,70 @@ func TestCLIPutWatchesCleaning(t *testing.T) {
 	}
 }
 
+func TestWriteRandomFileRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	const size = int64(1<<20 + 123) // a partial final chunk
+	path, sha, n, err := writeRandomFile(dir, size)
+	if err != nil || n != size || sha == "" {
+		t.Fatalf("write: %v n=%d sha=%q", err, n, sha)
+	}
+	if st, err := os.Stat(path); err != nil || st.Size() != size {
+		t.Fatalf("stat: %v size=%d", err, st.Size())
+	}
+	got, rn, err := fileSHA(path)
+	if err != nil || rn != size || got != sha {
+		t.Fatalf("read back: %v n=%d sha=%q want %q", err, rn, got, sha)
+	}
+	// A second write produces different data, confirming it is random.
+	_, sha2, _, err := writeRandomFile(dir, size)
+	if err != nil || sha2 == sha {
+		t.Fatalf("second write not random: %v %q", err, sha2)
+	}
+}
+
+func TestTapeStatDelta(t *testing.T) {
+	c := func(n uint64) drive.Count { return drive.Count{N: n, OK: true} }
+	base := &drive.VolumeStats{WriteRetries: c(10), WriteUnrecovered: c(0), ReadRetries: c(5), ReadUnrecovered: c(0)}
+	after := &drive.VolumeStats{WriteRetries: c(13), WriteUnrecovered: c(1), ReadRetries: c(5), ReadUnrecovered: c(0)}
+	msg, unrecovered := tapeStatDelta(base, after)
+	if !unrecovered || !strings.Contains(msg, "write 3 retries, 1 unrecovered") || !strings.Contains(msg, "read 0 retries, 0 unrecovered") {
+		t.Fatalf("delta: %q unrecovered=%v", msg, unrecovered)
+	}
+	// No change, and a counter that was reset (went down), both report nothing.
+	if _, u := tapeStatDelta(base, base); u {
+		t.Fatal("no change reported unrecovered")
+	}
+	if _, u := tapeStatDelta(after, base); u {
+		t.Fatal("a reset counter reported unrecovered")
+	}
+}
+
+// drive writetest writes random data to the tape, reads it back, checks it,
+// reports the tape error counters, and removes the scratch file.
+func TestCLIDriveWriteTest(t *testing.T) {
+	f := drivetest.New()
+	useFake(t, f, fakeFound, nil)
+	oldFor := forMount
+	t.Cleanup(func() { forMount = oldFor })
+	forMount = func(string) (drive.Found, error) { return fakeFound, nil }
+
+	base := t.TempDir()
+	tape := filepath.Join(base, "tape")
+	os.MkdirAll(tape, 0o755)
+	code, out, errOut := runCmd(t, "drive", "writetest", "--size", "2",
+		"--tape", tape, "--catalog", filepath.Join(base, "cat"), "--no-mount-check")
+	if code != exitOK || !strings.Contains(out, "Checksum:     OK") ||
+		!strings.Contains(out, "Tape errors:") || !strings.Contains(out, "OK: wrote and read") {
+		t.Fatalf("code=%d\nout=%s\nerr=%s", code, out, errOut)
+	}
+	ents, _ := os.ReadDir(tape)
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), "tapemgr-writetest-") {
+			t.Fatalf("scratch file left behind: %s", e.Name())
+		}
+	}
+}
+
 func TestCLIRefusesWriteProtectedTape(t *testing.T) {
 	old := checkWriteProtect
 	t.Cleanup(func() { checkWriteProtect = old })

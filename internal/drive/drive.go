@@ -342,6 +342,18 @@ func ReadLinkRates(d Device) ([]LinkRate, error) {
 	return parseProtocolPort(lp), nil
 }
 
+// ReadVolumeStats reads the loaded cartridge's volume statistics log page, a
+// single log-page read with no media motion. It returns ErrUnsupported if the
+// drive does not report the page, and (nil, nil) if the page is present but
+// empty, for example with no cartridge loaded.
+func ReadVolumeStats(d Device) (*VolumeStats, error) {
+	lp, err := ReadLogPage(d, PageVolumeStats)
+	if err != nil {
+		return nil, err
+	}
+	return parseVolumeStats(lp), nil
+}
+
 // ErrorStats are the drive's error counters at one moment: the write and read
 // error counter log pages and the non-medium error count. These counters
 // reset when the cartridge is loaded or the drive is powered on, so their

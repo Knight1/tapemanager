@@ -298,6 +298,9 @@ func FuzzParseLogPage(f *testing.F) {
 		parseVHF(lp)
 		parseTapeAlerts(lp)
 		parseVolumeStats(lp)
+		for _, lr := range parseProtocolPort(lp) {
+			lr.Where()
+		}
 		parseFirmwareBuild(b)
 		if entries, _ := parseErrorLog(lp); len(entries) > 0 {
 			for _, e := range entries {
